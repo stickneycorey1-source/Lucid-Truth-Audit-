@@ -1,0 +1,14 @@
+name: Lucid Truth Audit CI
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+    - run: pip install -r requirements.txt
+    - run: pytest -v
+    - run: echo '{"results":[]}' > audit_log.json
+    - run: python3 audit_scorer.py audit_log.json
