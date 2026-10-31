@@ -2,11 +2,9 @@ import re
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
-from database import init_db, log_audit
+from database import init_db, log_audit, get_logs
 
-# Spin up the SQLite database on launch
 init_db()
-
 app = FastAPI(title="Lucid Truth Audit API")
 
 API_KEY_NAME = "X-API-Key"
@@ -28,7 +26,6 @@ class AuditResponse(BaseModel):
     flagged_pii: list[str] = []
 
 RESTRICTED_TERMS = ["ignore previous instructions", "system prompt", "bypass", "jailbreak", "sudo"]
-
 PII_PATTERNS = {
     "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
     "Email": r"[\w\.-]+@[\w\.-]+\.\w+",
@@ -51,16 +48,14 @@ def run_guardrail(req: AuditRequest, api_key: str = Depends(verify_api_key)):
 
     flagged_all = flagged_terms + flagged_pii
 
-    # Write the outcome to the secure database ledger
     if flagged_all:
         log_audit(req.model_input, "blocked", flagged_all)
-        return AuditResponse(
-            status="blocked", 
-            risk_level="critical", 
-            flagged_terms=flagged_terms,
-            flagged_pii=flagged_pii
-        )
+        return AuditResponse(status="blocked", risk_level="critical", flagged_terms=flagged_terms, flagged_pii=flagged_pii)
         
     log_audit(req.model_input, "clean", [])
     return AuditResponse(status="clean", risk_level="low")
+
+@app.get("/api/v1/logs")
+def fetch_logs(api_key: str = Depends(verify_api_key)):
+    return {"audit_trail": get_logs()}
     
