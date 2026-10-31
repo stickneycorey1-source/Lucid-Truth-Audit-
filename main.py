@@ -2,6 +2,10 @@ import re
 from fastapi import FastAPI, HTTPException, Security, Depends
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, Field
+from database import init_db, log_audit
+
+# Spin up the SQLite database on launch
+init_db()
 
 app = FastAPI(title="Lucid Truth Audit API")
 
@@ -23,10 +27,8 @@ class AuditResponse(BaseModel):
     flagged_terms: list[str] = []
     flagged_pii: list[str] = []
 
-# Core Red Team Blocklist
 RESTRICTED_TERMS = ["ignore previous instructions", "system prompt", "bypass", "jailbreak", "sudo"]
 
-# Regex Patterns for Data Leaks
 PII_PATTERNS = {
     "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
     "Email": r"[\w\.-]+@[\w\.-]+\.\w+",
@@ -41,20 +43,17 @@ def read_root():
 def run_guardrail(req: AuditRequest, api_key: str = Depends(verify_api_key)):
     input_text = req.model_input.lower()
     
-    # 1. Jailbreak & Prompt Injection Scan
     flagged_terms = [term for term in RESTRICTED_TERMS if term in input_text]
+    flagged_pii = [pii for pii, pattern in PII_PATTERNS.items() if re.search(pattern, req.model_input)]
     
-    # 2. PII / Data Leak Scan (Uses original case)
-    flagged_pii = []
-    for pii_type, pattern in PII_PATTERNS.items():
-        if re.search(pattern, req.model_input):
-            flagged_pii.append(pii_type)
-            
-    # 3. Anomaly / Buffer Overflow Scan (Blocks 20+ repeating characters)
     if re.search(r"(.)\1{20,}", input_text):
         flagged_terms.append("anomaly_repeating_chars")
 
-    if flagged_terms or flagged_pii:
+    flagged_all = flagged_terms + flagged_pii
+
+    # Write the outcome to the secure database ledger
+    if flagged_all:
+        log_audit(req.model_input, "blocked", flagged_all)
         return AuditResponse(
             status="blocked", 
             risk_level="critical", 
@@ -62,4 +61,6 @@ def run_guardrail(req: AuditRequest, api_key: str = Depends(verify_api_key)):
             flagged_pii=flagged_pii
         )
         
+    log_audit(req.model_input, "clean", [])
     return AuditResponse(status="clean", risk_level="low")
+    
