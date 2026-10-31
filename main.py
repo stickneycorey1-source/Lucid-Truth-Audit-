@@ -1,61 +1,82 @@
-import re
 from fastapi import FastAPI, HTTPException, Security, Depends
-from fastapi.security.api_key import APIKeyHeader
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
-from database import init_db, log_audit, get_logs
+import sqlite3
+from datetime import datetime
+import re
 
-init_db()
-app = FastAPI(title="Lucid Truth Audit API")
+# --- 1. Database Setup & Logging ---
+def init_audit_ledger():
+    conn = sqlite3.connect('lucid_audit.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS blocked_threats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            risk_level TEXT,
+            raw_input TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
-MASTER_KEY = "lucid-prop-key-2026"
+# Fire immediately on Render server boot
+init_audit_ledger()
+
+def log_threat(risk_level: str, raw_input: str):
+    conn = sqlite3.connect('lucid_audit.db')
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO blocked_threats (timestamp, risk_level, raw_input) VALUES (?, ?, ?)",
+        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), risk_level, raw_input)
+    )
+    conn.commit()
+    conn.close()
+
+
+# --- 2. FastAPI App & Security ---
+app = FastAPI(title="Stickney-Audit-Mandate API")
+
+# Match this to your frontend Colab script
+API_KEY = "lucid-prop-key-2026"
+api_key_header = APIKeyHeader(name="x-api-key", auto_error=True)
 
 def verify_api_key(api_key: str = Security(api_key_header)):
-    if api_key != MASTER_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
     return api_key
 
-class AuditRequest(BaseModel):
-    model_input: str = Field(..., max_length=1000)
-    
-class AuditResponse(BaseModel):
+
+# --- 3. Pydantic v2 Schemas ---
+class GuardRequest(BaseModel):
+    model_input: str = Field(..., description="The raw user input to be audited")
+
+class GuardResponse(BaseModel):
     status: str
-    risk_level: str
-    flagged_terms: list[str] = []
-    flagged_pii: list[str] = []
+    risk_level: str = "none"
+    message: str = "cleared"
 
-RESTRICTED_TERMS = ["ignore previous instructions", "system prompt", "bypass", "jailbreak", "sudo"]
-PII_PATTERNS = {
-    "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
-    "Email": r"[\w\.-]+@[\w\.-]+\.\w+",
-    "Credit_Card": r"\b(?:\d[ -]*?){13,16}\b"
-}
 
-@app.get("/")
-def read_root():
-    return {"message": "Lucid Truth Audit Engine is live."}
-
-@app.post("/api/v1/guard", response_model=AuditResponse)
-def run_guardrail(req: AuditRequest, api_key: str = Depends(verify_api_key)):
-    input_text = req.model_input.lower()
+# --- 4. Guardrail Logic & Endpoint ---
+@app.post("/api/v1/guard", response_model=GuardResponse)
+async def guard_endpoint(request: GuardRequest, api_key: str = Depends(verify_api_key)):
+    user_text = request.model_input.lower()
     
-    flagged_terms = [term for term in RESTRICTED_TERMS if term in input_text]
-    flagged_pii = [pii for pii, pattern in PII_PATTERNS.items() if re.search(pattern, req.model_input)]
+    # Heuristics for threat detection (Injection keywords & PII patterns)
+    is_injection = "ignore all previous instructions" in user_text or "system prompt" in user_text
+    is_pii = "ssn" in user_text or re.search(r"\d{3}-\d{2}-\d{4}", user_text)
     
-    if re.search(r"(.)\1{20,}", input_text):
-        flagged_terms.append("anomaly_repeating_chars")
-
-    flagged_all = flagged_terms + flagged_pii
-
-    if flagged_all:
-        log_audit(req.model_input, "blocked", flagged_all)
-        return AuditResponse(status="blocked", risk_level="critical", flagged_terms=flagged_terms, flagged_pii=flagged_pii)
+    # Intercept and Block
+    if is_injection or is_pii:
+        # Write the attack to the SQLite ledger
+        log_threat(risk_level="critical", raw_input=request.model_input)
         
-    log_audit(req.model_input, "clean", [])
-    return AuditResponse(status="clean", risk_level="low")
+        # Return the exact JSON structure your frontend expects
+        return GuardResponse(
+            status="blocked",
+            risk_level="critical",
+            message="Security protocols engaged. Threat logged."
+        )
 
-@app.get("/api/v1/logs")
-def fetch_logs(api_key: str = Depends(verify_api_key)):
-    return {"audit_trail": get_logs()}
-    
+    # Clear safe inputs
+    return GuardResponse(status="cleared", risk_level="none", message="Input safe.")
