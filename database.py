@@ -28,4 +28,12 @@ def log_audit(model_input: str, status: str, flagged_data: list):
     )
     conn.commit()
     conn.close()
-  
+
+def get_logs(limit: int = 20):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT timestamp, model_input, status, flagged_data FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [{"timestamp": r[0], "prompt": r[1], "status": r[2], "flags": json.loads(r[3])} for r in rows]
+    
