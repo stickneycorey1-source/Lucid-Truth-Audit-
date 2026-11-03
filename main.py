@@ -50,11 +50,11 @@ def log_event(threat_detected: int, violation_type: str, payload: str):
     cursor = conn.cursor()
     
     # Data minimization / PII masking
-    masked = payload[:4] + "****" + payload[-4:] if len(payload) > 8. else "****"
+    masked = payload[:4] + "****" + payload[-4:] if len(payload) > 8 else "****"
     
     cursor.execute(
         "INSERT INTO audit_logs (timestamp, threat_detected, violation_type, masked_payload) VALUES (?, ?, ?, ?)",
-        (datetime.utcnow.isoformat(), threat_detected, violation_type, masked)
+        (datetime.utcnow().isoformat(), threat_detected, violation_type, masked)
     )
     conn.commit()
     conn.close()
@@ -69,4 +69,47 @@ def read_root():
         "active_endpoint": "/api/v1/guard"
     }
 
-@app.post("/api/v1/guard", response_model
+@app.post("/api/v1/guard", response_model=GuardResponse)
+def evaluate_guardrail(
+    body: GuardRequest,
+    x_api_key: Optional[str] = Header(default=None)
+):
+    """Edge interception endpoint scanning for prompt injections and PII exfiltration."""
+    
+    # 1. API Key Authentication Check
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API Key"
+        )
+    
+    prompt_lower = body.model_input.lower()
+    
+    # 2. Heuristic Threat Detection: Prompt Injection
+    if "ignore all previous instructions" in prompt_lower or "system prompt" in prompt_lower:
+        log_event(threat_detected=1, violation_type="Prompt Injection", payload=body.model_input)
+        return {
+            "status": "blocked",
+            "risk_level": "critical",
+            "message": "Adversarial prompt injection attempt intercepted at the edge.",
+            "masked_input": body.model_input[:4] + "****"
+        }
+        
+    # 3. Heuristic Threat Detection: PII Exfiltration (e.g., SSN)
+    if "ssn" in prompt_lower or "social security" in prompt_lower or "555-55-" in prompt_lower:
+        log_event(threat_detected=1, violation_type="PII Exfiltration", payload=body.model_input)
+        return {
+            "status": "blocked",
+            "risk_level": "critical",
+            "message": "Unauthorized PII exfiltration vector blocked.",
+            "masked_input": "****-**-****"
+        }
+        
+    # 4. Cleared Traffic
+    log_event(threat_detected=0, violation_type="None", payload=body.model_input)
+    return {
+        "status": "cleared",
+        "risk_level": "none",
+        "message": "Prompt passed edge security validation.",
+        "masked_input": body.model_input
+    }
