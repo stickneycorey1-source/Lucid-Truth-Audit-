@@ -1,39 +1,38 @@
 import sqlite3
-import json
-from datetime import datetime
+import os
 
-DB_NAME = "lucid_audit_ledger.db"
+DB_NAME = os.getenv("AUDIT_DB_PATH", "lucid_audit.db")
 
 def init_db():
+    """Initializes the SQLite audit ledger with a unified schema."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('''
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT,
-            model_input TEXT,
-            status TEXT,
-            flagged_data TEXT
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+            client_ip TEXT,
+            endpoint TEXT,
+            threat_detected BOOLEAN,
+            violation_type TEXT,
+            masked_payload TEXT
         )
-    ''')
+    """)
     conn.commit()
     conn.close()
 
-def log_audit(model_input: str, status: str, flagged_data: list):
+def log_audit_event(client_ip: str, endpoint: str, threat_detected: bool, violation_type: str, payload: str):
+    """Logs an audit event with PII masking."""
+    # Mask potential SSNs or sensitive strings before writing to SQLite
+    masked = payload
+    if len(payload) > 10:
+        masked = payload[:4] + "****" + payload[-4:]
+
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO audit_logs (timestamp, model_input, status, flagged_data) VALUES (?, ?, ?, ?)",
-        (datetime.utcnow().isoformat(), model_input, status, json.dumps(flagged_data))
-    )
+    cursor.execute("""
+        INSERT INTO audit_logs (client_ip, endpoint, threat_detected, violation_type, masked_payload)
+        VALUES (?, ?, ?, ?, ?)
+    """, (client_ip, endpoint, threat_detected, violation_type, masked))
     conn.commit()
     conn.close()
-
-def get_logs(limit: int = 20):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("SELECT timestamp, model_input, status, flagged_data FROM audit_logs ORDER BY id DESC LIMIT ?", (limit,))
-    rows = cursor.fetchall()
-    conn.close()
-    return [{"timestamp": r[0], "prompt": r[1], "status": r[2], "flags": json.loads(r[3])} for r in rows]
-    
