@@ -1,74 +1,72 @@
 import os
-from fastapi import FastAPI, Header, HTTPException, Request, status
+import sqlite3
+from datetime import datetime
+from typing import Optional
+from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
-from database import init_db, log_audit_event
 
-app = FastAPI(title="Lucid-Truth-Audit Gateway", version="1.0.0")
+# Initialize FastAPI App
+app = FastAPI(
+    title="Lucid-Truth-Audit",
+    description="The Stickney Audit Mandate - Real-time Edge Security Gateway & PII Redaction Middleware",
+    version="1.0.0"
+)
 
-# Initialize database on startup
-@app.on_event("startup")
-def startup_event():
-    init_db()
+# Configuration from Environment Variables
+API_KEY = os.getenv("LUCID_API_KEY", "lucid-prop-key-2026")
+DB_PATH = os.getenv("AUDIT_DB_PATH", "lucid_audit.db")
 
-class PromptPayload(BaseModel):
-    prompt: str = Field(..., description="The user prompt or query destined for the LLM pipeline.")
-    jurisdiction: str = Field(default="US", description="Target compliance jurisdiction (e.g., US, EU).")
+# Pydantic v2 Schemas
+class GuardRequest(BaseModel):
+    model_input: str = Field(..., description="The raw prompt input to be scanned by the edge gateway.")
 
-def verify_api_key(x_api_key: str = Header(...)):
-    """Enforces strict API key authentication from environment variables."""
-    expected_key = os.getenv("LUCID_API_KEY")
-    if not expected_key:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server misconfigured: LUCID_API_KEY environment variable is not set."
+class GuardResponse(BaseModel):
+    status: str
+    risk_level: str
+    message: str
+    masked_input: Optional[str] = None
+
+# Initialize SQLite Tamper-Evident Ledger
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            threat_detected INTEGER,
+            violation_type TEXT,
+            masked_payload TEXT
         )
-    if x_api_key != expected_key:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid or missing x-api-key header."
-        )
-    return x_api_key
+    """)
+    conn.commit()
+    conn.close()
 
-@app.post("/audit", status_code=status.HTTP_200_OK)
-async def audit_prompt(request: Request, payload: PromptPayload, x_api_key: str = Header(...)):
-    verify_api_key(x_api_key)
+init_db()
+
+def log_event(threat_detected: int, violation_type: str, payload: str):
+    """Safely logs masked payloads and threats to the SQLite database."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    client_ip = request.client.host if request.client else "unknown"
-    prompt_text = payload.prompt.lower()
-
-    # Heuristic threat and PII detection matrix
-    threat_detected = False
-    violation_type = "None"
-
-    if "ignore previous instructions" in prompt_text or "system prompt" in prompt_text:
-        threat_detected = True
-        violation_type = "Prompt Injection"
-    elif "ssn" in prompt_text or "social security" in prompt_text:
-        threat_detected = True
-        violation_type = "PII Exfiltration (SSN)"
-
-    # Log to the persistent SQLite ledger
-    log_audit_event(
-        client_ip=client_ip,
-        endpoint="/audit",
-        threat_detected=threat_detected,
-        violation_type=violation_type,
-        payload=payload.prompt
+    # Data minimization / PII masking
+    masked = payload[:4] + "****" + payload[-4:] if len(payload) > 8. else "****"
+    
+    cursor.execute(
+        "INSERT INTO audit_logs (timestamp, threat_detected, violation_type, masked_payload) VALUES (?, ?, ?, ?)",
+        (datetime.utcnow.isoformat(), threat_detected, violation_type, masked)
     )
+    conn.commit()
+    conn.close()
 
-    if threat_detected:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "Payload intercepted by Lucid-Truth-Audit edge guardrail.",
-                "violation": violation_type,
-                "status": "Blocked",
-                "tokens_burned": 0
-            }
-        )
-
+@app.get("/")
+def read_root():
+    """Root endpoint to verify the Lucid-Truth-Audit gateway is online."""
     return {
-        "status": "Approved",
-        "jurisdiction": payload.jurisdiction,
-        "message": "Payload passed Pydantic v2 edge validation."
+        "status": "online",
+        "service": "Lucid-Truth-Audit (The Stickney Audit Mandate)",
+        "version": "1.0.0",
+        "active_endpoint": "/api/v1/guard"
     }
+
+@app.post("/api/v1/guard", response_model
