@@ -3,7 +3,6 @@ import binascii
 import re
 import unicodedata
 
-# Common Cyrillic and Greek homoglyphs mapped to ASCII
 HOMOGLYPH_MAP = str.maketrans({
     "а": "a", "А": "A", "е": "e", "Е": "E", "о": "o", "О": "O",
     "р": "p", "Р": "P", "с": "c", "С": "C", "у": "y", "У": "Y",
@@ -13,7 +12,7 @@ HOMOGLYPH_MAP = str.maketrans({
     "ρ": "p", "Ρ": "P", "τ": "t", "Τ": "T", "υ": "y", "χ": "x",
 })
 
-B64_PATTERN = re.compile(r"\b[A-Za-z0-9+/]{16,2048}={0,2}\b")
+B64_PATTERN = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{16,2048}={0,2}(?![A-Za-z0-9+/=])")
 HEX_PATTERN = re.compile(r"\b(?:0x)?([0-9a-fA-F]{16,2048})\b")
 
 MAX_DECODED_CHUNKS = 8
@@ -21,7 +20,6 @@ MAX_SCAN_LENGTH = 20000
 
 
 def strip_invisible_and_fold(text: str) -> str:
-    # Remove Unicode format/zero-width characters (e.g., U+200B, U+200C, U+FEFF)
     cleaned = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
     folded = unicodedata.normalize("NFKC", cleaned)
     return folded.translate(HOMOGLYPH_MAP)
