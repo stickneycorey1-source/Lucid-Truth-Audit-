@@ -9,4 +9,4 @@ google-genai>=0.3.0
 streamlit>=1.39.0
 pytest-html
 pytest-json-report
-
+psycopg[binary]>=3.2.0
