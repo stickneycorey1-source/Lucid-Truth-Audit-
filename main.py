@@ -1,3 +1,13 @@
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from db import init_audit_table, log_audit_event
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_audit_table()
+    yield
+
+app = FastAPI(title="Lucid-Truth-Audit", lifespan=lifespan)
 import hashlib
 import hmac
 import os
