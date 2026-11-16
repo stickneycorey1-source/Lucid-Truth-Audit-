@@ -1,9 +1,11 @@
 import os
 import sqlite3
-import psycopg
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 DB_PATH = os.getenv("AUDIT_DB_PATH", "lucid_audit.db")
+
+if DATABASE_URL:
+    import psycopg
 
 
 def get_connection():
