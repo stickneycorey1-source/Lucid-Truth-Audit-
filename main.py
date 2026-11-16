@@ -9,6 +9,7 @@ from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from db import init_db, insert_audit_log
+from normalize import normalize_for_scan
 
 app = FastAPI(
     title="Lucid-Truth-Audit",
@@ -99,13 +100,18 @@ def guard_prompt(
         )
 
     raw_input = request.model_input
-    lowered = raw_input.lower()
+    scan_text = normalize_for_scan(raw_input)
+    lowered = scan_text.lower()
 
     flagged_terms = [phrase for phrase in INJECTION_PHRASES if phrase in lowered]
-    if REPEATING_CHAR_PATTERN.search(raw_input):
+    if REPEATING_CHAR_PATTERN.search(raw_input) or REPEATING_CHAR_PATTERN.search(scan_text):
         flagged_terms.append("anomaly_repeating_chars")
 
     masked_text, flagged_pii = redact_pii(raw_input)
+    _, decoded_pii = redact_pii(scan_text)
+    for pii in decoded_pii:
+        if pii not in flagged_pii:
+            flagged_pii.append(pii)
 
     if flagged_terms or flagged_pii:
         risk_level = "critical" if (flagged_terms and flagged_pii) or "SSN" in flagged_pii else "high"
