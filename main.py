@@ -1,23 +1,14 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from db import init_audit_table, log_audit_event
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_audit_table()
-    yield
-
-app = FastAPI(title="Lucid-Truth-Audit", lifespan=lifespan)
 import hashlib
 import hmac
 import os
 import re
-import sqlite3
 from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
+
+from db import init_db, insert_audit_log
 
 app = FastAPI(
     title="Lucid-Truth-Audit",
@@ -29,8 +20,6 @@ app = FastAPI(
 API_KEY = os.getenv("LUCID_API_KEY")
 if not API_KEY:
     raise RuntimeError("LUCID_API_KEY environment variable must be set.")
-
-DB_PATH = os.getenv("AUDIT_DB_PATH", "lucid_audit.db")
 
 # Pre-compiled detection patterns
 SSN_PATTERN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
@@ -66,39 +55,15 @@ class GuardResponse(BaseModel):
     flagged_pii: List[str] = Field(default_factory=list)
 
 
-def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                threat_detected INTEGER NOT NULL,
-                violation_type TEXT NOT NULL,
-                masked_payload TEXT NOT NULL,
-                payload_sha256 TEXT NOT NULL
-            )
-            """
-        )
-
-
 init_db()
 
 
 def log_event(threat_detected: int, violation_type: str, payload: str) -> None:
-    """Safely logs hashed and redacted payloads to the SQLite ledger."""
+    """Safely logs hashed and redacted payloads to PostgreSQL (or SQLite in CI)."""
     payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     masked = f"[REDACTED len={len(payload)}]"
     timestamp = datetime.now(timezone.utc).isoformat()
-
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            INSERT INTO audit_logs (timestamp, threat_detected, violation_type, masked_payload, payload_sha256)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (timestamp, threat_detected, violation_type, masked, payload_hash),
-        )
+    insert_audit_log(timestamp, threat_detected, violation_type, masked, payload_hash)
 
 
 def redact_pii(text: str) -> tuple[str, List[str]]:
