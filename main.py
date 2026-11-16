@@ -1,8 +1,10 @@
 import hashlib
+import hmac
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,12 +15,26 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Fail closed if LUCID_API_KEY is unset in production
+# Fail closed if LUCID_API_KEY is unset in production (set in Render Environment Variables)
 API_KEY = os.getenv("LUCID_API_KEY")
 if not API_KEY:
     raise RuntimeError("LUCID_API_KEY environment variable must be set.")
 
 DB_PATH = os.getenv("AUDIT_DB_PATH", "lucid_audit.db")
+
+# Pre-compiled detection patterns
+SSN_PATTERN = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+EMAIL_PATTERN = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+REPEATING_CHAR_PATTERN = re.compile(r"(.)\1{19,}")
+
+INJECTION_PHRASES = (
+    "ignore all previous instructions",
+    "ignore previous instructions",
+    "disregard your instructions",
+    "reveal your system prompt",
+    "output your system prompt",
+    "bypass safety",
+)
 
 
 class GuardRequest(BaseModel):
@@ -36,6 +52,8 @@ class GuardResponse(BaseModel):
     risk_level: str
     message: str
     masked_input: Optional[str] = None
+    flagged_terms: List[str] = Field(default_factory=list)
+    flagged_pii: List[str] = Field(default_factory=list)
 
 
 def init_db() -> None:
@@ -71,3 +89,66 @@ def log_event(threat_detected: int, violation_type: str, payload: str) -> None:
             """,
             (timestamp, threat_detected, violation_type, masked, payload_hash),
         )
+
+
+def redact_pii(text: str) -> tuple[str, List[str]]:
+    """Detects and masks PII patterns without exposing raw values."""
+    pii_types: List[str] = []
+    masked_text = text
+
+    if SSN_PATTERN.search(masked_text):
+        pii_types.append("SSN")
+        masked_text = SSN_PATTERN.sub("[REDACTED_SSN]", masked_text)
+
+    if EMAIL_PATTERN.search(masked_text):
+        pii_types.append("EMAIL")
+        masked_text = EMAIL_PATTERN.sub("[REDACTED_EMAIL]", masked_text)
+
+    return masked_text, pii_types
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "service": "Lucid-Truth-Audit", "version": "1.0.0"}
+
+
+@app.post("/api/v1/guard", response_model=GuardResponse)
+def guard_prompt(
+    request: GuardRequest,
+    x_api_key: Optional[str] = Header(default=None),
+):
+    if not x_api_key or not hmac.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid API Key",
+        )
+
+    raw_input = request.model_input
+    lowered = raw_input.lower()
+
+    flagged_terms = [phrase for phrase in INJECTION_PHRASES if phrase in lowered]
+    if REPEATING_CHAR_PATTERN.search(raw_input):
+        flagged_terms.append("anomaly_repeating_chars")
+
+    masked_text, flagged_pii = redact_pii(raw_input)
+
+    if flagged_terms or flagged_pii:
+        risk_level = "critical" if (flagged_terms and flagged_pii) or "SSN" in flagged_pii else "high"
+        violation_type = ",".join(flagged_terms + flagged_pii)
+        log_event(threat_detected=1, violation_type=violation_type, payload=raw_input)
+        return GuardResponse(
+            status="blocked",
+            risk_level=risk_level,
+            message="Request blocked by Lucid-Truth-Audit guardrail.",
+            masked_input=masked_text,
+            flagged_terms=flagged_terms,
+            flagged_pii=flagged_pii,
+        )
+
+    log_event(threat_detected=0, violation_type="none", payload=raw_input)
+    return GuardResponse(
+        status="cleared",
+        risk_level="none",
+        message="Input cleared.",
+        masked_input=masked_text,
+    )
