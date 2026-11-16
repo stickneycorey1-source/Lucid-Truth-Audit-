@@ -1,49 +1,51 @@
 import os
 import sqlite3
-import uuid
-from datetime import datetime, timezone
 import psycopg
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-AUDIT_DB_PATH = os.getenv("AUDIT_DB_PATH", "lucid_audit.db")
+DB_PATH = os.getenv("AUDIT_DB_PATH", "lucid_audit.db")
 
 
-def get_db_connection():
+def get_connection():
     if DATABASE_URL:
         return psycopg.connect(DATABASE_URL)
-    return sqlite3.connect(AUDIT_DB_PATH)
+    return sqlite3.connect(DB_PATH)
 
 
-def init_audit_table():
-    with get_db_connection() as conn:
+def init_db() -> None:
+    id_col = "SERIAL PRIMARY KEY" if DATABASE_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS audit_logs (
-                id TEXT PRIMARY KEY,
-                timestamp_utc TEXT NOT NULL,
-                payload_sha256 TEXT NOT NULL,
-                status TEXT NOT NULL,
-                detected_vector TEXT
+                id {id_col},
+                timestamp TEXT NOT NULL,
+                threat_detected INTEGER NOT NULL,
+                violation_type TEXT NOT NULL,
+                masked_payload TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL
             )
             """
         )
         conn.commit()
 
 
-def log_audit_event(payload_sha256: str, status: str, detected_vector: str | None = None) -> str:
-    audit_id = str(uuid.uuid4())
-    timestamp_utc = datetime.now(timezone.utc).isoformat()
+def insert_audit_log(
+    timestamp: str,
+    threat_detected: int,
+    violation_type: str,
+    masked_payload: str,
+    payload_sha256: str,
+) -> None:
     ph = "%s" if DATABASE_URL else "?"
-
-    with get_db_connection() as conn:
+    with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
             f"""
-            INSERT INTO audit_logs (id, timestamp_utc, payload_sha256, status, detected_vector)
+            INSERT INTO audit_logs (timestamp, threat_detected, violation_type, masked_payload, payload_sha256)
             VALUES ({ph}, {ph}, {ph}, {ph}, {ph})
             """,
-            (audit_id, timestamp_utc, payload_sha256, status, detected_vector),
+            (timestamp, threat_detected, violation_type, masked_payload, payload_sha256),
         )
         conn.commit()
-    return audit_id
