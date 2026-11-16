@@ -1,0 +1,61 @@
+from datetime import datetime, timezone
+import pytest
+from pytest_metadata.plugin import metadata_key
+
+
+def pytest_html_report_title(report):
+    """Set the browser tab and main H1 title of compliance_audit.html."""
+    report.title = "Lucid-Truth-Audit — AI Compliance & Guardrail Report"
+
+
+def pytest_configure(config):
+    """Add EU AI Act and framework metadata to the Environment table."""
+    if config.pluginmanager.getplugin("metadata"):
+        config.stash[metadata_key]["Framework"] = (
+            "Lucid-Truth-Audit (FastAPI + Pydantic v2)"
+        )
+        config.stash[metadata_key]["Regulatory Alignment"] = (
+            "EU AI Act (Regulation (EU) 2024/1689) | ISO/IEC 42001"
+        )
+        config.stash[metadata_key]["Verification Scope"] = (
+            "Deterministic Schema Guardrails & Red-Team Suite"
+        )
+        config.stash[metadata_key]["Audit Timestamp (UTC)"] = datetime.now(
+            timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+        config.stash[metadata_key]["Owner"] = (
+            "Corey Allen Stickney (Lucid Truth)"
+        )
+
+
+def pytest_html_results_summary(prefix, summary, postfix):
+    """Add a branded compliance attestation banner above the summary counts."""
+    prefix.extend(
+        [
+            "<div style='padding:12px 16px;margin:12px 0;border-left:4px solid #2563EB;"
+            "background:#F6F8FA;border-radius:4px;font-family:sans-serif;'>"
+            "<strong>Compliance Attestation Summary:</strong> "
+            "Automated pre-deployment verification of FastAPI edge guardrails, "
+            "strict Pydantic v2 schema enforcement, and adversarial prompt handling "
+            "aligned with EU AI Act risk-management and post-market monitoring expectations."
+            "</div>"
+        ]
+    )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """Attach each test function's docstring to the report object."""
+    outcome = yield
+    report = outcome.get_result()
+    report.description = (item.function.__doc__ or "").strip()
+
+
+def pytest_html_results_table_header(cells):
+    """Insert a Description column into the HTML results table."""
+    cells.insert(2, "<th>Description</th>")
+
+
+def pytest_html_results_table_row(report, cells):
+    """Populate the Description column with the test's docstring."""
+    cells.insert(2, f"<td>{getattr(report, 'description', '')}</td>")
