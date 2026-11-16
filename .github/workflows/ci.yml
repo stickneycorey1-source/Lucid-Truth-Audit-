@@ -2,12 +2,12 @@ name: Lucid Truth Audit CI
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: [ main, master ]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [ main, master ]
 
 jobs:
-  audit-verification:
+  audit:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Lucid-Truth-Audit
@@ -17,7 +17,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install Dependencies
         run: |
@@ -25,8 +24,19 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run Red Team & Pydantic Guardrail Suite
-        env:
-          PYTHONPATH: .
-          LUCID_API_KEY: ${{ secrets.LUCID_API_KEY || 'lucid-prop-key-2026' }}
         run: |
-          pytest -v || echo "Ensure test_*.py files are in root or /tests directory"
+          mkdir -p reports
+          pytest -v \
+            --html=reports/compliance_audit.html \
+            --self-contained-html \
+            --json-report \
+            --json-report-file=reports/compliance_audit.json
+
+      - name: Upload Compliance Audit Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-audit-reports-${{ github.run_number }}
+          path: reports/
+          retention-days: 30
+          if-no-files-found: error
