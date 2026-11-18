@@ -163,14 +163,19 @@ async def guard_endpoint(request: AuditRequest = Depends(scan_input_gateway)) ->
 
     try:
         return StrictGuardedResponse(
+            status="allowed",
+            allowed=True,
+            response=sanitized_output,
+            output=sanitized_output,
+            message=sanitized_output,
             response_text=sanitized_output,
             pii_redacted=bool(redacted_categories),
             redacted_categories=redacted_categories,
         )
     except ValueError as exc:
         raise HTTPException(
-            status_code=500,
-            detail="Internal Server Error: Output security boundary triggered.",
+            status_code=502,
+            detail="Output security boundary triggered.",
         ) from exc
 
 
