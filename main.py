@@ -163,7 +163,7 @@ async def guard_endpoint(request: AuditRequest = Depends(scan_input_gateway)) ->
 
     try:
         return StrictGuardedResponse(
-            status="allowed",
+            status="success",
             allowed=True,
             response=sanitized_output,
             output=sanitized_output,
