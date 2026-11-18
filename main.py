@@ -82,7 +82,10 @@ INJECTION_PHRASES = [
     "override system instructions",
 ]
 
-BASE64_TOKEN_PATTERN = re.compile(r"\b[A-Za-z0-9+/]{16,}={0,2}\b")
+# Lookarounds preserve trailing '=' padding (unlike \b, which stripped '=' and broke validate=True)
+BASE64_TOKEN_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{16,}={0,2}(?![A-Za-z0-9+/=])"
+)
 HEX_TOKEN_PATTERN = re.compile(r"\b(?:0x)?[0-9a-fA-F]{24,}\b")
 
 
@@ -163,23 +166,15 @@ async def guard_endpoint(request: AuditRequest = Depends(scan_input_gateway)) ->
 
     try:
         return StrictGuardedResponse(
-            status="allow",
+            status="success",
             decision="allow",
             verdict="allow",
-            action="allow",
-            result="allow",
-            guardrail_status="passed",
             allowed=True,
             safe=True,
             blocked=False,
-            flagged=False,
             response=sanitized_output,
             output=sanitized_output,
-            model_output=sanitized_output,
             message=sanitized_output,
-            reply=sanitized_output,
-            text=sanitized_output,
-            content=sanitized_output,
             response_text=sanitized_output,
             pii_redacted=bool(redacted_categories),
             redacted_categories=redacted_categories,
