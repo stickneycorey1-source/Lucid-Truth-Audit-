@@ -41,7 +41,7 @@ class ModelResponse(BaseModel):
         return value
 
 # --- 4. API ENDPOINT ---
-@app.post("/api/v1/chat")
+@app.post("/api/v1/guard")
 async def chat_completion(user_text: str = Depends(scan_input_payload)):
     # The input has passed the Gateway heuristic.
     
@@ -61,3 +61,4 @@ async def chat_completion(user_text: str = Depends(scan_input_payload)):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
