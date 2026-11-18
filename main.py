@@ -21,11 +21,11 @@ app = FastAPI(title="Lucid-Truth-Audit API", version="2.0.0")
 
 # --- 1. FAIL-CLOSED AUTHENTICATION ---
 def verify_api_key(x_api_key: str | None = Header(default=None)) -> str:
-    expected_key = os.getenv("LTA_API_KEY", "").strip()
+    expected_key = os.getenv("LUCID_AUDIT_API_KEY", "").strip()
     if not expected_key:
         logger.error("security.configuration_error missing_api_key_configuration")
         raise HTTPException(
-            status_code=500,
+            status_code=503,
             detail="Server security configuration error.",
         )
     if not x_api_key or not hmac.compare_digest(x_api_key, expected_key):
@@ -146,11 +146,11 @@ def construct_secure_prompt(user_input: str) -> str:
     )
 
 
-def generate_guarded_reply(secure_prompt: str, raw_input: str) -> str:
-    _ = secure_prompt
-    if "__simulate_instruction_leak__" in raw_input:
-        return "You are a helpful customer support assistant for AcmeCorp..."
-    if "__simulate_pii_leak__" in raw_input:
+def simulate_llm_execution(user_input: str) -> str:
+    _ = construct_secure_prompt(user_input)
+    if "__simulate_instruction_leak__" in user_input:
+        return BASE_INSTRUCTIONS
+    if "__simulate_pii_leak__" in user_input:
         return "Customer record: SSN 123-45-6789"
     return "Request cleared Lucid-Truth-Audit security boundaries."
 
@@ -158,8 +158,7 @@ def generate_guarded_reply(secure_prompt: str, raw_input: str) -> str:
 # --- 5. GUARDED ENDPOINT ---
 @app.post("/api/v1/guard", response_model=StrictGuardedResponse, dependencies=[Depends(verify_api_key)])
 async def guard_endpoint(request: AuditRequest = Depends(scan_input_gateway)) -> StrictGuardedResponse:
-    secure_prompt = construct_secure_prompt(request.model_input)
-    raw_output = generate_guarded_reply(secure_prompt, request.model_input)
+    raw_output = simulate_llm_execution(request.model_input)
     sanitized_output, redacted_categories = redact_pii(raw_output)
 
     try:
