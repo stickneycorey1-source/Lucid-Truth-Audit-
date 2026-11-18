@@ -7,7 +7,7 @@ on:
     branches: ["main"]
 
 env:
-  LTA_API_KEY: ${{ secrets.LTA_API_KEY || 'valid-test-key' }}
+  LUCID_AUDIT_API_KEY: ${{ secrets.LUCID_AUDIT_API_KEY || 'test-only-secret' }}
 
 jobs:
   audit:
