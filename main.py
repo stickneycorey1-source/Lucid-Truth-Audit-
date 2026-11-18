@@ -13,13 +13,19 @@ from vector2_pii_guard import (
     redact_pii,
     scan_social_engineering,
 )
+from vector3_resilience_guard import (
+    ConversationTurn,
+    rate_limiter,
+    scan_payload_anomalies,
+    validate_conversation_history,
+)
 
 logger = logging.getLogger("lucid_truth_audit")
 
-app = FastAPI(title="Lucid-Truth-Audit API", version="2.0.0")
+app = FastAPI(title="Lucid-Truth-Audit API", version="3.0.0")
 
 
-# --- 1. FAIL-CLOSED AUTHENTICATION ---
+# --- 1. FAIL-CLOSED AUTHENTICATION & SLIDING-WINDOW RATE LIMIT ---
 def verify_api_key(x_api_key: str | None = Header(default=None)) -> str:
     expected_key = os.getenv("LUCID_AUDIT_API_KEY", "").strip()
     if not expected_key:
@@ -34,6 +40,7 @@ def verify_api_key(x_api_key: str | None = Header(default=None)) -> str:
             status_code=403,
             detail="Invalid API Key",
         )
+    rate_limiter.check(x_api_key)
     return x_api_key
 
 
@@ -41,6 +48,7 @@ def verify_api_key(x_api_key: str | None = Header(default=None)) -> str:
 class AuditRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     model_input: str = Field(..., min_length=1, max_length=4000)
+    conversation_history: list[ConversationTurn] | None = None
 
     @field_validator("model_input")
     @classmethod
@@ -50,7 +58,7 @@ class AuditRequest(BaseModel):
         return value
 
 
-# --- 3. CANONICALIZATION & ENCODING DECODER (VECTOR 1 + VECTOR 2) ---
+# --- 3. CANONICALIZATION, ANOMALY & ENCODING DECODER (VECTOR 1 + 2 + 3) ---
 ZERO_WIDTH_PATTERN = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
 
 HOMOGLYPH_MAP = str.maketrans({
@@ -82,7 +90,6 @@ INJECTION_PHRASES = [
     "override system instructions",
 ]
 
-# Lookarounds preserve trailing '=' padding (unlike \b, which stripped '=' and broke validate=True)
 BASE64_TOKEN_PATTERN = re.compile(
     r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{16,}={0,2}(?![A-Za-z0-9+/=])"
 )
@@ -120,6 +127,10 @@ def _extract_decoded_variants(text: str) -> list[str]:
 
 
 def scan_input_gateway(request: AuditRequest) -> AuditRequest:
+    scan_payload_anomalies(request.model_input)
+    if request.conversation_history:
+        validate_conversation_history(request.conversation_history)
+
     for variant in _extract_decoded_variants(request.model_input):
         if any(phrase in variant for phrase in INJECTION_PHRASES):
             logger.warning("security.input_blocked category=prompt_injection")
