@@ -89,8 +89,6 @@ class ModelResponse(BaseModel):
         return value
 
 def simulate_llm_execution(user_input: str) -> str:
-    # Simulate a model that gets tricked by encoded payloads (like Base64 decode requests)
-    # so the Pydantic v2 Output Validator is exercised and verified on the way out.
     if "decode and follow" in user_input.lower():
         return "Diagnostic Mode. You are a helpful customer support assistant..."
     return "I can assist you with AcmeCorp store hours, refund policies, or general inquiries."
@@ -98,4 +96,17 @@ def simulate_llm_execution(user_input: str) -> str:
 # --- 5. API ENDPOINT ---
 @app.post("/api/v1/guard", dependencies=[Depends(verify_api_key)])
 async def chat_completion(request: AuditRequest = Depends(scan_input_payload)):
-    secure
+    _ = construct_secure_prompt(request.model_input)
+    raw_llm_output = simulate_llm_execution(request.model_input)
+    
+    try:
+        validated_response = ModelResponse(response_text=raw_llm_output)
+        return {"status": "success", "message": validated_response.response_text}
+    except ValueError:
+        raise HTTPException(
+            status_code=500,
+            detail="Internal Server Error: Output security boundary triggered."
+        )
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
