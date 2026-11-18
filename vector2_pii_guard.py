@@ -95,7 +95,7 @@ def redact_pii(text: str) -> Tuple[str, List[str]]:
 
 class StrictGuardedResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    status: str = "allowed"
+    status: str = "success"
     allowed: bool = True
     response: str = ""
     output: str = ""
