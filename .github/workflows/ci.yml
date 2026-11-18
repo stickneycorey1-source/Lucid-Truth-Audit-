@@ -30,7 +30,7 @@ jobs:
 
       - name: Run Red Team & Pydantic Guardrail Suite
         run: |
-          pytest test_audit.py test_vector2_pii.py -v --html=compliance_audit.html --self-contained-html
+          pytest test_audit.py test_vector2_pii.py test_vector3_resilience.py -v --html=compliance_audit.html --self-contained-html
 
       - name: Upload Compliance Audit Artifacts
         if: always()
