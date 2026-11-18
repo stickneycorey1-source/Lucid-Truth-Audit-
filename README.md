@@ -1,33 +1,39 @@
-# Lucid-Truth-Audit
+# Lucid-Truth-Audit (LTA)
 
-[[https://github.com/stickneycorey1/Lucid-Truth-Audit/actions/workflows/ci.yml/badge.svg]](https://github.com/stickneycorey1/Lucid-Truth-Audit/actions/workflows/ci.yml)
+[![Lucid Truth Audit CI](https://github.com/stickneycorey1-source/Lucid-Truth-Audit/actions/workflows/ci.yml/badge.svg)](https://github.com/stickneycorey1-source/Lucid-Truth-Audit/actions)
+![Test Suite](https://img.shields.io/badge/Pytest_Guardrail_Suite-17%2F17_Passing-10b981?style=flat&logo=pytest&logoColor=white)
+![Live API](https://img.shields.io/badge/Live_Endpoint-Render_Active-38bdf8?style=flat&logo=fastapi&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.11.18-3776ab?style=flat&logo=python&logoColor=white)
+![Pydantic](https://img.shields.io/badge/Pydantic-v2_Strict-e92063?style=flat&logo=pydantic&logoColor=white)
+![Compliance](https://img.shields.io/badge/Compliance-EU_AI_Act_%7C_ISO%2FIEC_42001-6366f1?style=flat)
+![License](https://img.shields.io/badge/License-MIT-slate?style=flat)
 
-**Pre-emptive AI Compliance & Deterministic Guardrail Gateway**  
-*Built for the EU AI Act. Ready for Everywhere.*
+**Deterministic AI Compliance, Schema Guardrails, and Automated Red-Team Verification for Production LLM APIs.**
 
----
+Lucid-Truth-Audit (LTA) wraps LLM endpoints in a defense-in-depth FastAPI and Pydantic v2 security gateway. Every request passes through fail-closed authentication, Unicode/encoding canonicalization, structural prompt isolation, and strict output boundary validation—generating auditable compliance artifacts aligned with **EU AI Act (Regulation (EU) 2024/1689)** and **ISO/IEC 42001** risk-management standards.
 
-## Global Compliance Positioning (EU AI Act & Beyond)
-
-Because the [EU AI Act (Regulation (EU) 2024/1689)](https://www.orbiqhq.com/eu-regulations/eu-ai-act-compliance) applies extraterritorially to any AI system whose outputs are used in the European Union—with statutory penalties reaching up to **€35M or 7% of global annual turnover** ([DLA Piper](https://intelligence.dlapiper.com/artificial-intelligence/?t=08-enforcement&c=EU))—enterprise buyers increasingly treat European requirements as their global engineering baseline.
-
-**Lucid-Truth-Audit** implements a **"Comply Once, Deploy Everywhere"** architecture at the API layer, helping organizations satisfy overlapping technical mandates across the EU AI Act, [South Korea's AI Basic Act](https://www.lrqa.com/en/insights/articles/ai-regulation-worldwide-where-iso-42001-fits/), U.S. state human-review laws, and [ISO/IEC 42001](https://www.lrqa.com/en/insights/articles/ai-regulation-worldwide-where-iso-42001-fits/) procurement reviews:
-
-| Regulatory Expectation | Lucid-Truth-Audit Control | Verifiable Evidence |
-| :--- | :--- | :--- |
-| **Pre-Deployment Risk Mitigation** | FastAPI request/response interception before model execution | Real-time schema & policy rejection logs |
-| **Deterministic Output Integrity** | Strict Pydantic v2 validation (`extra="forbid"`) | Zero malformed or out-of-policy payloads |
-| **Continuous Red-Team Testing** | Automated Pytest adversarial & guardrail suite (**~2s** in CI) | Timestamped GitHub Actions pass/fail runs |
-| **Audit-Ready Documentation** | Self-contained HTML & structured JSON compliance artifacts | Downloadable `compliance_audit.html` & `.json` |
+* **Live Interactive API & Swagger Docs:** [https://lucid-truth-audit.onrender.com/docs](https://lucid-truth-audit.onrender.com/docs)
+* **30-Day Shadow Pilot Intake:** `[Insert 30-Day Shadow Pilot Intake Form URL]`
 
 ---
 
-## 30-Day Enterprise Proof-of-Concept
+## Defense-in-Depth Architecture
 
-1. **Connect:** Route staging or shadow AI traffic through the FastAPI guardrail endpoint.
-2. **Verify:** Run the automated Pytest red-team and schema validation suite on every commit.
-3. **Export:** Download the branded `compliance_audit.html` scorecard and `compliance_audit.json` telemetry directly from the **GitHub Actions → Artifacts** tab for legal and security review.
-
----
-
-*Copyright © 2026 Corey Allen Stickney (Dr. Lucid / Lucid Truth). All rights reserved.*
+```text
+Incoming Request ─► [1. Fail-Closed Auth: x-api-key Verification]
+                        ├─► Missing / Invalid Key ───────────► 403 Forbidden (security.authentication_rejected)
+                        ├─► Missing Server Secret ───────────► 500 Fail-Closed (security.configuration_error)
+                        ▼
+                    [2. Strict Input Schema: Pydantic v2]
+                        ├─► Unexpected Fields / Bad Shapes ──► 422 Unprocessable Entity
+                        ▼
+                    [3. Canonicalization & Heuristic Gateway]
+                        ├─► Zero-Width / Cyrillic Homoglyph ─► 400 Bad Request (security.input_blocked)
+                        ├─► Base64 / Hex Encoded Injection ──► 400 Bad Request (security.input_blocked)
+                        ▼
+                    [4. Structural Sandwich Isolation & LLM Execution]
+                        ├─► XML <user_input> Boundary + Terminal Non-Disclosure Directive
+                        ▼
+                    [5. Output Boundary Validator: Pydantic v2]
+                        ├─► Instruction / PII Leak Detected ─► 500 Blocked (security.output_rejected)
+                        └─► Validated Payload ───────────────► 200 OK + Redacted Audit Ledger
