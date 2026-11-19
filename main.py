@@ -8,9 +8,22 @@ import logging
 import unicodedata
 from collections import defaultdict
 from typing import List, Optional, Literal
-from fastapi import FastAPI, Header, HTTPException, Request, status
-from pydantic import BaseModel, Field, ConfigDict, field_validator
-from app.schemas.logistics_guard import router as logistics_router
+
+from fastapi import FastAPI, Header, HTTPException, status
+from pydantic import BaseModel, Field, ConfigDict
+
+# Optional companion guard modules if present in your repo
+try:
+    import vector2_pii_guard  # type: ignore
+except Exception:
+    vector2_pii_guard = None
+
+try:
+    import vector3_resilience_guard  # type: ignore
+except Exception:
+    vector3_resilience_guard = None
+
+from app.schemas.logistics_guard import router as logistics_router[span_1](start_span)[span_1](end_span)
 
 logger = logging.getLogger("lucid_truth_audit")
 
@@ -31,24 +44,32 @@ INJECTION_SIGNATURES = [
     r"(?i)export\s+all\s+customer\s+records",
 ]
 
+SOCIAL_ENGINEERING_PII_SIGNATURES = [
+    r"(?i)(system\s+administrator|security\s+auditor|compliance\s+officer).*?(export|list|reveal|bypass).*?(customer|ssn|user|privacy)",
+]
+
 
 def normalize_obfuscated_text(text: str) -> str:
-    # Strip zero-width chars
     stripped = re.sub(r"[\u200b-\u200f\ufeff]", "", text)
-    # Normalize Cyrillic homoglyphs
-    homoglyphs = str.maketrans({"о": "o", "е": "e", "а": "a", "і": "i", "р": "p", "с": "c", "у": "y", "х": "x"})
+    homoglyphs = str.maketrans({
+        "о": "o", "е": "e", "а": "a", "і": "i", "р": "p", "с": "c", "у": "y", "х": "x",
+        "О": "O", "Е": "E", "А": "A", "І": "I", "Р": "P", "С": "C", "У": "Y", "Х": "X",
+    })
     normalized = unicodedata.normalize("NFKC", stripped).translate(homoglyphs)
     candidates = [normalized]
-    # Attempt base64 / hex decode inspection
     compact = normalized.strip()
     if len(compact) >= 12 and len(compact) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/=]+", compact):
         try:
-            candidates.append(base64.b64decode(compact).decode("utf-8", errors="ignore"))
+            decoded = base64.b64decode(compact).decode("utf-8", errors="ignore")
+            if decoded:
+                candidates.append(decoded)
         except Exception:
             pass
     if len(compact) >= 16 and len(compact) % 2 == 0 and re.fullmatch(r"[0-9a-fA-F]+", compact):
         try:
-            candidates.append(bytes.fromhex(compact).decode("utf-8", errors="ignore"))
+            decoded_hex = bytes.fromhex(compact).decode("utf-8", errors="ignore")
+            if decoded_hex:
+                candidates.append(decoded_hex)
         except Exception:
             pass
     return " ".join(candidates)
@@ -59,7 +80,12 @@ def contains_injection(text: str) -> bool:
     return any(re.search(sig, expanded) for sig in INJECTION_SIGNATURES)
 
 
-# --- Vector 2: PII & Secret Scrubbing ---
+def is_social_engineering_pii_pretext(text: str) -> bool:
+    expanded = normalize_obfuscated_text(text)
+    return any(re.search(sig, expanded) for sig in SOCIAL_ENGINEERING_PII_SIGNATURES)
+
+
+# --- Vector 2: PII & Secret Redaction ---
 
 SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
 SECRET_RE = re.compile(r"\b(?:sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})\b")
@@ -80,7 +106,15 @@ def luhn_valid(digits: str) -> bool:
 
 
 def redact_sensitive_entities(text: str) -> tuple[str, List[str]]:
-    redacted_types = []
+    if vector2_pii_guard is not None and hasattr(vector2_pii_guard, "redact_pii"):
+        try:
+            res = vector2_pii_guard.redact_pii(text)
+            if isinstance(res, tuple) and len(res) == 2:
+                return res
+        except Exception:
+            pass
+
+    redacted_types: List[str] = []
     out = text
     if SSN_RE.search(out):
         redacted_types.append("SSN")
@@ -102,7 +136,7 @@ def redact_sensitive_entities(text: str) -> tuple[str, List[str]]:
     return out, redacted_types
 
 
-# --- Vector 3: Sliding-Window Rate Limiter & Flood Anomaly Detector ---
+# --- Vector 3: Rate Limiting & Flood Detection ---
 
 RATE_BUCKETS: dict[str, list[float]] = defaultdict(list)
 RATE_LIMIT_MAX = 10
@@ -110,6 +144,11 @@ RATE_WINDOW_SEC = 60.0
 
 
 def check_rate_limit(api_key: str) -> bool:
+    if vector3_resilience_guard is not None and hasattr(vector3_resilience_guard, "allow_request"):
+        try:
+            return bool(vector3_resilience_guard.allow_request(api_key))
+        except Exception:
+            pass
     now = time.time()
     window_start = now - RATE_WINDOW_SEC
     RATE_BUCKETS[api_key] = [t for t in RATE_BUCKETS[api_key] if t >= window_start]
@@ -130,7 +169,7 @@ def is_anomalous_flood(text: str) -> Optional[str]:
     return None
 
 
-# --- Schemas & Auth ---
+# --- Request / Response Schemas & Authentication ---
 
 class MessageTurn(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -155,10 +194,16 @@ def verify_api_key(x_api_key: Optional[str]) -> str:
     expected = os.getenv("LUCID_AUDIT_API_KEY", "")
     if not expected:
         logger.error("security.configuration_error missing_api_key_configuration")
-        raise HTTPException(status_code=503, detail="Server authentication secret not configured.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Server authentication secret not configured.",
+        )
     if not x_api_key or not hmac.compare_digest(x_api_key, expected):
         logger.warning("security.authentication_rejected")
-        raise HTTPException(status_code=401, detail="Invalid or missing API key.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing API key.",
+        )
     return x_api_key
 
 
@@ -168,31 +213,59 @@ async def health_check():
         "status": "healthy",
         "framework": "Lucid-Truth-Audit",
         "version": "1.0.0",
-        "vectors": ["vector1_injection", "vector2_pii", "vector3_resilience", "vector4_logistics"],
+        "vectors": [
+            "vector1_injection",
+            "vector2_pii",
+            "vector3_resilience",
+            "vector4_logistics",
+        ],
     }
 
 
 @app.post("/api/v1/guard", response_model=GuardResponse)
-async def guard_endpoint(payload: GuardRequest, x_api_key: Optional[str] = Header(default=None)):
+async def guard_endpoint(
+    payload: GuardRequest,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+):
     key = verify_api_key(x_api_key)
+
     if not check_rate_limit(key):
         logger.warning("security.rate_limit_exceeded")
-        raise HTTPException(status_code=429, detail="Rate limit exceeded.")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Rate limit exceeded.",
+        )
 
     anomaly = is_anomalous_flood(payload.prompt)
     if anomaly:
         logger.warning(f"security.input_blocked category={anomaly}")
-        raise HTTPException(status_code=422, detail=f"Blocked anomalous input: {anomaly}")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Blocked anomalous input: {anomaly}",
+        )
+
+    if is_social_engineering_pii_pretext(payload.prompt):
+        logger.warning("security.input_blocked category=social_engineering_pii")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Blocked social engineering PII request.",
+        )
 
     if contains_injection(payload.prompt):
         logger.warning("security.input_blocked category=prompt_injection")
-        raise HTTPException(status_code=422, detail="Blocked prompt injection attempt.")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Blocked prompt injection attempt.",
+        )
 
     if payload.messages:
         for turn in payload.messages:
             if contains_injection(turn.content):
                 logger.warning("security.input_blocked category=multi_turn_role_spoof")
-                raise HTTPException(status_code=422, detail="Blocked multi-turn spoofing attempt.")
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Blocked multi-turn spoofing attempt.",
+                )
 
     clean_prompt, entities = redact_sensitive_entities(payload.prompt)
     return GuardResponse(
