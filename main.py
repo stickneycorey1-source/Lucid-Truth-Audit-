@@ -23,7 +23,8 @@ try:
 except Exception:
     vector3_resilience_guard = None
 
-from app.schemas.logistics_guard import router as logistics_router[span_1](start_span)[span_1](end_span)
+from app.schemas.logistics_guard import router as logistics_router
+
 
 logger = logging.getLogger("lucid_truth_audit")
 
