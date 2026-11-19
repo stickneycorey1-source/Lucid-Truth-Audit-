@@ -1,6 +1,6 @@
 import re
 from typing import List, Optional, Literal
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, status
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 router = APIRouter(prefix="/api/v1/guard", tags=["Logistics Guard"])
@@ -8,7 +8,7 @@ router = APIRouter(prefix="/api/v1/guard", tags=["Logistics Guard"])
 # --- Deterministic Security & PII Patterns ---
 
 INJECTION_PATTERNS = [
-    r"(?i)ignore\s+(all\s+)?(previous|prior|safety|hos)\s+(instructions|rules|constraints)",
+    r"(?i)ignore\s+(all\s+)?(previous|prior|safety|hos)\s+(instructions|rules|constraints|hos|policies)",
     r"(?i)bypass\s+(weigh\s+station|inspection|geofence|hos|safety)",
     r"(?i)reroute\s+(shipment|cargo|truck)\s+to\s+unverified",
     r"(?i)override\s+(system|dispatch|route)\s+policy",
