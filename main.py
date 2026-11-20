@@ -25,7 +25,6 @@ except Exception:
 
 from app.schemas.logistics_guard import router as logistics_router
 
-
 logger = logging.getLogger("lucid_truth_audit")
 
 app = FastAPI(
@@ -274,3 +273,4 @@ async def guard_endpoint(
         sanitized_prompt=clean_prompt,
         redacted_entities=entities,
     )
+I've d
