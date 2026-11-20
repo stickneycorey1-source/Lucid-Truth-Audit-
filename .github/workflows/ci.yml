@@ -2,40 +2,41 @@ name: Lucid Truth Audit CI
 
 on:
   push:
-    branches: ["main"]
+    branches: [ main ]
   pull_request:
-    branches: ["main"]
-
-env:
-  LUCID_AUDIT_API_KEY: ${{ secrets.LUCID_AUDIT_API_KEY || 'test-only-secret' }}
+    branches: [ main ]
 
 jobs:
   audit:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Lucid-Truth-Audit
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          pip install pytest-html
 
-      - name: Run Red Team & Pydantic Guardrail Suite
+      - name: Run Guardrail & Compliance Suite
+        env:
+          LTA_API_KEY: valid-test-key
         run: |
-          pytest test_audit.py test_vector2_pii.py test_vector3_resilience.py -v --html=compliance_audit.html --self-contained-html
+          mkdir -p reports
+          python -m pytest --junitxml=reports/junit.xml
 
-      - name: Upload Compliance Audit Artifacts
+      - name: Upload Compliance Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lucid-truth-compliance-report
-          path: compliance_audit.html
-          retention-days: 30
+          name: compliance-audit-reports
+          path: |
+            reports/compliance_audit.html
+            reports/compliance_audit.md
+            reports/junit.xml
