@@ -5,8 +5,6 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 router = APIRouter(prefix="/api/v1/guard", tags=["Logistics Guard"])
 
-# --- Deterministic Security & PII Patterns ---
-
 INJECTION_PATTERNS = [
     r"(?i)ignore\s+(all\s+)?(previous|prior|safety|hos)\s+(instructions|rules|constraints|hos|policies)",
     r"(?i)bypass\s+(weigh\s+station|inspection|geofence|hos|safety)",
@@ -34,8 +32,6 @@ def redact_pii(text: str) -> tuple[str, List[str]]:
     return cleaned, detected
 
 
-# --- Pydantic v2 Schemas ---
-
 class Waypoint(BaseModel):
     label: str = Field(..., min_length=1, max_length=100)
     latitude: float = Field(..., ge=-90.0, le=90.0)
@@ -55,7 +51,6 @@ class DispatchRoutePayload(BaseModel):
     driver_alias: str = Field(..., min_length=2, max_length=50, description="Anonymized driver callsign")
     vehicle_vin_hash: str = Field(..., min_length=8, max_length=64)
 
-    # FMCSA Property-Carrying HOS Safety Constraints
     planned_drive_hours: float = Field(..., gt=0.0, le=11.0, description="Max 11.0 hrs per FMCSA 49 CFR § 395.3")
     on_duty_window_hours: float = Field(..., gt=0.0, le=14.0, description="Max 14.0 hr consecutive duty window")
     continuous_drive_before_break_hours: float = Field(
@@ -63,15 +58,12 @@ class DispatchRoutePayload(BaseModel):
     )
     rest_break_minutes: int = Field(..., ge=30, description="Minimum 30-minute off-duty rest break")
 
-    # Cargo & Weight Integrity
     gross_vehicle_weight_lbs: int = Field(..., gt=0, le=80000, description="Federal interstate weight cap")
     hazmat_class: Optional[Literal["NONE", "1", "2", "3", "4", "5", "6", "7", "8", "9"]] = "NONE"
 
-    # Unstructured Text Fields (High Injection & PII Risk)
     bill_of_lading_notes: str = Field(default="", max_length=2000)
     dispatcher_summary: str = Field(default="", max_length=2000)
 
-    # Route Geometry
     waypoints: List[Waypoint] = Field(..., min_length=2, max_length=25)
 
     @field_validator("bill_of_lading_notes", "dispatcher_summary")
@@ -101,14 +93,8 @@ class DispatchGuardResponse(BaseModel):
     compliance_checks: dict
 
 
-# --- FastAPI Guard Endpoint ---
-
 @router.post("/logistics", response_model=DispatchGuardResponse, status_code=status.HTTP_200_OK)
 async def evaluate_dispatch_route(payload: DispatchRoutePayload) -> DispatchGuardResponse:
-    """
-    Deterministic guardrail endpoint for AI-generated fleet dispatch and routing payloads.
-    Blocks HOS violations, unauthorized waypoints, and BOL prompt injections; redacts driver PII.
-    """
     clean_bol, bol_pii = redact_pii(payload.bill_of_lading_notes)
     clean_summary, summary_pii = redact_pii(payload.dispatcher_summary)
 
