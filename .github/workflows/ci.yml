@@ -1,42 +1,6 @@
-name: Lucid Truth Audit CI
-
-on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
-
-jobs:
-  audit:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest-html
-
       - name: Run Guardrail & Compliance Suite
         env:
-          LTA_API_KEY: valid-test-key
+          LUCID_AUDIT_API_KEY: valid-test-key
         run: |
           mkdir -p reports
           python -m pytest --junitxml=reports/junit.xml
-
-      - name: Upload Compliance Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: compliance-audit-reports
-          path: |
-            reports/compliance_audit.html
-            reports/compliance_audit.md
-            reports/junit.xml
