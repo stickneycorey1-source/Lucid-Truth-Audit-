@@ -1,8 +1,9 @@
-"""Provider-agnostic upstream LLM adapters (Hardened v2.4 — full Gemini support + safe diagnostics)."""
+"""Provider-agnostic upstream LLM adapters (Hardened v2.4.1 — full Gemini support + scrubbed diagnostics)."""
 
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -11,6 +12,13 @@ import httpx
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal", "ollama"}
+_SECRET_SCRUB_RE = re.compile(
+    r"(?:sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{20,}|Bearer\s+[A-Za-z0-9._\-]{16,})"
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    return _SECRET_SCRUB_RE.sub("[REDACTED_SECRET]", text)
 
 
 @dataclass
@@ -260,12 +268,14 @@ async def call_upstream(
             err_msg = body.get("error", {}).get("message", "") if isinstance(body, dict) else ""
         except Exception:
             err_msg = exc.response.text[:200]
+        safe_msg = _scrub_secrets(err_msg or "request rejected")
         raise UpstreamProviderError(
-            f"Upstream '{provider_key}' HTTP {exc.response.status_code} ({model}): {err_msg or 'request rejected'}"
+            f"Upstream '{provider_key}' HTTP {exc.response.status_code} ({model}): {safe_msg}"
         ) from exc
     except httpx.HTTPError as exc:
+        safe_exc = _scrub_secrets(str(exc) or "connection or timeout error")
         raise UpstreamProviderError(
-            f"Upstream '{provider_key}' {type(exc).__name__} ({model}): {exc or 'connection or timeout error'}"
+            f"Upstream '{provider_key}' {type(exc).__name__} ({model}): {safe_exc}"
         ) from exc
 
     raise UpstreamProviderError(f"Unsupported upstream provider: '{provider}'")
