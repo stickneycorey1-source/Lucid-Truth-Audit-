@@ -1,4 +1,4 @@
-"""Lucid-Truth-Audit Enterprise FastAPI Application (Hardened v2.3)."""
+"""Lucid-Truth-Audit Enterprise FastAPI Application (Hardened v2.4)."""
 
 from __future__ import annotations
 
@@ -88,23 +88,40 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         req_id = (request.headers.get("x-request-id") or "").strip()[:64] or str(
             uuid.uuid4()
         )
+        sec_headers = {
+            "X-Request-ID": req_id,
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Frame-Options": "DENY",
+        }
         content_length = request.headers.get("content-length")
         if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
             return JSONResponse(
                 status_code=413,
                 content={"detail": f"Payload Too Large: exceeds {MAX_BODY_BYTES} byte limit."},
-                headers={
-                    "X-Request-ID": req_id,
-                    "Cache-Control": "no-store",
-                    "X-Content-Type-Options": "nosniff",
-                    "X-Frame-Options": "DENY",
-                },
+                headers=sec_headers,
             )
+        if request.method in ("POST", "PUT", "PATCH") and not (
+            content_length and content_length.isdigit()
+        ):
+            chunks: List[bytes] = []
+            total = 0
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > MAX_BODY_BYTES:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "detail": f"Payload Too Large: exceeds {MAX_BODY_BYTES} byte limit."
+                        },
+                        headers=sec_headers,
+                    )
+                chunks.append(chunk)
+            request._body = b"".join(chunks)
+
         response = await call_next(request)
-        response.headers["X-Request-ID"] = req_id
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
+        for k, v in sec_headers.items():
+            response.headers[k] = v
         return response
 
     def _extract_key(
