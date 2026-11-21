@@ -1,12 +1,13 @@
 # Lucid-Truth-Audit (LTA) Enterprise — v2.1
 
 [[https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml/badge.svg]](https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions)
-[https://img.shields.io/badge/Pytest_Guardrail_Suite-61%2F61_Passing-10b981?style=flat&logo=pytest&logoColor=white]
-[https://img.shields.io/badge/Live_Endpoint-Render_Active-38bdf8?style=flat&logo=fastapi&logoColor=white]
-[https://img.shields.io/badge/Python-3.11-3776ab?style=flat&logo=python&logoColor=white]
-[https://img.shields.io/badge/Pydantic-v2_Strict-e92063?style=flat&logo=pydantic&logoColor=white]
-[https://img.shields.io/badge/Compliance-EU_AI_Act_%7C_ISO%2FIEC_42001_%7C_FMCSA_%7C_HIPAA_%7C_PCI-6366f1?style=flat]
-[https://img.shields.io/badge/License-MIT-slate?style=flat]
+[[https://img.shields.io/static/v1?label=Pytest+Suite&message=61/61+Passing&color=10b981&logo=pytest&logoColor=white]](https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions)
+[[https://img.shields.io/static/v1?label=Live+API&message=Render+Active&color=38bdf8&logo=fastapi&logoColor=white]](https://lucid-truth-audit.onrender.com/docs)
+[https://img.shields.io/static/v1?label=Python&message=3.11&color=3776ab&logo=python&logoColor=white]
+[https://img.shields.io/static/v1?label=Pydantic&message=v2+Strict&color=e92063&logo=pydantic&logoColor=white]
+[https://img.shields.io/static/v1?label=Compliance&message=EU+AI+Act+%7C+ISO+42001+%7C+FMCSA+%7C+HIPAA+%7C+PCI&color=6366f1]
+[https://img.shields.io/static/v1?label=Local+p95&message=3.67ms&color=0ea5e9]
+[https://img.shields.io/static/v1?label=License&message=MIT&color=475569]
 
 **Drop-In, Provider-Agnostic AI Security, PII Redaction, and Tamper-Evident Compliance Gateway for Production LLM Workflows.**
 
