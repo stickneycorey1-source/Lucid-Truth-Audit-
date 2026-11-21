@@ -1,9 +1,8 @@
-"""Tamper-evident SHA-256 hash-chained persistent audit ledger.
+"""Tamper-evident SHA-256 hash-chained persistent audit ledger (Hardened v2.1).
 
 Supports SQLite out of the box (zero extra dependencies) and PostgreSQL via
-`psycopg` when `LTA_AUDIT_DB_URL` starts with `postgresql://`.
-Raw prompts are NEVER stored; only SHA-256 payload digests and structured verdicts
-are written, satisfying EU AI Act Article 12 and ISO/IEC 42001 record-keeping.
+`psycopg` with transactional `pg_advisory_xact_lock` to guarantee a linear,
+race-free hash chain across multi-worker deployments.
 """
 
 from __future__ import annotations
@@ -18,6 +17,7 @@ from typing import List, Optional, Tuple
 
 
 GENESIS_HASH = "0" * 64
+PG_CHAIN_LOCK_ID = 728391045
 
 
 @dataclass
@@ -86,7 +86,7 @@ class AuditLedger:
             import psycopg  # type: ignore
 
             self._pg = psycopg
-            self._conn = psycopg.connect(db_url, autocommit=True)
+            self._conn = psycopg.connect(db_url, autocommit=False)
         else:
             path = db_url.replace("sqlite:///", "", 1)
             self._conn = sqlite3.connect(path, check_same_thread=False)
@@ -135,8 +135,7 @@ class AuditLedger:
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(ddl)
-            if not self._is_postgres:
-                self._conn.commit()
+            self._conn.commit()
 
     def record(
         self,
@@ -162,6 +161,8 @@ class AuditLedger:
 
         with self._lock:
             cur = self._conn.cursor()
+            if self._is_postgres:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (PG_CHAIN_LOCK_ID,))
             cur.execute(
                 "SELECT entry_hash FROM audit_events ORDER BY seq_id DESC LIMIT 1"
             )
@@ -207,6 +208,7 @@ class AuditLedger:
             if self._is_postgres:
                 cur.execute(sql + " RETURNING seq_id", params)
                 seq_id = int(cur.fetchone()[0])
+                self._conn.commit()
             else:
                 cur.execute(sql, params)
                 self._conn.commit()
@@ -230,10 +232,7 @@ class AuditLedger:
         )
 
     def verify_chain(self) -> Tuple[bool, int, Optional[int]]:
-        """Verify every SHA-256 link in the ledger.
-
-        Returns: (is_valid, total_records, first_broken_seq_id)
-        """
+        """Verify every SHA-256 link in the ledger."""
         with self._lock:
             cur = self._conn.cursor()
             cur.execute(
