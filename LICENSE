@@ -1,31 +1,34 @@
-PROPRIETARY SOFTWARE & AUDIT MANDATE LICENSE
+Copyright (c) 2026 Corey Allen Stickney (Lucid Truth). All Rights Reserved.
 
-Copyright (c) 2026 Corey Allen Stickney (Dr. Lucid / Lucid Truth).
-All Rights Reserved.
+PROPRIETARY AND SOURCE-AVAILABLE EVALUATION LICENSE
 
-1. GRANT OF VIEW-ONLY ACCESS
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this repository and associated documentation files (the "Software"), to view
-and inspect the source code solely for the purposes of technical verification,
-security auditing, and compliance review.
+1. Ownership
+This software, including all source code, policy packs, documentation, test suites,
+and compliance artifacts in this repository ("Software"), is the exclusive
+intellectual property of Corey Allen Stickney / Lucid Truth ("Licensor"). All
+rights not expressly granted herein are reserved by Licensor.
 
-2. RESTRICTIONS
-Except as expressly permitted under Section 1, no license or right is granted,
-either expressly or by implication, estoppel, or otherwise, under any patent,
-copyright, trademark, trade secret, or other intellectual property right. You
-may NOT:
-  (a) Copy, modify, merge, publish, distribute, sublicense, or sell copies of
-      the Software or any derivative works thereof;
-  (b) Use the Software, its Pydantic schemas, or its guardrail logic in any
-      commercial, production, or derivative software environment without prior
-      written authorization from the Copyright Holder;
-  (c) Remove, alter, or obscure any proprietary notices, attribution headers,
-      or digital watermarks embedded within the Software.
+2. Permitted Evaluation Use Only
+Permission is granted solely to view and inspect the Software in this repository
+for non-commercial, internal technical evaluation (including reviewing automated
+CI/CD verification artifacts).
 
-3. DISCLAIMER OF WARRANTY
+3. Prohibited Uses Without a Commercial License
+Without a separate, executed written Commercial License Agreement or 30-Day Shadow
+Pilot Agreement from Licensor, you may NOT:
+  (a) deploy, run, or use the Software in any production, staging, or commercial
+      environment;
+  (b) copy, modify, adapt, translate, or create derivative works of the Software;
+  (c) redistribute, sublicense, sell, lease, host, or offer the Software (or any
+      portion of it) as a standalone product or managed service.
+
+4. Commercial Licensing Inquiries
+To obtain a commercial enterprise license or authorize a pilot deployment, contact
+Corey Allen Stickney / Lucid Truth at: stickneycorey1@gmail.com
+
+5. Disclaimer of Warranty & Limitation of Liability
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHOR OR COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
-WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL LICENSOR BE
+LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR IN CONNECTION
+WITH THE SOFTWARE.
