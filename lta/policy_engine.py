@@ -1,27 +1,21 @@
-"""YAML Policy-Pack Engine for Lucid-Truth-Audit Enterprise.
-
-Handles:
-1. Unicode/homoglyph/zero-width canonicalization + Base64/Hex decoding
-2. Prompt injection & social-engineering pretext blocking
-3. Flooding / high-entropy gibberish defense
-4. PII / PHI / PCI detection and deterministic redaction (including Luhn PAN check)
-5. Industry-specific domain guardrails (FMCSA logistics, HIPAA, PCI-DSS, custom rules)
-6. Output-boundary leak prevention (system prompts, secrets, raw SSNs)
-"""
+"""YAML Policy-Pack Engine for Lucid-Truth-Audit Enterprise (Hardened v2.1)."""
 
 from __future__ import annotations
 
 import base64
 import math
 import re
+import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 import yaml
 
 ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+WHITESPACE_RE = re.compile(r"\s+")
 HOMOGLYPH_MAP = str.maketrans(
     {
         "\u0430": "a",
@@ -87,14 +81,22 @@ def shannon_entropy(text: str) -> float:
 
 
 def canonicalize(text: str) -> str:
-    """Strip zero-width characters, fold Cyrillic homoglyphs, and lowercase."""
-    cleaned = ZERO_WIDTH_RE.sub("", text)
-    return cleaned.translate(HOMOGLYPH_MAP).lower()
+    """NFKC-normalize, strip zero-width chars, fold homoglyphs, lowercase, and collapse whitespace."""
+    nfkc = unicodedata.normalize("NFKC", text)
+    cleaned = ZERO_WIDTH_RE.sub("", nfkc)
+    folded = cleaned.translate(HOMOGLYPH_MAP).lower()
+    return WHITESPACE_RE.sub(" ", folded).strip()
 
 
 def extract_decoded_segments(text: str) -> List[str]:
-    """Decode embedded Base64 and Hex payloads to catch obfuscated injections."""
+    """Decode embedded URL-encoded, Base64, and Hex payloads to catch obfuscated injections."""
     decoded: List[str] = []
+
+    if "%" in text:
+        url_decoded = unquote(text)
+        if url_decoded != text:
+            decoded.append(canonicalize(url_decoded))
+
     for match in BASE64_CANDIDATE_RE.findall(text):
         try:
             raw = base64.b64decode(match, validate=True).decode("utf-8", errors="ignore")
@@ -102,6 +104,7 @@ def extract_decoded_segments(text: str) -> List[str]:
                 decoded.append(canonicalize(raw))
         except Exception:
             pass
+
     for match in HEX_CANDIDATE_RE.findall(text):
         hex_str = match[2:] if match.lower().startswith("0x") else match
         if len(hex_str) % 2 == 0:
