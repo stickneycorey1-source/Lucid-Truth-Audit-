@@ -1,4 +1,4 @@
-"""Provider-agnostic upstream LLM adapters (Hardened v2.3 — TLS check + pooled httpx)."""
+"""Provider-agnostic upstream LLM adapters (Hardened v2.3.1 — header auth + safe diagnostics)."""
 
 from __future__ import annotations
 
@@ -69,6 +69,7 @@ async def call_upstream(
 ) -> ProviderResponse:
     """Route sanitized chat messages to the configured upstream AI provider."""
     provider_key = provider.lower().strip()
+    model = model.strip()
 
     if provider_key == "mock":
         last_user = next(
@@ -109,9 +110,10 @@ async def call_upstream(
                 else "https://api.openai.com/v1",
             )
             base_url = validate_upstream_url(raw_url)
-            api_key = os.getenv(f"LTA_{provider_key.upper()}_API_KEY") or os.getenv(
-                "OPENAI_API_KEY", ""
-            )
+            api_key = (
+                os.getenv(f"LTA_{provider_key.upper()}_API_KEY")
+                or os.getenv("OPENAI_API_KEY", "")
+            ).strip()
             if provider_key in ("openai", "azure_openai") and not api_key:
                 raise UpstreamProviderError(
                     f"Missing API key for upstream provider '{provider_key}'"
@@ -142,7 +144,7 @@ async def call_upstream(
             )
 
         if provider_key == "anthropic":
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
+            api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
             if not api_key:
                 raise UpstreamProviderError("Missing ANTHROPIC_API_KEY")
             system_parts = [m["content"] for m in messages if m.get("role") == "system"]
@@ -181,7 +183,7 @@ async def call_upstream(
             )
 
         if provider_key == "gemini":
-            api_key = os.getenv("GEMINI_API_KEY", "")
+            api_key = os.getenv("GEMINI_API_KEY", "").strip()
             if not api_key:
                 raise UpstreamProviderError("Missing GEMINI_API_KEY")
             contents = [
@@ -194,19 +196,46 @@ async def call_upstream(
             ]
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
-                f"{model}:generateContent?key={api_key}"
+                f"{model}:generateContent"
             )
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            }
             data = await _post_json(
                 url,
+                headers=headers,
                 payload={"contents": contents},
                 timeout_s=timeout_s,
                 http_client=http_client,
             )
-            text = data["candidates"][0]["content"]["parts"][0]["text"]  # type: ignore[index]
-            return ProviderResponse(content=text, model=model, provider="gemini")
+            parts = data["candidates"][0]["content"]["parts"]  # type: ignore[index]
+            text = "".join(
+                p.get("text", "")
+                for p in parts
+                if isinstance(p, dict) and not p.get("thought")
+            )
+            usage = data.get("usageMetadata", {})  # type: ignore[union-attr]
+            return ProviderResponse(
+                content=text,
+                model=model,
+                provider="gemini",
+                prompt_tokens=int(usage.get("promptTokenCount", 0)),
+                completion_tokens=int(usage.get("candidatesTokenCount", 0)),
+            )
+    except httpx.HTTPStatusError as exc:
+        err_msg = ""
+        try:
+            body = exc.response.json()
+            err_msg = body.get("error", {}).get("message", "") if isinstance(body, dict) else ""
+        except Exception:
+            err_msg = exc.response.text[:200]
+        raise UpstreamProviderError(
+            f"Upstream '{provider_key}' HTTP {exc.response.status_code} ({model}): {err_msg or 'request rejected'}"
+        ) from exc
     except httpx.HTTPError as exc:
         raise UpstreamProviderError(
-            f"Upstream '{provider_key}' request failed: {exc}"
+            f"Upstream '{provider_key}' {type(exc).__name__} ({model}): {exc or 'connection or timeout error'}"
         ) from exc
 
     raise UpstreamProviderError(f"Unsupported upstream provider: '{provider}'")
