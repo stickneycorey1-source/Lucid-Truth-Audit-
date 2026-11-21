@@ -1,34 +1,40 @@
-Copyright (c) 2026 Corey Allen Stickney (Lucid Truth). All Rights Reserved.
+Lucid-Truth-Audit (LTA) Enterprise Gateway — Proprietary Software License
+Copyright (c) 2026 Corey Allen Stickney. All Rights Reserved.
 
-PROPRIETARY AND SOURCE-AVAILABLE EVALUATION LICENSE
+1. Ownership & Intellectual Property
+This software, including all source code, YAML policy packs, cryptographic audit
+ledger schemas, compliance test suites, documentation, and associated assets
+(collectively, the "Software"), is the sole and exclusive proprietary property of
+Corey Allen Stickney ("Licensor"). No ownership rights are transferred under this
+License.
 
-1. Ownership
-This software, including all source code, policy packs, documentation, test suites,
-and compliance artifacts in this repository ("Software"), is the exclusive
-intellectual property of Corey Allen Stickney / Lucid Truth ("Licensor"). All
-rights not expressly granted herein are reserved by Licensor.
+2. Limited Evaluation Right
+Subject to strict compliance with this License, you are granted a revocable,
+non-exclusive, non-transferable, non-sublicensable license solely to view and
+locally evaluate the Software in a non-production environment for the purpose of
+assessing a commercial license or authorized pilot agreement with Licensor.
 
-2. Permitted Evaluation Use Only
-Permission is granted solely to view and inspect the Software in this repository
-for non-commercial, internal technical evaluation (including reviewing automated
-CI/CD verification artifacts).
+3. Strict Restrictions
+Without a separate written Commercial License Agreement signed by Licensor, you
+may NOT:
+  (a) deploy, operate, or use the Software in any production, commercial,
+      revenue-generating, or client-facing environment;
+  (b) copy, redistribute, publish, sell, lease, sublicense, or make the Software
+      available as a hosted service, SaaS, API proxy, or managed offering;
+  (c) modify, adapt, translate, or create derivative works based on the Software
+      for external distribution or competitive commercial use; or
+  (d) remove, obscure, or alter any copyright, attribution, or proprietary
+      notices contained in the Software.
 
-3. Prohibited Uses Without a Commercial License
-Without a separate, executed written Commercial License Agreement or 30-Day Shadow
-Pilot Agreement from Licensor, you may NOT:
-  (a) deploy, run, or use the Software in any production, staging, or commercial
-      environment;
-  (b) copy, modify, adapt, translate, or create derivative works of the Software;
-  (c) redistribute, sublicense, sell, lease, host, or offer the Software (or any
-      portion of it) as a standalone product or managed service.
-
-4. Commercial Licensing Inquiries
-To obtain a commercial enterprise license or authorize a pilot deployment, contact
-Corey Allen Stickney / Lucid Truth at: stickneycorey1@gmail.com
+4. Commercial Licensing & Enterprise Pilots
+Production deployments, multi-tenant enterprise installations, custom industry
+policy packs, and 30-day shadow pilot agreements require a written commercial
+license from Licensor.
+Licensing inquiries: stickneycorey1@gmail.com
 
 5. Disclaimer of Warranty & Limitation of Liability
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL LICENSOR BE
-LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR IN CONNECTION
-WITH THE SOFTWARE.
+THE SOFTWARE IS PROVIDED FOR EVALUATION "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL LICENSOR
+BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR IN
+CONNECTION WITH THE SOFTWARE OR ITS EVALUATION.
