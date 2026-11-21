@@ -1,4 +1,22 @@
 # Lucid-Truth-Audit (LTA) Enterprise — v2.1
+<p align="left">
+  <a href="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml">
+    <img src="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml/badge.svg" alt="CI Status">
+  </a>
+  <a href="https://lucid-truth-audit.onrender.com/docs">
+    <img src="https://img.shields.io/badge/Version-v2.4.0%20Hardened-0A66C2" alt="Version v2.4.0 Hardened">
+  </a>
+  <a href="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml">
+    <img src="https://img.shields.io/badge/Tests-63%2F63%20Passing-2EA44F" alt="Tests 63/63 Passing">
+  </a>
+  <a href="https://lucid-truth-audit.onrender.com/docs">
+    <img src="https://img.shields.io/badge/Gateway-Render%20Live-46E3B7" alt="Gateway Render Live">
+  </a>
+  <img src="https://img.shields.io/badge/Policy%20Packs-FMCSA%20%7C%20HIPAA%20%7C%20PCI%20%7C%20Enterprise-6E40C9" alt="Policy Packs">
+  <a href="./LICENSE">
+    <img src="https://img.shields.io/badge/License-Proprietary%20%E2%80%94%20All%20Rights%20Reserved-D93025" alt="License Proprietary All Rights Reserved">
+  </a>
+</p>
 
 <p>
   <a href="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions"><img src="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml/badge.svg" alt="Lucid Truth Audit CI"></a>
