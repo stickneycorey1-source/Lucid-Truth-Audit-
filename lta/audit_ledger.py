@@ -1,9 +1,4 @@
-"""Tamper-evident SHA-256 hash-chained persistent audit ledger (Hardened v2.1).
-
-Supports SQLite out of the box (zero extra dependencies) and PostgreSQL via
-`psycopg` with transactional `pg_advisory_xact_lock` to guarantee a linear,
-race-free hash chain across multi-worker deployments.
-"""
+"""Tamper-evident SHA-256 hash-chained persistent audit ledger (Hardened v2.3)."""
 
 from __future__ import annotations
 
@@ -12,8 +7,9 @@ import json
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterator, List, Optional, Tuple
 
 
 GENESIS_HASH = "0" * 64
@@ -82,15 +78,47 @@ class AuditLedger:
         self._is_postgres = db_url.startswith("postgresql://") or db_url.startswith(
             "postgres://"
         )
-        if self._is_postgres:
-            import psycopg  # type: ignore
+        self._pool = None
+        self._conn = None
 
-            self._pg = psycopg
-            self._conn = psycopg.connect(db_url, autocommit=False)
+        if self._is_postgres:
+            try:
+                from psycopg_pool import ConnectionPool  # type: ignore
+
+                self._pool = ConnectionPool(
+                    conninfo=db_url,
+                    min_size=1,
+                    max_size=10,
+                    kwargs={"autocommit": False},
+                    check=ConnectionPool.check_connection,
+                )
+            except ImportError:
+                import psycopg  # type: ignore
+
+                self._conn = psycopg.connect(db_url, autocommit=False)
         else:
             path = db_url.replace("sqlite:///", "", 1)
             self._conn = sqlite3.connect(path, check_same_thread=False)
+
         self._init_schema()
+
+    @contextmanager
+    def _connection(self) -> Iterator[object]:
+        if self._pool is not None:
+            with self._pool.connection() as conn:
+                try:
+                    yield conn
+                except Exception:
+                    conn.rollback()
+                    raise
+        else:
+            with self._lock:
+                try:
+                    yield self._conn
+                except Exception:
+                    if self._conn is not None:
+                        self._conn.rollback()
+                    raise
 
     def _init_schema(self) -> None:
         ddl = (
@@ -132,10 +160,21 @@ class AuditLedger:
             )
             """
         )
-        with self._lock:
-            cur = self._conn.cursor()
+        with self._connection() as conn:
+            cur = conn.cursor()
             cur.execute(ddl)
-            self._conn.commit()
+            conn.commit()
+
+    def ping(self) -> bool:
+        """Fast O(1) connectivity check for /readyz without scanning audit_events."""
+        try:
+            with self._connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            return True
+        except Exception:
+            return False
 
     def record(
         self,
@@ -159,8 +198,8 @@ class AuditLedger:
         redactions_json = json.dumps(redactions)
         rounded_latency = round(float(latency_ms), 3)
 
-        with self._lock:
-            cur = self._conn.cursor()
+        with self._connection() as conn:
+            cur = conn.cursor()
             if self._is_postgres:
                 cur.execute("SELECT pg_advisory_xact_lock(%s)", (PG_CHAIN_LOCK_ID,))
             cur.execute(
@@ -208,10 +247,10 @@ class AuditLedger:
             if self._is_postgres:
                 cur.execute(sql + " RETURNING seq_id", params)
                 seq_id = int(cur.fetchone()[0])
-                self._conn.commit()
+                conn.commit()
             else:
                 cur.execute(sql, params)
-                self._conn.commit()
+                conn.commit()
                 seq_id = int(cur.lastrowid)
 
         return AuditRecord(
@@ -233,8 +272,8 @@ class AuditLedger:
 
     def verify_chain(self) -> Tuple[bool, int, Optional[int]]:
         """Verify every SHA-256 link in the ledger."""
-        with self._lock:
-            cur = self._conn.cursor()
+        with self._connection() as conn:
+            cur = conn.cursor()
             cur.execute(
                 "SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
                 "provider, action, http_status, vector, redactions_json, "
@@ -285,8 +324,8 @@ class AuditLedger:
     def export_jsonl(self, tenant_id: Optional[str] = None, limit: int = 1000) -> str:
         """Export audit events in SIEM-ready JSON Lines format (Splunk/Datadog)."""
         placeholder = "%s" if self._is_postgres else "?"
-        with self._lock:
-            cur = self._conn.cursor()
+        with self._connection() as conn:
+            cur = conn.cursor()
             if tenant_id:
                 cur.execute(
                     f"SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
@@ -331,5 +370,8 @@ class AuditLedger:
         return "\n".join(lines)
 
     def close(self) -> None:
-        with self._lock:
-            self._conn.close()
+        if self._pool is not None:
+            self._pool.close()
+        elif self._conn is not None:
+            with self._lock:
+                self._conn.close()
