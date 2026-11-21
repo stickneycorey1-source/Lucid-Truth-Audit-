@@ -1,4 +1,4 @@
-"""Lightweight zero-dependency Prometheus metrics collector for LTA Enterprise."""
+"""Lightweight zero-dependency Prometheus metrics collector for LTA Enterprise (v2.2)."""
 
 from __future__ import annotations
 
@@ -8,25 +8,24 @@ from typing import Deque, Dict, Tuple
 
 
 class MetricsRegistry:
-    """Tracks request counts, block counts by vector, and rolling latency quantiles."""
+    """Tracks aggregate request counts, block counts by vector, and latency quantiles (no tenant PII)."""
 
     def __init__(self, max_latency_samples: int = 5000) -> None:
         self._lock = threading.Lock()
-        self._requests: Counter[Tuple[str, str, int]] = Counter()
+        self._requests: Counter[Tuple[str, int]] = Counter()
         self._blocks: Counter[Tuple[str, str]] = Counter()
         self._latencies_ms: Deque[float] = deque(maxlen=max_latency_samples)
 
     def observe(
         self,
         *,
-        tenant_id: str,
         policy_pack: str,
         http_status: int,
         latency_ms: float,
         vector: str | None = None,
     ) -> None:
         with self._lock:
-            self._requests[(tenant_id, policy_pack, http_status)] += 1
+            self._requests[(policy_pack, http_status)] += 1
             if vector:
                 self._blocks[(policy_pack, vector)] += 1
             self._latencies_ms.append(latency_ms)
@@ -50,9 +49,9 @@ class MetricsRegistry:
             "# TYPE lta_requests_total counter",
         ]
         with self._lock:
-            for (tenant, policy, status), count in sorted(self._requests.items()):
+            for (policy, status), count in sorted(self._requests.items()):
                 lines.append(
-                    f'lta_requests_total{{tenant="{tenant}",policy="{policy}",status="{status}"}} {count}'
+                    f'lta_requests_total{{policy="{policy}",status="{status}"}} {count}'
                 )
             lines.extend(
                 [
