@@ -396,3 +396,95 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         metrics.observe(
             policy_pack=policy_name,
             http_status=200,
+            latency_ms=latency_ms,
+        )
+
+        return {
+            "content": out_res.sanitized_text,
+            "model": upstream.model,
+            "provider": upstream.provider,
+            "prompt_tokens": upstream.prompt_tokens,
+            "completion_tokens": upstream.completion_tokens,
+            "action": final_action,
+            "redactions": unique_redactions,
+            "policy_pack": policy_name,
+            "audit_entry_hash": rec.entry_hash,
+            "audit_seq_id": rec.seq_id,
+            "latency_ms": round(latency_ms, 3),
+        }
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        body: OpenAIChatCompletionRequest,
+        tenant: TenantConfig = Depends(authenticate_tenant),
+        x_lta_policy: Optional[str] = Header(default=None),
+        x_lta_provider: Optional[str] = Header(default=None),
+    ) -> Dict[str, Any]:
+        result = await _run_pipeline(
+            tenant=tenant,
+            endpoint="/v1/chat/completions",
+            messages=[{"role": m.role, "content": m.content} for m in body.messages],
+            model=body.model or tenant.upstream_model,
+            policy_override=x_lta_policy,
+            provider_override=x_lta_provider,
+            metadata=body.metadata,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+        )
+        return {
+            "id": f"chatcmpl-lta-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": result["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": result["content"]},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": result["prompt_tokens"],
+                "completion_tokens": result["completion_tokens"],
+                "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
+            },
+            "lta_audit": {
+                "action": result["action"],
+                "policy_pack": result["policy_pack"],
+                "provider": result["provider"],
+                "redactions": result["redactions"],
+                "seq_id": result["audit_seq_id"],
+                "entry_hash": result["audit_entry_hash"],
+                "latency_ms": result["latency_ms"],
+            },
+        }
+
+    @app.post("/api/v1/guard")
+    async def legacy_guard(
+        body: LegacyGuardRequest,
+        tenant: TenantConfig = Depends(authenticate_tenant),
+        x_lta_policy: Optional[str] = Header(default=None),
+        x_lta_provider: Optional[str] = Header(default=None),
+    ) -> Dict[str, Any]:
+        result = await _run_pipeline(
+            tenant=tenant,
+            endpoint="/api/v1/guard",
+            messages=[{"role": "user", "content": body.model_input}],
+            model=tenant.upstream_model,
+            policy_override=x_lta_policy,
+            provider_override=x_lta_provider,
+            metadata=body.metadata,
+        )
+        return {
+            "status": "success",
+            "action": result["action"],
+            "message": result["content"],
+            "redactions": result["redactions"],
+            "policy_pack": result["policy_pack"],
+            "audit_entry_hash": result["audit_entry_hash"],
+        }
+
+    return app
+
+
+app = create_app()
