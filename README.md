@@ -1,4 +1,5 @@
-# Lucid-Truth-Audit (LTA) Enterprise — v2.1
+# Lucid-Truth-Audit (LTA) Enterprise Gateway
+
 <p align="left">
   <a href="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml">
     <img src="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml/badge.svg" alt="CI Status">
@@ -18,110 +19,65 @@
   </a>
 </p>
 
-<p>
-  <a href="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions"><img src="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml/badge.svg" alt="Lucid Truth Audit CI"></a>
-  <a href="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions"><img src="https://img.shields.io/static/v1?label=Pytest+Suite&message=61/61+Passing&color=10b981&logo=pytest&logoColor=white" alt="Pytest Suite"></a>
-  <a href="https://lucid-truth-audit.onrender.com/docs"><img src="https://img.shields.io/static/v1?label=Live+API&message=Render+Active&color=38bdf8&logo=fastapi&logoColor=white" alt="Live API"></a>
-  <img src="https://img.shields.io/static/v1?label=Python&message=3.11&color=3776ab&logo=python&logoColor=white" alt="Python 3.11">
-  <img src="https://img.shields.io/static/v1?label=Pydantic&message=v2+Strict&color=e92063&logo=pydantic&logoColor=white" alt="Pydantic v2 Strict">
-  <img src="https://img.shields.io/static/v1?label=Compliance&message=EU+AI+Act+%7C+ISO+42001+%7C+FMCSA+%7C+HIPAA+%7C+PCI&color=6366f1" alt="Compliance">
-  <img src="https://img.shields.io/static/v1?label=Local+p95&message=3.67ms&color=0ea5e9" alt="Local p95 Latency">
-    <img src="https://img.shields.io/static/v1?label=License&message=Proprietary+%7C+All+Rights+Reserved&color=dc2626" alt="Proprietary License">
+**Drop-in OpenAI-compatible AI security, PII redaction, and regulatory compliance gateway** with config-driven YAML policy packs, fail-closed per-tenant RBAC, and a tamper-evident SHA-256 hash-chained audit ledger.
 
+- **Live API & Swagger Docs:** https://lucid-truth-audit.onrender.com/docs
+- **Automated Verification:** 63/63 passing in GitHub Actions CI (`19` enterprise integration tests + legacy compliance suites)
+- **Measured Local Overhead:** `295.4 req/s` | `3.31 ms` p50 | `3.67 ms` p95 | `4.36 ms` p99 (200-request local benchmark, 200/200 valid SHA-256 chain records)
 
-**Drop-In, Provider-Agnostic AI Security, PII Redaction, and Tamper-Evident Compliance Gateway for Production LLM Workflows.**
+## Core Architecture (v2.4.0 Hardened)
 
-Lucid-Truth-Audit (LTA) sits in front of any LLM provider (OpenAI, Anthropic, Google Gemini, Azure OpenAI, vLLM, or Ollama) as an OpenAI-compatible proxy (`/v1/chat/completions`) and legacy guardrail API (`/api/v1/guard`). Every request passes through fail-closed multi-tenant authentication, RBAC policy isolation, NFKC/homoglyph/encoding canonicalization, config-driven YAML industry policy packs, strict Pydantic v2 validation, and a SHA-256 hash-chained audit ledger.
+1. **Drop-In Proxy & Provider Routing (`lta/app.py`, `lta/providers.py`)**
+   - OpenAI-compatible `POST /v1/chat/completions` plus `POST /api/v1/guard`.
+   - Upstream adapters for **Google Gemini** (`x-goog-api-key` header, `systemInstruction`, `generationConfig`), **OpenAI / Azure OpenAI**, **Anthropic**, **Ollama / vLLM**, and a deterministic `mock` provider.
+   - HTTPS enforcement on all non-localhost upstream URLs, pooled `httpx.AsyncClient` via FastAPI `lifespan`, and safe structured error diagnostics (no credential leakage).
 
-* **Live Interactive API & Swagger Docs:** [https://lucid-truth-audit.onrender.com/docs](https://lucid-truth-audit.onrender.com/docs)
-* **GitHub Repository:** [https://github.com/stickneycorey1-source/Lucid-Truth-Audit-](https://github.com/stickneycorey1-source/Lucid-Truth-Audit-)
+2. **Multi-Layer Security & Policy Engine (`lta/policy_engine.py`, `policy_packs/`)**
+   - Four YAML policy packs: `general_enterprise`, `logistics_fmcsa`, `healthcare_hipaa`, and `finance_pci`.
+   - Recursive obfuscation normalization (NFKD diacritic stripping, NFKC folding, zero-width stripping, Cyrillic/Greek homoglyphs, whitespace collapsing, punctuation-stripped scanning on raw and depth-2 decoded URL/Base64/Hex payloads).
+   - Multi-turn split-injection scanning, system-prompt exfiltration verb guards, strict finite-numeric metadata validation (rejects `NaN`, `Inf`, booleans, and non-numeric strings), symmetric output-boundary leak prevention, and Luhn PAN / SSN / MRN / CDL / API secret redaction.
 
----
+3. **Fail-Closed Auth, Rate Limiting & Observability (`lta/config.py`, `lta/rate_limiter.py`, `lta/metrics.py`)**
+   - SHA-256 hashed per-tenant API keys (`LTA_TENANTS_JSON` or single-key `LTA_API_KEY`) with admin RBAC blocking client policy-downgrade headers and unauthorized `system` turns.
+   - Streaming 256 KB body limit (`413` on both `Content-Length` and chunked transfer encoding), 50-message cap, and `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and `X-Request-ID` headers.
+   - Atomic Redis Lua sliding-window rate limiter with 1.5s socket timeouts and configurable fallback (`LTA_REDIS_FAIL_MODE=memory|closed`).
+   - Admin-gated Prometheus `GET /metrics` (no `tenant=` label PII), `GET /healthz`, and `O(1)` `GET /readyz`.
 
-## One-Line Drop-In Integration (Any OpenAI SDK App)
+4. **Tamper-Evident Audit Ledger (`lta/audit_ledger.py`)**
+   - Append-only SHA-256 hash-chained SQLite/PostgreSQL ledger (`psycopg_pool.ConnectionPool` + `pg_advisory_xact_lock`, indexed by `(tenant_id, seq_id DESC)`).
+   - Never stores raw prompt text (SHA-256 payload digest only); supports `GET /v1/audit/verify` and SIEM-ready NDJSON via `GET /v1/audit/export`.
 
-Point your existing OpenAI SDK client (or LangChain, LlamaIndex, Vercel AI SDK) at LTA—no application rewrite required:
+## Quick Start
 
-    from openai import OpenAI
+Install dependencies and run locally:
 
-    client = OpenAI(
-        base_url="https://lucid-truth-audit.onrender.com/v1",
-        api_key="YOUR_TENANT_LTA_KEY",
-    )
+    pip install -r requirements.txt
+    export LTA_API_KEY="replace-with-strong-secret"
+    export LTA_DEFAULT_PROVIDER="mock"
+    uvicorn lta.app:app --host 0.0.0.0 --port 8000
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": "Summarize today's dispatch manifest."}],
-    )
+Route live traffic to Google Gemini:
 
----
+    export LTA_DEFAULT_PROVIDER="gemini"
+    export LTA_UPSTREAM_MODEL="gemini-3.5-flash-lite"
+    export GEMINI_API_KEY="your-google-ai-studio-key"
 
-## Defense-in-Depth Architecture (v2.1 Hardened)
+Run the verification test suite:
 
-    Incoming Request
-      ├─► [1. Fail-Closed Multi-Tenant Auth + SHA-256 Keys + RBAC]
-      │     ├─► Missing / Invalid Key ────────────────► 403 Forbidden
-      │     ├─► Non-Admin Policy/Provider Override ───► 403 Forbidden
-      │     └─► Sliding-Window Rate Limit (Mem/Redis) ► 429 Too Many Requests
-      ├─► [2. Strict Input Schema: Pydantic v2 (extra="forbid")]
-      │     └─► Unexpected Fields / Invalid Shapes ───► 422 Unprocessable
-      ├─► [3. Canonicalization & Multi-Turn Policy Engine (YAML Packs)]
-      │     ├─► NFKC / Zero-Width / Cyrillic / Whitespace / URL / Base64 / Hex
-      │     ├─► Split Multi-Turn & Role Spoofing ─────► 400 Bad Request
-      │     ├─► Floods (Char / Word / High-Entropy) ──► 400 Bad Request
-      │     ├─► Industry Rules (FMCSA / HIPAA / PCI) ─► 422 Unprocessable
-      │     └─► PII / PHI / PCI Redaction (Luhn PAN, SSN, MRN, CDL, Secrets)
-      ├─► [4. Provider-Agnostic Upstream Router]
-      │     ├─► OpenAI | Anthropic | Gemini | Azure | Ollama | vLLM | Mock
-      │     └─► Upstream HTTP Failure ────────────────► 502 Bad Gateway
-      └─► [5. Output Boundary Validator + Tamper-Evident Audit Ledger]
-            ├─► System Prompt / SSN / Secret Leak ────► 500 Blocked
-            └─► Clean Response ───────────────────────► 200 OK + SHA-256 Chain
+    pytest -v
 
----
-
-## Industry YAML Policy Packs (`policy_packs/`)
-
-Onboard any vertical without changing Python code:
-
-| Policy Pack | Target Vertical | Key Controls & Regulatory Alignment |
-| :--- | :--- | :--- |
-| `general_enterprise` | General SaaS / Enterprise | Prompt-injection defense, social-engineering blocks, PII/PAN/secret redaction, OWASP LLM Top 10, NIST AI RMF 1.0, EU AI Act, ISO/IEC 42001 |
-| `logistics_fmcsa` | Trucking & Dispatch | FMCSA HOS drive/duty/break limits, 80,000 lb weight cap, Bill of Lading indirect injection & waypoint-hijack defense, CDL/driver PII redaction |
-| `healthcare_hipaa` | Clinical & Health Tech | MRN/SSN/PHI redaction, bulk patient-record export blocking, unsupervised controlled-prescription blocks, HIPAA |
-| `finance_pci` | Banking & FinTech | Luhn PAN & bank account/routing redaction, unapproved wire caps, dual-control bypass blocking, PCI-DSS v4.0 & GLBA |
-
----
-
-## API Endpoints
-
-| Method & Path | Access | Purpose |
-| :--- | :--- | :--- |
-| `POST /v1/chat/completions` | Tenant Key | Drop-in OpenAI-compatible guarded chat proxy |
-| `POST /api/v1/guard` | Tenant Key | Backward-compatible single-prompt LTA guardrail endpoint |
-| `GET /v1/policies` | Tenant Key | Lists loaded YAML policy packs and active tenant policy |
-| `GET /v1/audit/verify` | Admin Key | Cryptographically verifies the entire SHA-256 audit hash chain |
-| `GET /v1/audit/export` | Admin Key | Exports SIEM-ready JSONL audit logs (raw prompts never stored) |
-| `GET /metrics` | Public / Internal | Prometheus scrape endpoint (request counts, block vectors, latency quantiles) |
-| `GET /healthz` & `/readyz` | Public / Internal | Container liveness and readiness probes (checks hash-chain integrity) |
-
----
-
-## Verified Test Suite & Local Performance
-
-* **Automated CI Suite:** **61 / 61 tests passing** via GitHub Actions (`pytest`), covering core gateway injection/encoding defense, PII/social-engineering redaction, sliding-window rate limiting and flood defense, FMCSA logistics guardrails, multi-industry YAML policy packs, RBAC override enforcement, split multi-turn injection defense, and cryptographic audit-chain tamper detection.
-* **Local Gateway Overhead (200-request benchmark, `logistics_fmcsa` + PII redaction + SQLite SHA-256 hash chain):** **295.4 req/s** | **3.31 ms p50** | **3.67 ms p95** | **4.36 ms p99** | **200/200 valid hash-chain records**.
-
----
-
-## Self-Hosted VPC Deployment (Docker Compose)
-
-Run LTA inside your own VPC backed by PostgreSQL (with transactional `pg_advisory_xact_lock` hash-chain serialization) and Redis distributed rate limiting:
+Deploy with Docker Compose (Gateway + PostgreSQL 16 + Redis 7):
 
     cp .env.example .env
-    # Edit .env with tenant API keys, Postgres credentials, and upstream provider keys
-    docker compose up -d --build
+    docker compose up --build -d
 
-Run tests locally:
+## Compliance Alignment
 
-    python -m pytest -v
+Mapped to **EU AI Act (Regulation (EU) 2024/1689)** (Articles 9, 12, and 15), **NIST AI RMF 1.0**, **OWASP Top 10 for LLM Applications**, **ISO/IEC 42001**, **FMCSA HOS / Dispatch Guardrails**, **HIPAA PHI Redaction**, and **PCI-DSS PAN Controls**.
+
+## License & Commercial Inquiries
+
+Copyright (c) 2026 Corey Allen Stickney. All Rights Reserved.
+This repository is governed by a **Proprietary Software License (Evaluation Only)** — see [LICENSE](./LICENSE). Production deployments, custom policy packs, and 30-day enterprise shadow pilots require a written commercial license.
+
+Contact: stickneycorey1@gmail.com
