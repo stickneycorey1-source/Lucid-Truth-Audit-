@@ -1,4 +1,4 @@
-"""Lucid-Truth-Audit Enterprise FastAPI Application (Hardened v2.4)."""
+"""Lucid-Truth-Audit Enterprise FastAPI Application (Hardened v2.4.1)."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lta import __version__
 from lta.audit_ledger import AuditLedger
@@ -31,6 +31,13 @@ class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str = Field(..., min_length=1, max_length=65536)
 
+    @field_validator("content")
+    @classmethod
+    def _non_blank_content(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("Message content cannot be blank or whitespace-only.")
+        return v
+
 
 class OpenAIChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -48,6 +55,13 @@ class LegacyGuardRequest(BaseModel):
     model_input: str = Field(..., min_length=1, max_length=65536)
     metadata: Optional[Dict[str, Any]] = None
 
+    @field_validator("model_input")
+    @classmethod
+    def _non_blank_input(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("model_input cannot be blank or whitespace-only.")
+        return v
+
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     cfg = settings or Settings.from_env()
@@ -55,6 +69,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     ledger = AuditLedger(cfg.audit_db_url)
     limiter = SlidingWindowRateLimiter(redis_url=cfg.redis_url)
     metrics = MetricsRegistry()
+    disable_docs = os.getenv("LTA_DISABLE_DOCS", "false").lower().strip() in (
+        "1",
+        "true",
+        "yes",
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -69,6 +88,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         title="Lucid-Truth-Audit Enterprise Gateway",
         version=__version__,
         lifespan=lifespan,
+        docs_url=None if disable_docs else "/docs",
+        redoc_url=None if disable_docs else "/redoc",
+        openapi_url=None if disable_docs else "/openapi.json",
         description=(
             "Drop-in OpenAI-compatible AI security, PII redaction, and regulatory "
             "compliance gateway with YAML policy packs and SHA-256 hash-chained audit logs."
