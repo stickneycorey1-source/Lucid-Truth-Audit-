@@ -8,8 +8,8 @@
   <img src="https://img.shields.io/static/v1?label=Pydantic&message=v2+Strict&color=e92063&logo=pydantic&logoColor=white" alt="Pydantic v2 Strict">
   <img src="https://img.shields.io/static/v1?label=Compliance&message=EU+AI+Act+%7C+ISO+42001+%7C+FMCSA+%7C+HIPAA+%7C+PCI&color=6366f1" alt="Compliance">
   <img src="https://img.shields.io/static/v1?label=Local+p95&message=3.67ms&color=0ea5e9" alt="Local p95 Latency">
-  <img src="https://img.shields.io/static/v1?label=License&message=MIT&color=475569" alt="Proprietary License">
-</p>
+    <img src="https://img.shields.io/static/v1?label=License&message=Proprietary+%7C+All+Rights+Reserved&color=dc2626" alt="Proprietary License">
+
 
 **Drop-In, Provider-Agnostic AI Security, PII Redaction, and Tamper-Evident Compliance Gateway for Production LLM Workflows.**
 
