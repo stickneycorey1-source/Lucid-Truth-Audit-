@@ -1,10 +1,10 @@
-"""Provider-agnostic upstream LLM adapters (Hardened v2.3.1 — header auth + safe diagnostics)."""
+"""Provider-agnostic upstream LLM adapters (Hardened v2.4 — full Gemini support + safe diagnostics)."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -43,10 +43,10 @@ async def _post_json(
     url: str,
     *,
     headers: Optional[Dict[str, str]] = None,
-    payload: Dict[str, object],
+    payload: Dict[str, Any],
     timeout_s: float,
     http_client: Optional[httpx.AsyncClient] = None,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     if http_client is not None:
         resp = await http_client.post(url, headers=headers, json=payload, timeout=timeout_s)
         resp.raise_for_status()
@@ -121,7 +121,7 @@ async def call_upstream(
             headers = {"Content-Type": "application/json"}
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
-            payload: Dict[str, object] = {"model": model, "messages": messages}
+            payload: Dict[str, Any] = {"model": model, "messages": messages}
             if temperature is not None:
                 payload["temperature"] = temperature
             if max_tokens is not None:
@@ -134,10 +134,14 @@ async def call_upstream(
                 timeout_s=timeout_s,
                 http_client=http_client,
             )
-            usage = data.get("usage", {})  # type: ignore[union-attr]
+            choices = data.get("choices") or []
+            if not choices or not isinstance(choices[0], dict):
+                raise UpstreamProviderError(f"Upstream '{provider_key}' returned empty choices")
+            content = (choices[0].get("message") or {}).get("content", "")
+            usage = data.get("usage") or {}
             return ProviderResponse(
-                content=data["choices"][0]["message"]["content"],  # type: ignore[index]
-                model=str(data.get("model", model)),  # type: ignore[union-attr]
+                content=str(content),
+                model=str(data.get("model", model)),
                 provider=provider_key,
                 prompt_tokens=int(usage.get("prompt_tokens", 0)),
                 completion_tokens=int(usage.get("completion_tokens", 0)),
@@ -154,6 +158,8 @@ async def call_upstream(
                 "max_tokens": max_tokens or 1024,
                 "messages": chat_msgs,
             }
+            if temperature is not None:
+                payload["temperature"] = temperature
             if system_parts:
                 payload["system"] = "\n".join(system_parts)
             headers = {
@@ -170,13 +176,13 @@ async def call_upstream(
             )
             text_blocks = [
                 b.get("text", "")
-                for b in data.get("content", [])  # type: ignore[union-attr]
-                if b.get("type") == "text"
+                for b in data.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "text"
             ]
-            usage = data.get("usage", {})  # type: ignore[union-attr]
+            usage = data.get("usage") or {}
             return ProviderResponse(
                 content="".join(text_blocks),
-                model=str(data.get("model", model)),  # type: ignore[union-attr]
+                model=str(data.get("model", model)),
                 provider="anthropic",
                 prompt_tokens=int(usage.get("input_tokens", 0)),
                 completion_tokens=int(usage.get("output_tokens", 0)),
@@ -186,6 +192,7 @@ async def call_upstream(
             api_key = os.getenv("GEMINI_API_KEY", "").strip()
             if not api_key:
                 raise UpstreamProviderError("Missing GEMINI_API_KEY")
+            system_parts = [m["content"] for m in messages if m.get("role") == "system"]
             contents = [
                 {
                     "role": "model" if m.get("role") == "assistant" else "user",
@@ -194,6 +201,19 @@ async def call_upstream(
                 for m in messages
                 if m.get("role") != "system"
             ]
+            gem_payload: Dict[str, Any] = {"contents": contents}
+            if system_parts:
+                gem_payload["systemInstruction"] = {
+                    "parts": [{"text": "\n".join(system_parts)}]
+                }
+            gen_cfg: Dict[str, Any] = {}
+            if temperature is not None:
+                gen_cfg["temperature"] = temperature
+            if max_tokens is not None:
+                gen_cfg["maxOutputTokens"] = max_tokens
+            if gen_cfg:
+                gem_payload["generationConfig"] = gen_cfg
+
             url = (
                 f"https://generativelanguage.googleapis.com/v1beta/models/"
                 f"{model}:generateContent"
@@ -205,17 +225,27 @@ async def call_upstream(
             data = await _post_json(
                 url,
                 headers=headers,
-                payload={"contents": contents},
+                payload=gem_payload,
                 timeout_s=timeout_s,
                 http_client=http_client,
             )
-            parts = data["candidates"][0]["content"]["parts"]  # type: ignore[index]
+            candidates = data.get("candidates") or []
+            if not candidates or not isinstance(candidates[0], dict):
+                raise UpstreamProviderError(
+                    f"Upstream 'gemini' returned no candidates ({model})"
+                )
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+            if not parts:
+                finish = candidates[0].get("finishReason", "UNKNOWN")
+                raise UpstreamProviderError(
+                    f"Upstream 'gemini' returned empty content (finishReason={finish})"
+                )
             text = "".join(
                 p.get("text", "")
                 for p in parts
                 if isinstance(p, dict) and not p.get("thought")
             )
-            usage = data.get("usageMetadata", {})  # type: ignore[union-attr]
+            usage = data.get("usageMetadata") or {}
             return ProviderResponse(
                 content=text,
                 model=model,
