@@ -1,12 +1,16 @@
-"""Lucid-Truth-Audit Enterprise FastAPI Application (Hardened v2.2)."""
+"""Lucid-Truth-Audit Enterprise FastAPI Application (Hardened v2.3)."""
 
 from __future__ import annotations
 
+import os
 import time
 import uuid
-from typing import Any, Dict, List, Literal, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from lta import __version__
@@ -16,6 +20,9 @@ from lta.metrics import MetricsRegistry
 from lta.policy_engine import PolicyEngine
 from lta.providers import UpstreamProviderError, call_upstream
 from lta.rate_limiter import SlidingWindowRateLimiter
+
+
+MAX_BODY_BYTES = int(os.getenv("LTA_MAX_BODY_BYTES", str(256 * 1024)))
 
 
 class ChatMessage(BaseModel):
@@ -49,9 +56,19 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     limiter = SlidingWindowRateLimiter(redis_url=cfg.redis_url)
     metrics = MetricsRegistry()
 
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
+        application.state.http_client = httpx.AsyncClient(timeout=cfg.upstream_timeout_s)
+        try:
+            yield
+        finally:
+            await application.state.http_client.aclose()
+            ledger.close()
+
     app = FastAPI(
         title="Lucid-Truth-Audit Enterprise Gateway",
         version=__version__,
+        lifespan=lifespan,
         description=(
             "Drop-in OpenAI-compatible AI security, PII redaction, and regulatory "
             "compliance gateway with YAML policy packs and SHA-256 hash-chained audit logs."
@@ -62,10 +79,29 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.state.ledger = ledger
     app.state.limiter = limiter
     app.state.metrics = metrics
+    app.state.http_client = None
 
     @app.middleware("http")
-    async def add_security_headers(request: Request, call_next: Any) -> Response:
+    async def security_and_body_limit_middleware(
+        request: Request, call_next: Any
+    ) -> Response:
+        req_id = (request.headers.get("x-request-id") or "").strip()[:64] or str(
+            uuid.uuid4()
+        )
+        content_length = request.headers.get("content-length")
+        if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": f"Payload Too Large: exceeds {MAX_BODY_BYTES} byte limit."},
+                headers={
+                    "X-Request-ID": req_id,
+                    "Cache-Control": "no-store",
+                    "X-Content-Type-Options": "nosniff",
+                    "X-Frame-Options": "DENY",
+                },
+            )
         response = await call_next(request)
+        response.headers["X-Request-ID"] = req_id
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
@@ -124,13 +160,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.get("/readyz")
     async def readyz() -> Dict[str, Any]:
-        chain_ok, total, _ = ledger.verify_chain()
-        if not chain_ok or not cfg.tenants or not engine.packs:
+        db_ok = ledger.ping()
+        if not db_ok or not cfg.tenants or not engine.packs:
             raise HTTPException(status_code=503, detail="Gateway not ready")
         return {
             "status": "ready",
-            "audit_chain_valid": chain_ok,
-            "audit_records": total,
+            "database_ok": db_ok,
             "policies_loaded": len(engine.packs),
         }
 
@@ -343,6 +378,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_s=cfg.upstream_timeout_s,
+                http_client=app.state.http_client,
             )
         except UpstreamProviderError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
