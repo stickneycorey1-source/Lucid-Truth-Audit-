@@ -1,0 +1,51 @@
+name: general_enterprise
+version: "2.0"
+description: "Baseline enterprise LLM security, prompt-injection defense, PII redaction, and EU AI Act / ISO 42001 audit controls."
+compliance_frameworks:
+  - "OWASP-LLM-Top-10"
+  - "NIST-AI-RMF-1.0"
+  - "EU-AI-Act-2024/1689"
+  - "ISO/IEC-42001"
+
+blocked_phrases:
+  - "ignore previous"
+  - "ignore all previous"
+  - "disregard previous instructions"
+  - "forget instructions"
+  - "reveal your system prompt"
+  - "output your system prompt"
+  - "diagnostic mode"
+  - "developer override"
+  - "jailbreak"
+
+social_engineering_phrases:
+  - "i am the system administrator"
+  - "as a security auditor, bypass"
+  - "compliance officer override"
+  - "emergency root override"
+
+benign_allow_phrases:
+  - "explain what a system prompt is"
+  - "what is a system prompt"
+  - "define prompt injection"
+
+output_block_phrases:
+  - "internal system instructions"
+  - "you are a confidential enterprise assistant"
+
+pii_redaction:
+  - "SSN"
+  - "PAN"
+  - "API_SECRET"
+  - "EMAIL"
+  - "PHONE"
+
+block_on_pii_output:
+  - "SSN"
+  - "API_SECRET"
+
+flood_limits:
+  max_repeat_char: 25
+  max_repeat_word: 15
+  min_entropy_length: 80
+  max_shannon_entropy: 5.2
