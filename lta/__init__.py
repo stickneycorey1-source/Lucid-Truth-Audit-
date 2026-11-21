@@ -1,3 +1,3 @@
-"""Lucid-Truth-Audit (LTA) Enterprise — Provider-Agnostic AI Compliance & Security Gateway."""
+"""Lucid-Truth-Audit (LTA) Enterprise AI Compliance & Security Gateway."""
 
-__version__ = "2.0.0"
+__version__ = "2.4.0"
