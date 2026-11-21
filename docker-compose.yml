@@ -1,0 +1,47 @@
+services:
+  lta-gateway:
+    build: .
+    container_name: lta-enterprise-gateway
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      LTA_AUDIT_DB_URL: postgresql://lta:lta_change_me@postgres:5432/lta_audit
+      LTA_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: lta-audit-postgres
+    environment:
+      POSTGRES_USER: lta
+      POSTGRES_PASSWORD: lta_change_me
+      POSTGRES_DB: lta_audit
+    volumes:
+      - lta_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lta -d lta_audit"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: lta-rate-limit-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  lta_pg_data:
