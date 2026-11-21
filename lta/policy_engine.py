@@ -1,4 +1,4 @@
-"""YAML Policy-Pack Engine for Lucid-Truth-Audit Enterprise (Hardened v2.1)."""
+"""YAML Policy-Pack Engine for Lucid-Truth-Audit Enterprise (Hardened v2.2)."""
 
 from __future__ import annotations
 
@@ -14,8 +14,9 @@ from urllib.parse import unquote
 
 import yaml
 
-ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
 WHITESPACE_RE = re.compile(r"\s+")
+PUNCT_STRIP_RE = re.compile(r"[^\w\s]")
 HOMOGLYPH_MAP = str.maketrans(
     {
         "\u0430": "a",
@@ -33,6 +34,24 @@ HOMOGLYPH_MAP = str.maketrans(
         "\u0421": "c",
         "\u0423": "y",
         "\u0425": "x",
+        "\u03b1": "a",
+        "\u03b5": "e",
+        "\u03bf": "o",
+        "\u03c1": "p",
+        "\u03b9": "i",
+        "\u03ba": "k",
+        "\u03bd": "v",
+        "\u03c4": "t",
+        "\u03c5": "u",
+        "\u03c7": "x",
+        "\u0391": "a",
+        "\u0395": "e",
+        "\u039f": "o",
+        "\u03a1": "p",
+        "\u0399": "i",
+        "\u039a": "k",
+        "\u03a4": "t",
+        "\u03a7": "x",
     }
 )
 
@@ -81,40 +100,64 @@ def shannon_entropy(text: str) -> float:
 
 
 def canonicalize(text: str) -> str:
-    """NFKC-normalize, strip zero-width chars, fold homoglyphs, lowercase, and collapse whitespace."""
-    nfkc = unicodedata.normalize("NFKC", text)
+    """Strip diacritics, NFKC-normalize, strip zero-width chars, fold homoglyphs, collapse whitespace."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    no_marks = "".join(ch for ch in nfkd if unicodedata.category(ch) != "Mn")
+    nfkc = unicodedata.normalize("NFKC", no_marks)
     cleaned = ZERO_WIDTH_RE.sub("", nfkc)
     folded = cleaned.translate(HOMOGLYPH_MAP).lower()
     return WHITESPACE_RE.sub(" ", folded).strip()
 
 
-def extract_decoded_segments(text: str) -> List[str]:
-    """Decode embedded URL-encoded, Base64, and Hex payloads to catch obfuscated injections."""
-    decoded: List[str] = []
+def _punct_stripped(normalized_text: str) -> str:
+    """Secondary scan surface with punctuation removed to catch dot/hyphen-split phrases."""
+    return WHITESPACE_RE.sub(" ", PUNCT_STRIP_RE.sub("", normalized_text)).strip()
 
-    if "%" in text:
-        url_decoded = unquote(text)
-        if url_decoded != text:
-            decoded.append(canonicalize(url_decoded))
 
-    for match in BASE64_CANDIDATE_RE.findall(text):
-        try:
-            raw = base64.b64decode(match, validate=True).decode("utf-8", errors="ignore")
-            if raw and len(raw) >= 8:
-                decoded.append(canonicalize(raw))
-        except Exception:
-            pass
+def extract_decoded_segments(text: str, max_depth: int = 2) -> List[str]:
+    """Bounded recursive decoding of URL-encoded, Base64, and Hex payloads."""
+    decoded_surfaces: List[str] = []
+    seen = {text}
+    frontier = [text]
 
-    for match in HEX_CANDIDATE_RE.findall(text):
-        hex_str = match[2:] if match.lower().startswith("0x") else match
-        if len(hex_str) % 2 == 0:
-            try:
-                raw = bytes.fromhex(hex_str).decode("utf-8", errors="ignore")
-                if raw and len(raw) >= 8:
-                    decoded.append(canonicalize(raw))
-            except Exception:
-                pass
-    return decoded
+    for _ in range(max_depth):
+        next_frontier: List[str] = []
+        for item in frontier:
+            if "%" in item:
+                url_dec = unquote(item)
+                if url_dec not in seen:
+                    seen.add(url_dec)
+                    decoded_surfaces.append(canonicalize(url_dec))
+                    next_frontier.append(url_dec)
+
+            for match in BASE64_CANDIDATE_RE.findall(item):
+                try:
+                    raw = base64.b64decode(match, validate=True).decode(
+                        "utf-8", errors="ignore"
+                    )
+                    if raw and len(raw) >= 8 and raw not in seen:
+                        seen.add(raw)
+                        decoded_surfaces.append(canonicalize(raw))
+                        next_frontier.append(raw)
+                except Exception:
+                    pass
+
+            for match in HEX_CANDIDATE_RE.findall(item):
+                hex_str = match[2:] if match.lower().startswith("0x") else match
+                if len(hex_str) % 2 == 0:
+                    try:
+                        raw = bytes.fromhex(hex_str).decode("utf-8", errors="ignore")
+                        if raw and len(raw) >= 8 and raw not in seen:
+                            seen.add(raw)
+                            decoded_surfaces.append(canonicalize(raw))
+                            next_frontier.append(raw)
+                    except Exception:
+                        pass
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    return decoded_surfaces
 
 
 @dataclass
@@ -272,8 +315,9 @@ class PolicyEngine:
     ) -> EvaluationResult:
         pack = self.get_pack(policy_name)
         normalized = canonicalize(text)
-        decoded_segments = extract_decoded_segments(text)
-        surfaces = [normalized] + decoded_segments
+        punct_clean = _punct_stripped(normalized)
+        decoded_segments = extract_decoded_segments(text, max_depth=2)
+        surfaces = [normalized, punct_clean] + decoded_segments
 
         flood_hit = self._check_flood(text, pack)
         if flood_hit:
@@ -293,9 +337,9 @@ class PolicyEngine:
         for idx, surface in enumerate(surfaces):
             for phrase in pack.blocked_phrases:
                 if phrase in surface:
-                    if idx == 0 and is_benign_educational and phrase == "system prompt":
+                    if idx <= 1 and is_benign_educational and phrase == "system prompt":
                         continue
-                    source_tag = "encoded_payload" if idx > 0 else "direct_or_obfuscated"
+                    source_tag = "encoded_payload" if idx > 1 else "direct_or_obfuscated"
                     return EvaluationResult(
                         allowed=False,
                         action="BLOCK",
@@ -370,9 +414,10 @@ class PolicyEngine:
         )
 
     def evaluate_output(self, text: str, policy_name: str) -> EvaluationResult:
-        """Inspect upstream LLM output for instruction leaks, secrets, or prohibited PII."""
+        """Inspect upstream LLM output on both raw and canonicalized surfaces."""
         pack = self.get_pack(policy_name)
         normalized = canonicalize(text)
+        surfaces = (text, normalized)
 
         for phrase in pack.output_block_phrases:
             if phrase in normalized:
@@ -386,7 +431,7 @@ class PolicyEngine:
                     compliance_tags=pack.compliance_frameworks,
                 )
 
-        if "SSN" in pack.block_on_pii_output and SSN_RE.search(text):
+        if "SSN" in pack.block_on_pii_output and any(SSN_RE.search(s) for s in surfaces):
             return EvaluationResult(
                 allowed=False,
                 action="BLOCK",
@@ -397,7 +442,9 @@ class PolicyEngine:
                 compliance_tags=pack.compliance_frameworks,
             )
 
-        if "API_SECRET" in pack.block_on_pii_output and API_SECRET_RE.search(text):
+        if "API_SECRET" in pack.block_on_pii_output and any(
+            API_SECRET_RE.search(s) for s in surfaces
+        ):
             return EvaluationResult(
                 allowed=False,
                 action="BLOCK",
@@ -407,6 +454,29 @@ class PolicyEngine:
                 policy_pack=pack.name,
                 compliance_tags=pack.compliance_frameworks,
             )
+
+        if "MRN" in pack.block_on_pii_output and any(MRN_RE.search(s) for s in surfaces):
+            return EvaluationResult(
+                allowed=False,
+                action="BLOCK",
+                http_status=500,
+                vector="security.output_phi_exfiltration",
+                reason="Upstream model output attempted raw MRN/PHI exfiltration",
+                policy_pack=pack.name,
+                compliance_tags=pack.compliance_frameworks,
+            )
+
+        for rule_name, pattern in pack.domain_block_patterns:
+            if any(pattern.search(s) for s in surfaces):
+                return EvaluationResult(
+                    allowed=False,
+                    action="BLOCK",
+                    http_status=500,
+                    vector=f"domain.output_{rule_name}",
+                    reason=f"Upstream model output violated domain policy ({rule_name})",
+                    policy_pack=pack.name,
+                    compliance_tags=pack.compliance_frameworks,
+                )
 
         sanitized, redactions = self._redact_pii(text, pack.pii_redaction)
         return EvaluationResult(
