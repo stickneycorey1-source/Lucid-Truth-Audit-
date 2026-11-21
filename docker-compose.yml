@@ -7,7 +7,7 @@ services:
     env_file:
       - .env
     environment:
-      LTA_AUDIT_DB_URL: postgresql://lta:lta_change_me@postgres:5432/lta_audit
+      LTA_AUDIT_DB_URL: postgresql://lta:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/lta_audit
       LTA_REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:
@@ -21,7 +21,7 @@ services:
     container_name: lta-audit-postgres
     environment:
       POSTGRES_USER: lta
-      POSTGRES_PASSWORD: lta_change_me
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: lta_audit
     volumes:
       - lta_pg_data:/var/lib/postgresql/data
