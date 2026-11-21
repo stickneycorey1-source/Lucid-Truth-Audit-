@@ -1,4 +1,10 @@
-"""Tamper-evident SHA-256 hash-chained persistent audit ledger (Hardened v2.3)."""
+"""Tamper-evident SHA-256 hash-chained persistent audit ledger (Hardened v2.4).
+
+Supports SQLite out of the box and PostgreSQL via `psycopg_pool.ConnectionPool`
+(with fallback to `psycopg.connect`) using transactional `pg_advisory_xact_lock`,
+automatic `rollback()` on errors, an O(1) `ping()` for `/readyz` probes, and a
+composite `(tenant_id, seq_id DESC)` index for fast SIEM exports.
+"""
 
 from __future__ import annotations
 
@@ -163,6 +169,10 @@ class AuditLedger:
         with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(ddl)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_tenant_seq "
+                "ON audit_events (tenant_id, seq_id DESC)"
+            )
             conn.commit()
 
     def ping(self) -> bool:
