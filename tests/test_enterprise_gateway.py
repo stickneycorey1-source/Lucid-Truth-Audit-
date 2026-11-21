@@ -5,9 +5,14 @@ from __future__ import annotations
 import base64
 import json
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from fastapi.testclient import TestClient
 
@@ -15,7 +20,7 @@ from lta.app import create_app
 from lta.config import Settings, TenantConfig, hash_api_key
 
 
-POLICY_DIR = Path(__file__).resolve().parent.parent / "policy_packs"
+POLICY_DIR = REPO_ROOT / "policy_packs"
 
 
 class TestLTAEnterpriseGateway(unittest.TestCase):
