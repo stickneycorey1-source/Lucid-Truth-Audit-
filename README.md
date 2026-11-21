@@ -1,13 +1,15 @@
 # Lucid-Truth-Audit (LTA) Enterprise — v2.1
 
-[[https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml/badge.svg]](https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions)
-[[https://img.shields.io/static/v1?label=Pytest+Suite&message=61/61+Passing&color=10b981&logo=pytest&logoColor=white]](https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions)
-[[https://img.shields.io/static/v1?label=Live+API&message=Render+Active&color=38bdf8&logo=fastapi&logoColor=white]](https://lucid-truth-audit.onrender.com/docs)
-[https://img.shields.io/static/v1?label=Python&message=3.11&color=3776ab&logo=python&logoColor=white]
-[https://img.shields.io/static/v1?label=Pydantic&message=v2+Strict&color=e92063&logo=pydantic&logoColor=white]
-[https://img.shields.io/static/v1?label=Compliance&message=EU+AI+Act+%7C+ISO+42001+%7C+FMCSA+%7C+HIPAA+%7C+PCI&color=6366f1]
-[https://img.shields.io/static/v1?label=Local+p95&message=3.67ms&color=0ea5e9]
-[https://img.shields.io/static/v1?label=License&message=MIT&color=475569]
+<p>
+  <a href="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions"><img src="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml/badge.svg" alt="Lucid Truth Audit CI"></a>
+  <a href="https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions"><img src="https://img.shields.io/static/v1?label=Pytest+Suite&message=61/61+Passing&color=10b981&logo=pytest&logoColor=white" alt="Pytest Suite"></a>
+  <a href="https://lucid-truth-audit.onrender.com/docs"><img src="https://img.shields.io/static/v1?label=Live+API&message=Render+Active&color=38bdf8&logo=fastapi&logoColor=white" alt="Live API"></a>
+  <img src="https://img.shields.io/static/v1?label=Python&message=3.11&color=3776ab&logo=python&logoColor=white" alt="Python 3.11">
+  <img src="https://img.shields.io/static/v1?label=Pydantic&message=v2+Strict&color=e92063&logo=pydantic&logoColor=white" alt="Pydantic v2 Strict">
+  <img src="https://img.shields.io/static/v1?label=Compliance&message=EU+AI+Act+%7C+ISO+42001+%7C+FMCSA+%7C+HIPAA+%7C+PCI&color=6366f1" alt="Compliance">
+  <img src="https://img.shields.io/static/v1?label=Local+p95&message=3.67ms&color=0ea5e9" alt="Local p95 Latency">
+  <img src="https://img.shields.io/static/v1?label=License&message=MIT&color=475569" alt="MIT License">
+</p>
 
 **Drop-In, Provider-Agnostic AI Security, PII Redaction, and Tamper-Evident Compliance Gateway for Production LLM Workflows.**
 
