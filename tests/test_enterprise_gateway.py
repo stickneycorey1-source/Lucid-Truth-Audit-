@@ -1,4 +1,4 @@
-"""Comprehensive unittest + pytest-compatible verification suite for LTA Enterprise (v2.2)."""
+"""Comprehensive unittest + pytest-compatible verification suite for LTA Enterprise (v2.3)."""
 
 from __future__ import annotations
 
@@ -16,8 +16,9 @@ if str(REPO_ROOT) not in sys.path:
 
 from fastapi.testclient import TestClient
 
-from lta.app import create_app
+from lta.app import MAX_BODY_BYTES, create_app
 from lta.config import Settings, TenantConfig, hash_api_key
+from lta.providers import UpstreamProviderError, validate_upstream_url
 
 
 POLICY_DIR = REPO_ROOT / "policy_packs"
@@ -87,17 +88,38 @@ class TestLTAEnterpriseGateway(unittest.TestCase):
         self.app.state.ledger.close()
         self._tmpdir.cleanup()
 
-    def test_health_readiness_and_security_headers(self) -> None:
-        r1 = self.client.get("/healthz")
+    def test_health_readiness_headers_and_body_size_limit(self) -> None:
+        r1 = self.client.get("/healthz", headers={"X-Request-ID": "trace-abc-123"})
         self.assertEqual(r1.status_code, 200)
         self.assertEqual(r1.json()["policies_loaded"], 4)
+        self.assertEqual(r1.headers.get("x-request-id"), "trace-abc-123")
         self.assertEqual(r1.headers.get("cache-control"), "no-store")
         self.assertEqual(r1.headers.get("x-content-type-options"), "nosniff")
         self.assertEqual(r1.headers.get("x-frame-options"), "DENY")
 
         r2 = self.client.get("/readyz")
         self.assertEqual(r2.status_code, 200)
-        self.assertTrue(r2.json()["audit_chain_valid"])
+        self.assertTrue(r2.json()["database_ok"])
+
+        oversized = "x" * (MAX_BODY_BYTES + 100)
+        r_big = self.client.post(
+            "/v1/chat/completions",
+            headers={"x-api-key": self.admin_key},
+            content=oversized,
+        )
+        self.assertEqual(r_big.status_code, 413)
+
+    def test_upstream_tls_url_validation(self) -> None:
+        self.assertEqual(
+            validate_upstream_url("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1",
+        )
+        self.assertEqual(
+            validate_upstream_url("http://localhost:11434/v1"),
+            "http://localhost:11434/v1",
+        )
+        with self.assertRaises(UpstreamProviderError):
+            validate_upstream_url("http://external-llm.example.com/v1")
 
     def test_fail_closed_when_no_tenants_configured(self) -> None:
         empty_cfg = Settings(
