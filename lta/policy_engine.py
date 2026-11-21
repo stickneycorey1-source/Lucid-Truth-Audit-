@@ -1,4 +1,15 @@
-"""YAML Policy-Pack Engine for Lucid-Truth-Audit Enterprise (Hardened v2.2)."""
+"""YAML Policy-Pack Engine for Lucid-Truth-Audit Enterprise (Hardened v2.4).
+
+Handles:
+1. Unicode NFKD diacritic stripping, NFKC normalization, zero-width stripping,
+   Cyrillic + Greek homoglyph folding, whitespace collapsing, and punctuation-stripped scan
+2. Bounded recursive decoding (depth=2) for URL, Base64, and Hex payloads (including punct-stripped)
+3. Prompt injection & social-engineering pretext blocking (hardened benign-allow & exfil verb guard)
+4. Flooding / high-entropy gibberish defense
+5. PII / PHI / PCI detection and deterministic redaction (including Luhn PAN check)
+6. Industry-specific domain guardrails with strict finite-numeric validation (blocks NaN/Inf/str)
+7. Symmetric output-boundary leak prevention on both raw and canonicalized outputs
+"""
 
 from __future__ import annotations
 
@@ -17,8 +28,15 @@ import yaml
 ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff\u00ad]")
 WHITESPACE_RE = re.compile(r"\s+")
 PUNCT_STRIP_RE = re.compile(r"[^\w\s]")
+EXFIL_ACTION_RE = re.compile(
+    r"\b(?:reveal|dump|print|show|output|ignore|override|bypass|leak|verbatim|disclose|expose|repeat)\b"
+)
+SYSTEM_PROMPT_EXFIL_RE = re.compile(
+    r"\b(?:reveal|dump|print|show|output|leak|disclose|expose|repeat)\b.{0,35}\b(?:system prompt|hidden instructions|developer prompt)\b"
+)
 HOMOGLYPH_MAP = str.maketrans(
     {
+        # Cyrillic lookalikes
         "\u0430": "a",
         "\u0435": "e",
         "\u043e": "o",
@@ -34,6 +52,7 @@ HOMOGLYPH_MAP = str.maketrans(
         "\u0421": "c",
         "\u0423": "y",
         "\u0425": "x",
+        # Greek lookalikes
         "\u03b1": "a",
         "\u03b5": "e",
         "\u03bf": "o",
@@ -120,6 +139,14 @@ def extract_decoded_segments(text: str, max_depth: int = 2) -> List[str]:
     seen = {text}
     frontier = [text]
 
+    def _add_surface(raw_val: str) -> None:
+        canon = canonicalize(raw_val)
+        if canon:
+            decoded_surfaces.append(canon)
+            punct = _punct_stripped(canon)
+            if punct and punct != canon:
+                decoded_surfaces.append(punct)
+
     for _ in range(max_depth):
         next_frontier: List[str] = []
         for item in frontier:
@@ -127,7 +154,7 @@ def extract_decoded_segments(text: str, max_depth: int = 2) -> List[str]:
                 url_dec = unquote(item)
                 if url_dec not in seen:
                     seen.add(url_dec)
-                    decoded_surfaces.append(canonicalize(url_dec))
+                    _add_surface(url_dec)
                     next_frontier.append(url_dec)
 
             for match in BASE64_CANDIDATE_RE.findall(item):
@@ -137,7 +164,7 @@ def extract_decoded_segments(text: str, max_depth: int = 2) -> List[str]:
                     )
                     if raw and len(raw) >= 8 and raw not in seen:
                         seen.add(raw)
-                        decoded_surfaces.append(canonicalize(raw))
+                        _add_surface(raw)
                         next_frontier.append(raw)
                 except Exception:
                     pass
@@ -149,7 +176,7 @@ def extract_decoded_segments(text: str, max_depth: int = 2) -> List[str]:
                         raw = bytes.fromhex(hex_str).decode("utf-8", errors="ignore")
                         if raw and len(raw) >= 8 and raw not in seen:
                             seen.add(raw)
-                            decoded_surfaces.append(canonicalize(raw))
+                            _add_surface(raw)
                             next_frontier.append(raw)
                     except Exception:
                         pass
@@ -331,10 +358,23 @@ class PolicyEngine:
                 compliance_tags=pack.compliance_frameworks,
             )
 
-        is_benign_educational = any(
-            allow in normalized for allow in pack.benign_allow_phrases
+        is_benign_educational = (
+            any(allow in normalized for allow in pack.benign_allow_phrases)
+            and not EXFIL_ACTION_RE.search(normalized)
+            and not EXFIL_ACTION_RE.search(punct_clean)
         )
         for idx, surface in enumerate(surfaces):
+            if SYSTEM_PROMPT_EXFIL_RE.search(surface):
+                source_tag = "encoded_payload" if idx > 1 else "direct_or_obfuscated"
+                return EvaluationResult(
+                    allowed=False,
+                    action="BLOCK",
+                    http_status=400,
+                    vector="security.prompt_injection",
+                    reason=f"Blocked prompt injection ({source_tag})",
+                    policy_pack=pack.name,
+                    compliance_tags=pack.compliance_frameworks,
+                )
             for phrase in pack.blocked_phrases:
                 if phrase in surface:
                     if idx <= 1 and is_benign_educational and phrase == "system prompt":
@@ -379,7 +419,39 @@ class PolicyEngine:
             for rule in pack.numeric_limits:
                 field_name = rule["field"]
                 if field_name in metadata and metadata[field_name] is not None:
-                    val = float(metadata[field_name])
+                    raw_val = metadata[field_name]
+                    if isinstance(raw_val, bool):
+                        return EvaluationResult(
+                            allowed=False,
+                            action="BLOCK",
+                            http_status=422,
+                            vector="domain.invalid_numeric_metadata",
+                            reason=f"Field '{field_name}' must be a finite number, not boolean",
+                            policy_pack=pack.name,
+                            compliance_tags=pack.compliance_frameworks,
+                        )
+                    try:
+                        val = float(raw_val)
+                    except (TypeError, ValueError):
+                        return EvaluationResult(
+                            allowed=False,
+                            action="BLOCK",
+                            http_status=422,
+                            vector="domain.invalid_numeric_metadata",
+                            reason=f"Field '{field_name}' must be a valid finite number",
+                            policy_pack=pack.name,
+                            compliance_tags=pack.compliance_frameworks,
+                        )
+                    if not math.isfinite(val):
+                        return EvaluationResult(
+                            allowed=False,
+                            action="BLOCK",
+                            http_status=422,
+                            vector="domain.invalid_numeric_metadata",
+                            reason=f"Field '{field_name}' must be finite (NaN/Inf rejected)",
+                            policy_pack=pack.name,
+                            compliance_tags=pack.compliance_frameworks,
+                        )
                     if "max" in rule and val > float(rule["max"]):
                         return EvaluationResult(
                             allowed=False,
