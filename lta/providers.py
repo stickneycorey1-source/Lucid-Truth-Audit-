@@ -1,12 +1,16 @@
-"""Provider-agnostic upstream LLM adapters (OpenAI, Anthropic, Gemini, Ollama/vLLM, Mock)."""
+"""Provider-agnostic upstream LLM adapters (Hardened v2.3 — TLS check + pooled httpx)."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 import httpx
+
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal", "ollama"}
 
 
 @dataclass
@@ -22,6 +26,37 @@ class UpstreamProviderError(RuntimeError):
     """Raised when an upstream LLM provider call fails or is misconfigured."""
 
 
+def validate_upstream_url(url: str) -> str:
+    """Enforce HTTPS on all non-localhost upstream provider endpoints."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https":
+        return url.rstrip("/")
+    if parsed.scheme == "http" and host in _LOCAL_HOSTS:
+        return url.rstrip("/")
+    raise UpstreamProviderError(
+        f"Refusing insecure non-local upstream URL scheme '{parsed.scheme}' for host '{host}'."
+    )
+
+
+async def _post_json(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    payload: Dict[str, object],
+    timeout_s: float,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> Dict[str, object]:
+    if http_client is not None:
+        resp = await http_client.post(url, headers=headers, json=payload, timeout=timeout_s)
+        resp.raise_for_status()
+        return resp.json()
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+
 async def call_upstream(
     *,
     provider: str,
@@ -30,6 +65,7 @@ async def call_upstream(
     temperature: Optional[float] = None,
     max_tokens: Optional[int] = None,
     timeout_s: float = 30.0,
+    http_client: Optional[httpx.AsyncClient] = None,
 ) -> ProviderResponse:
     """Route sanitized chat messages to the configured upstream AI provider."""
     provider_key = provider.lower().strip()
@@ -64,101 +100,113 @@ async def call_upstream(
             completion_tokens=24,
         )
 
-    if provider_key in ("openai", "azure_openai", "vllm", "ollama"):
-        base_url = os.getenv(
-            f"LTA_{provider_key.upper()}_BASE_URL",
-            "http://localhost:11434/v1"
-            if provider_key == "ollama"
-            else "https://api.openai.com/v1",
-        ).rstrip("/")
-        api_key = os.getenv(f"LTA_{provider_key.upper()}_API_KEY") or os.getenv(
-            "OPENAI_API_KEY", ""
-        )
-        if provider_key in ("openai", "azure_openai") and not api_key:
-            raise UpstreamProviderError(
-                f"Missing API key for upstream provider '{provider_key}'"
+    try:
+        if provider_key in ("openai", "azure_openai", "vllm", "ollama"):
+            raw_url = os.getenv(
+                f"LTA_{provider_key.upper()}_BASE_URL",
+                "http://localhost:11434/v1"
+                if provider_key == "ollama"
+                else "https://api.openai.com/v1",
             )
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        payload: Dict[str, object] = {"model": model, "messages": messages}
-        if temperature is not None:
-            payload["temperature"] = temperature
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.post(
-                f"{base_url}/chat/completions", headers=headers, json=payload
+            base_url = validate_upstream_url(raw_url)
+            api_key = os.getenv(f"LTA_{provider_key.upper()}_API_KEY") or os.getenv(
+                "OPENAI_API_KEY", ""
             )
-            resp.raise_for_status()
-            data = resp.json()
-        usage = data.get("usage", {})
-        return ProviderResponse(
-            content=data["choices"][0]["message"]["content"],
-            model=data.get("model", model),
-            provider=provider_key,
-            prompt_tokens=int(usage.get("prompt_tokens", 0)),
-            completion_tokens=int(usage.get("completion_tokens", 0)),
-        )
+            if provider_key in ("openai", "azure_openai") and not api_key:
+                raise UpstreamProviderError(
+                    f"Missing API key for upstream provider '{provider_key}'"
+                )
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            payload: Dict[str, object] = {"model": model, "messages": messages}
+            if temperature is not None:
+                payload["temperature"] = temperature
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
 
-    if provider_key == "anthropic":
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            raise UpstreamProviderError("Missing ANTHROPIC_API_KEY")
-        system_parts = [m["content"] for m in messages if m.get("role") == "system"]
-        chat_msgs = [m for m in messages if m.get("role") != "system"]
-        payload = {
-            "model": model,
-            "max_tokens": max_tokens or 1024,
-            "messages": chat_msgs,
-        }
-        if system_parts:
-            payload["system"] = "\n".join(system_parts)
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-        }
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages", headers=headers, json=payload
+            data = await _post_json(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                payload=payload,
+                timeout_s=timeout_s,
+                http_client=http_client,
             )
-            resp.raise_for_status()
-            data = resp.json()
-        text_blocks = [
-            b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"
-        ]
-        usage = data.get("usage", {})
-        return ProviderResponse(
-            content="".join(text_blocks),
-            model=data.get("model", model),
-            provider="anthropic",
-            prompt_tokens=int(usage.get("input_tokens", 0)),
-            completion_tokens=int(usage.get("output_tokens", 0)),
-        )
+            usage = data.get("usage", {})  # type: ignore[union-attr]
+            return ProviderResponse(
+                content=data["choices"][0]["message"]["content"],  # type: ignore[index]
+                model=str(data.get("model", model)),  # type: ignore[union-attr]
+                provider=provider_key,
+                prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                completion_tokens=int(usage.get("completion_tokens", 0)),
+            )
 
-    if provider_key == "gemini":
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if not api_key:
-            raise UpstreamProviderError("Missing GEMINI_API_KEY")
-        contents = [
-            {
-                "role": "model" if m.get("role") == "assistant" else "user",
-                "parts": [{"text": m["content"]}],
+        if provider_key == "anthropic":
+            api_key = os.getenv("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                raise UpstreamProviderError("Missing ANTHROPIC_API_KEY")
+            system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+            chat_msgs = [m for m in messages if m.get("role") != "system"]
+            payload = {
+                "model": model,
+                "max_tokens": max_tokens or 1024,
+                "messages": chat_msgs,
             }
-            for m in messages
-            if m.get("role") != "system"
-        ]
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{model}:generateContent?key={api_key}"
-        )
-        async with httpx.AsyncClient(timeout=timeout_s) as client:
-            resp = await client.post(url, json={"contents": contents})
-            resp.raise_for_status()
-            data = resp.json()
-        text = data["candidates"][0]["content"]["parts"][0]["text"]
-        return ProviderResponse(content=text, model=model, provider="gemini")
+            if system_parts:
+                payload["system"] = "\n".join(system_parts)
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
+            data = await _post_json(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                payload=payload,
+                timeout_s=timeout_s,
+                http_client=http_client,
+            )
+            text_blocks = [
+                b.get("text", "")
+                for b in data.get("content", [])  # type: ignore[union-attr]
+                if b.get("type") == "text"
+            ]
+            usage = data.get("usage", {})  # type: ignore[union-attr]
+            return ProviderResponse(
+                content="".join(text_blocks),
+                model=str(data.get("model", model)),  # type: ignore[union-attr]
+                provider="anthropic",
+                prompt_tokens=int(usage.get("input_tokens", 0)),
+                completion_tokens=int(usage.get("output_tokens", 0)),
+            )
+
+        if provider_key == "gemini":
+            api_key = os.getenv("GEMINI_API_KEY", "")
+            if not api_key:
+                raise UpstreamProviderError("Missing GEMINI_API_KEY")
+            contents = [
+                {
+                    "role": "model" if m.get("role") == "assistant" else "user",
+                    "parts": [{"text": m["content"]}],
+                }
+                for m in messages
+                if m.get("role") != "system"
+            ]
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent?key={api_key}"
+            )
+            data = await _post_json(
+                url,
+                payload={"contents": contents},
+                timeout_s=timeout_s,
+                http_client=http_client,
+            )
+            text = data["candidates"][0]["content"]["parts"][0]["text"]  # type: ignore[index]
+            return ProviderResponse(content=text, model=model, provider="gemini")
+    except httpx.HTTPError as exc:
+        raise UpstreamProviderError(
+            f"Upstream '{provider_key}' request failed: {exc}"
+        ) from exc
 
     raise UpstreamProviderError(f"Unsupported upstream provider: '{provider}'")
