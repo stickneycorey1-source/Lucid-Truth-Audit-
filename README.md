@@ -22,48 +22,41 @@ Lucid-Truth-Audit (LTA) sits in front of any LLM provider (OpenAI, Anthropic, Go
 
 Point your existing OpenAI SDK client (or LangChain, LlamaIndex, Vercel AI SDK) at LTA—no application rewrite required:
 
-```python
-from openai import OpenAI
+    from openai import OpenAI
 
-client = OpenAI(
-    base_url="[https://lucid-truth-audit.onrender.com/v1](https://lucid-truth-audit.onrender.com/v1)",
-    api_key="YOUR_TENANT_LTA_KEY",
-)
+    client = OpenAI(
+        base_url="https://lucid-truth-audit.onrender.com/v1",
+        api_key="YOUR_TENANT_LTA_KEY",
+    )
 
-response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "Summarize today's dispatch manifest."}],
-)
-```
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": "Summarize today's dispatch manifest."}],
+    )
 
 ---
 
 ## Defense-in-Depth Architecture (v2.1 Hardened)
 
-```text
-Incoming Request ─► [1. Fail-Closed Multi-Tenant Auth + SHA-256 Hashed Keys + RBAC]
-                      ├─► Missing / Invalid Key ──────────────────► 403 Forbidden
-                      ├─► Non-Admin Policy/Provider Override ─────► 403 Forbidden
-                      ├─► Sliding-Window Rate Limit (Mem/Redis) ──► 429 Too Many Requests
-                      ▼
-                    [2. Strict Input Schema: Pydantic v2 (extra="forbid")]
-                      ├─► Unexpected Fields / Invalid Shapes ─────► 422 Unprocessable Entity
-                      ▼
-                    [3. Canonicalization & Multi-Turn Policy Engine (YAML Packs)]
-                      ├─► NFKC / Zero-Width / Cyrillic / Whitespace / URL / Base64 / Hex
-                      ├─► Split Multi-Turn & System-Role Spoofing ─► 400 Bad Request
-                      ├─► Floods (Char / Word / High-Entropy) ────► 400 Bad Request
-                      ├─► Industry Rules (FMCSA / HIPAA / PCI) ───► 422 Unprocessable Entity
-                      ├─► PII / PHI / PCI Redaction (Luhn PAN, SSN, MRN, CDL, Secrets)
-                      ▼
-                    [4. Provider-Agnostic Upstream Router]
-                      ├─► OpenAI | Anthropic | Gemini | Azure | Ollama | vLLM | Mock
-                      ├─► Upstream HTTP Failure ──────────────────► 502 Bad Gateway
-                      ▼
-                    [5. Output Boundary Validator + Tamper-Evident Audit Ledger]
-                      ├─► System Prompt / SSN / Secret Leak ──────► 500 Blocked
-                      └─► Clean Response ─────────────────────────► 200 OK + SHA-256 Hash-Chained Record
-```
+    Incoming Request
+      ├─► [1. Fail-Closed Multi-Tenant Auth + SHA-256 Keys + RBAC]
+      │     ├─► Missing / Invalid Key ────────────────► 403 Forbidden
+      │     ├─► Non-Admin Policy/Provider Override ───► 403 Forbidden
+      │     └─► Sliding-Window Rate Limit (Mem/Redis) ► 429 Too Many Requests
+      ├─► [2. Strict Input Schema: Pydantic v2 (extra="forbid")]
+      │     └─► Unexpected Fields / Invalid Shapes ───► 422 Unprocessable
+      ├─► [3. Canonicalization & Multi-Turn Policy Engine (YAML Packs)]
+      │     ├─► NFKC / Zero-Width / Cyrillic / Whitespace / URL / Base64 / Hex
+      │     ├─► Split Multi-Turn & Role Spoofing ─────► 400 Bad Request
+      │     ├─► Floods (Char / Word / High-Entropy) ──► 400 Bad Request
+      │     ├─► Industry Rules (FMCSA / HIPAA / PCI) ─► 422 Unprocessable
+      │     └─► PII / PHI / PCI Redaction (Luhn PAN, SSN, MRN, CDL, Secrets)
+      ├─► [4. Provider-Agnostic Upstream Router]
+      │     ├─► OpenAI | Anthropic | Gemini | Azure | Ollama | vLLM | Mock
+      │     └─► Upstream HTTP Failure ────────────────► 502 Bad Gateway
+      └─► [5. Output Boundary Validator + Tamper-Evident Audit Ledger]
+            ├─► System Prompt / SSN / Secret Leak ────► 500 Blocked
+            └─► Clean Response ───────────────────────► 200 OK + SHA-256 Chain
 
 ---
 
@@ -105,14 +98,10 @@ Onboard any vertical without changing Python code:
 
 Run LTA inside your own VPC backed by PostgreSQL (with transactional `pg_advisory_xact_lock` hash-chain serialization) and Redis distributed rate limiting:
 
-```bash
-cp .env.example .env
-# Edit .env with tenant API keys, Postgres credentials, and upstream provider keys
-docker compose up -d --build
-```
+    cp .env.example .env
+    # Edit .env with tenant API keys, Postgres credentials, and upstream provider keys
+    docker compose up -d --build
 
 Run tests locally:
 
-```bash
-python -m pytest -v
-```
+    python -m pytest -v
