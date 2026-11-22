@@ -92,6 +92,7 @@ def test_blocks_obfuscated_bol_injections(bol_attack):
     p["bill_of_lading_notes"] = bol_attack
     res = client.post("/api/v1/guard/logistics", json=p, headers={"X-API-Key": "p2-secret-key"})
     assert res.status_code == 422
+    assert "SECURITY_VIOLATION" in res.text
 
 
 @pytest.mark.parametrize(
@@ -118,12 +119,18 @@ def test_blocks_60_7_and_70_8_cycle_overflow_and_validates_permits():
     p = valid_dispatch()
     p["cycle_type"] = "60_7"
     p["cycle_hours_used_before_shift"] = 55.0
+    p["planned_drive_hours"] = 7.0
     p["on_duty_window_hours"] = 8.0
-    assert client.post("/api/v1/guard/logistics", json=p, headers={"X-API-Key": "p2-secret-key"}).status_code == 422
+    res_cycle = client.post("/api/v1/guard/logistics", json=p, headers={"X-API-Key": "p2-secret-key"})
+    assert res_cycle.status_code == 422
+    assert "HOS_CYCLE_VIOLATION" in res_cycle.text
 
     p2 = valid_dispatch()
     p2["gross_vehicle_weight_lbs"] = 92000
-    assert client.post("/api/v1/guard/logistics", json=p2, headers={"X-API-Key": "p2-secret-key"}).status_code == 422
+    res_wt = client.post("/api/v1/guard/logistics", json=p2, headers={"X-API-Key": "p2-secret-key"})
+    assert res_wt.status_code == 422
+    assert "WEIGHT_VIOLATION" in res_wt.text
+
     p2["oversize_permit_id"] = "MN-OSW-202604"
     ok = client.post("/api/v1/guard/logistics", json=p2, headers={"X-API-Key": "p2-secret-key"})
     assert ok.status_code == 200
