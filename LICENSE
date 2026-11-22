@@ -1,40 +1,41 @@
-Lucid-Truth-Audit (LTA) Enterprise Gateway — Proprietary Software License
-Copyright (c) 2026 Corey Allen Stickney. All Rights Reserved.
 
-1. Ownership & Intellectual Property
-This software, including all source code, YAML policy packs, cryptographic audit
-ledger schemas, compliance test suites, documentation, and associated assets
-(collectively, the "Software"), is the sole and exclusive proprietary property of
-Corey Allen Stickney ("Licensor"). No ownership rights are transferred under this
-License.
+---
 
-2. Limited Evaluation Right
-Subject to strict compliance with this License, you are granted a revocable,
-non-exclusive, non-transferable, non-sublicensable license solely to view and
-locally evaluate the Software in a non-production environment for the purpose of
-assessing a commercial license or authorized pilot agreement with Licensor.
+## 2. Licensing Strategy: Which `LICENSE` Fits Lucid Tech Best?
 
-3. Strict Restrictions
-Without a separate written Commercial License Agreement signed by Licensor, you
-may NOT:
-  (a) deploy, operate, or use the Software in any production, commercial,
-      revenue-generating, or client-facing environment;
-  (b) copy, redistribute, publish, sell, lease, sublicense, or make the Software
-      available as a hosted service, SaaS, API proxy, or managed offering;
-  (c) modify, adapt, translate, or create derivative works based on the Software
-      for external distribution or competitive commercial use; or
-  (d) remove, obscure, or alter any copyright, attribution, or proprietary
-      notices contained in the Software.
+Because your React storefront references an **MIT reference gateway** while you are simultaneously launching commercial B2B SaaS tiers ($599–$6,400/month), there are three legitimate licensing approaches—each with distinct trade-offs[span_13](start_span)[span_13](end_span):
 
-4. Commercial Licensing & Enterprise Pilots
-Production deployments, multi-tenant enterprise installations, custom industry
-policy packs, and 30-day shadow pilot agreements require a written commercial
-license from Licensor.
-Licensing inquiries: stickneycorey1@gmail.com
+| Option | Legal Friction for Pilots | Patent & Brand Protection | Commercial Moat | When to Choose It |
+| :--- | :--- | :--- | :--- | :--- |
+| **Option A: MIT License (Recommended for Pilot Launch)** | Lowest (instant trust; zero counsel review needed) | Basic (no explicit patent grant) | Relies on managed hosting, custom rules, and SLAs | Best right now while closing your 5 Founding Partners (matches your storefront's MIT reference)[span_14](start_span)[span_14](end_span). |
+| **Option B: Apache License 2.0** | Very low (standard enterprise permissive license) | Strong (explicit patent grant + trademark exclusion) | Same open-core model, stronger legal hygiene | Best if larger carriers or TMS vendors ask for formal patent-indemnity clarity before adopting the open core. |
+| **Option C: Dual-License (MIT Core + Commercial Pro)** | Medium (requires clear boundary between repos/folders) | Strongest | High (proprietary multi-tenant billing, managed connectors, and compliance binders stay closed) | Best once you scale past 5+ paying clients and want a private `lucid-truth-enterprise` repo for paid add-ons. |
 
-5. Disclaimer of Warranty & Limitation of Liability
-THE SOFTWARE IS PROVIDED FOR EVALUATION "AS IS", WITHOUT WARRANTY OF ANY KIND,
-EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL LICENSOR
-BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR IN
-CONNECTION WITH THE SOFTWARE OR ITS EVALUATION.
+---
+
+## 3. Ready-to-Paste `LICENSE` (Option A: MIT License)
+
+Save this as `LICENSE` at the root of `Lucid-Truth-Audit`:
+
+```text
+MIT License
+
+Copyright (c) 2026 Corey Allen Stickney (Lucid Tech)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
