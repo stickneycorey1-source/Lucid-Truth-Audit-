@@ -1,44 +1,31 @@
-name: Lucid Truth Audit CI
+name: Lucid-Truth-Audit v2.0.1 Production CI
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   pull_request:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
-  audit:
+  verify-and-test:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest-html
-
-      - name: Run Guardrail & Compliance Suite
+      - name: Run Production Guardrail Suite
         env:
-          LUCID_AUDIT_API_KEY: valid-test-key
+          PYTHONPATH: "."
+          LUCID_TENANT_KEYS: "p2_pilot:p2-ci-secret-2026:2099-12-31,expired_demo:old-key-2020:2020-01-01"
         run: |
-          mkdir -p reports
-          python -m pytest --junitxml=reports/junit.xml
-
-      - name: Upload Compliance Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
+          python -m pytest -v --html=compliance_audit.html --self-contained-html --json-report --json-report-file=audit_ledger.json
+      - uses: actions/upload-artifact@v4
         with:
-          name: compliance-audit-reports
+          name: lucid-truth-audit-v2-0-1-compliance-artifacts
           path: |
-            reports/compliance_audit.html
-            reports/compliance_audit.md
-            reports/junit.xml
+            compliance_audit.html
+            audit_ledger.json
