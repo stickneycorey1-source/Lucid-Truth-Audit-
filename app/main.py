@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -81,7 +82,11 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             redacted_types=[],
             summary=reasons[:280],
         )
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    safe_errors = jsonable_encoder(
+        exc.errors(),
+        custom_encoder={BaseException: str},
+    )
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 
 # --- Vector 1, 2 & 3 Guard Logic ---
