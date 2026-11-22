@@ -2,10 +2,28 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from app.schemas.logistics_guard import router
+from app.security import rate_limiter
+from app.ledger import audit_ledger
 
 app = FastAPI()
 app.include_router(router)
 client = TestClient(app)
+
+TEST_API_KEY = "v4-logistics-test-key-2026"
+AUTH_HEADERS = {"X-API-Key": TEST_API_KEY}
+
+
+@pytest.fixture(autouse=True)
+def configure_v4_auth(monkeypatch, tmp_path):
+    monkeypatch.setenv("LUCID_TENANT_KEYS", f"v4_test:{TEST_API_KEY}:2099-12-31")
+    monkeypatch.setenv("LUCID_AUDIT_API_KEY", TEST_API_KEY)
+    prev_db_path = getattr(audit_ledger, "db_path", None)
+    if hasattr(audit_ledger, "reconfigure"):
+        audit_ledger.reconfigure(str(tmp_path / "v4_test_ledger.db"))
+    rate_limiter.reset()
+    yield
+    if prev_db_path and hasattr(audit_ledger, "reconfigure"):
+        audit_ledger.reconfigure(prev_db_path)
 
 
 def base_valid_dispatch() -> dict:
@@ -30,7 +48,7 @@ def base_valid_dispatch() -> dict:
 
 def test_valid_fmcsa_compliant_dispatch():
     payload = base_valid_dispatch()
-    response = client.post("/api/v1/guard/logistics", json=payload)
+    response = client.post("/api/v1/guard/logistics", json=payload, headers=AUTH_HEADERS)
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "APPROVED"
@@ -51,7 +69,7 @@ def test_valid_fmcsa_compliant_dispatch():
 def test_blocks_fmcsa_hos_and_weight_violations(field_override):
     payload = base_valid_dispatch()
     payload.update(field_override)
-    response = client.post("/api/v1/guard/logistics", json=payload)
+    response = client.post("/api/v1/guard/logistics", json=payload, headers=AUTH_HEADERS)
     assert response.status_code == 422
 
 
@@ -66,7 +84,7 @@ def test_blocks_fmcsa_hos_and_weight_violations(field_override):
 def test_blocks_indirect_prompt_injection_in_bol(malicious_bol):
     payload = base_valid_dispatch()
     payload["bill_of_lading_notes"] = malicious_bol
-    response = client.post("/api/v1/guard/logistics", json=payload)
+    response = client.post("/api/v1/guard/logistics", json=payload, headers=AUTH_HEADERS)
     assert response.status_code == 422
     assert "SECURITY_VIOLATION" in response.text
 
@@ -81,7 +99,7 @@ def test_blocks_unauthorized_waypoint_hijack():
             "is_authorized_facility": False,
         }
     )
-    response = client.post("/api/v1/guard/logistics", json=payload)
+    response = client.post("/api/v1/guard/logistics", json=payload, headers=AUTH_HEADERS)
     assert response.status_code == 422
     assert "SECURITY_VIOLATION" in response.text
 
@@ -92,7 +110,7 @@ def test_redacts_driver_and_manifest_pii():
         "Assigned to John Doe (CDL MN8492014, SSN 123-45-6789). "
         "Reach driver at 651-555-0199 or j.doe@carrier-example.com."
     )
-    response = client.post("/api/v1/guard/logistics", json=payload)
+    response = client.post("/api/v1/guard/logistics", json=payload, headers=AUTH_HEADERS)
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "APPROVED_WITH_REDACTIONS"
