@@ -1,0 +1,78 @@
+name: Fix Corrupted Filenames
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove corrupted filenames from Git index without checkout
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global user.name "Lucid Tech Repair Bot"
+          git config --global user.email "actions@github.com"
+
+          git clone --no-checkout --branch main --single-branch \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" repo
+          cd repo
+
+          # Load HEAD into the index in memory (never writes illegal filenames to disk)
+          git read-tree HEAD
+
+          # Strip any path containing newlines, diff headers, >200-byte segments, or the notice filename
+          git ls-files -z | python3 - <<'PY'
+          import sys, subprocess
+
+          raw_entries = sys.stdin.buffer.read().split(b"\0")
+          to_remove = []
+          for raw in raw_entries:
+              if not raw:
+                  continue
+              path = raw.decode("utf-8", "replace")
+              parts = path.split("/")
+              too_long = any(len(part.encode("utf-8")) > 200 for part in parts)
+              has_newline = ("\n" in path or "\r" in path)
+              if has_newline or too_long or "diff --git" in path or path.startswith("Commercial & Trademark Notice"):
+                  print(f"REMOVING ({len(raw)} bytes): {path[:90]!r}")
+                  to_remove.append(raw)
+
+          if to_remove:
+              payload = b"\0".join(to_remove) + b"\0"
+              subprocess.run(
+                  ["git", "update-index", "--force-remove", "-z", "--stdin"],
+                  input=payload,
+                  check=True,
+              )
+              print(f"Removed {len(to_remove)} corrupted path(s).")
+          else:
+              print("No corrupted paths found.")
+          PY
+
+          # Rename trailing-dot test file if present so Pytest discovers it
+          if git ls-files --error-unmatch "tests/test_evidence_chain.py." >/dev/null 2>&1; then
+            BLOB_SHA=$(git rev-parse ":tests/test_evidence_chain.py.")
+            git update-index --force-remove -- "tests/test_evidence_chain.py."
+            git update-index --add --cacheinfo 100644 "$BLOB_SHA" "tests/test_evidence_chain.py"
+            echo "RENAMED: tests/test_evidence_chain.py. -> tests/test_evidence_chain.py"
+          fi
+
+          # Pure plumbing commit (never touches working tree)
+          OLD_TREE=$(git rev-parse HEAD^{tree})
+          NEW_TREE=$(git write-tree)
+          if [ "$NEW_TREE" = "$OLD_TREE" ]; then
+            echo "Tree unchanged; nothing to push."
+            exit 0
+          fi
+
+          NEW_COMMIT=$(git commit-tree "$NEW_TREE" -p HEAD -m "Fix: remove corrupted overlong filenames breaking git checkout")
+          git update-ref refs/heads/main "$NEW_COMMIT"
+          git push origin main
+
+          # Final verification: standard checkout MUST now succeed cleanly
+          git checkout -f main
+          echo "CHECKOUT VERIFIED CLEAN!"
