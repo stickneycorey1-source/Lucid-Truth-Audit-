@@ -316,3 +316,86 @@ async def export_tenant_ledger_csv(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="lucid_audit_{tenant.tenant_id}.csv"'},
     )
+
+diff --git a/app/main.py b/app/main.py
+--- a/app/main.py
++++ b/app/main.py
+@@
+ from app.ledger import audit_ledger
++from app.evidence_chain import EvidenceChainStore, DuplicateEvidenceError
+@@
+ app.include_router(logistics_router)
++
++
++class EvidenceCreate(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++    claim: str = Field(..., min_length=1, max_length=4000)
++    source_uri: Optional[str] = Field(default=None, max_length=2000)
++    source_sha256: str = Field(
++        ..., pattern=r"^[a-fA-F0-9]{64}$"
++    )
++    evidence_summary: str = Field(..., min_length=1, max_length=4000)
++    evidence_type: str = Field(..., min_length=1, max_length=100)
++    rule_id: str = Field(..., min_length=1, max_length=150)
++    rule_version: str = Field(..., min_length=1, max_length=50)
++    test_results: List[dict[str, Any]] = Field(
++        default_factory=list, max_length=100
++    )
++    counterexamples: List[dict[str, Any]] = Field(
++        default_factory=list, max_length=100
++    )
++
++
++def get_evidence_store():
++    # Resolve the current ledger path at request time so isolated
++    # test databases and production configuration stay aligned.
++    return EvidenceChainStore(audit_ledger.db_path)
++
++
++@app.post("/api/v1/evidence", status_code=201)
++async def create_evidence(
++    payload: EvidenceCreate,
++    tenant: TenantContext = Depends(authenticate_and_limit),
++):
++    store = get_evidence_store()
++    try:
++        record = store.add(tenant.tenant_id, payload.model_dump())
++    except DuplicateEvidenceError:
++        raise HTTPException(
++            status_code=409,
++            detail="Duplicate evidence record.",
++        )
++
++    audit_ledger.record_event(
++        tenant_id=tenant.tenant_id,
++        endpoint="/api/v1/evidence",
++        reference_id=record["evidence_id"],
++        decision="EVIDENCE_RECORDED",
++        http_status=201,
++        summary="Evidence metadata and source hash recorded.",
++    )
++    return record
++
++
++@app.get("/api/v1/evidence")
++async def list_evidence(
++    limit: int = 100,
++    tenant: TenantContext = Depends(authenticate_and_limit),
++):
++    return {
++        "tenant_id": tenant.tenant_id,
++        "records": get_evidence_store().list_records(
++            tenant.tenant_id, limit
++        ),
++    }
++
++
++@app.get("/api/v1/evidence/verify")
++async def verify_evidence(
++    tenant: TenantContext = Depends(authenticate_and_limit),
++):
++    return {
++        "tenant_id": tenant.tenant_id,
++        **get_evidence_store().verify(tenant.tenant_id),
++    }
