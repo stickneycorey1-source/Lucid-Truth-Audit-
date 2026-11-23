@@ -28,6 +28,7 @@ except ImportError:
         return tenant, status.HTTP_200_OK, ""
 
 from app.ledger import audit_ledger
+from app.evidence_chain import EvidenceChainStore, DuplicateEvidenceError
 from app.schemas.logistics_guard import router as logistics_router
 
 logger = logging.getLogger("lucid_truth_audit")
@@ -35,7 +36,7 @@ logger = logging.getLogger("lucid_truth_audit")
 app = FastAPI(
     title="Lucid-Truth-Audit",
     version="2.0.2",
-    description="Production Deterministic AI Security, PII Redaction, and FMCSA Fleet Compliance Engine",
+    description="Production Deterministic AI Security, PII Redaction, Evidence Chain, and FMCSA Fleet Compliance Engine",
 )
 
 # Configurable CORS allowlist for external portals (e.g., Vercel React frontend)
@@ -218,6 +219,38 @@ class GuardResponse(BaseModel):
     ledger_entry_hash: str
 
 
+# --- Evidence Chain Schemas ---
+
+class EvidenceTestResult(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    test: str = Field(..., min_length=1, max_length=200)
+    passed: bool
+
+
+class EvidenceCounterexample(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    description: str = Field(..., min_length=1, max_length=2000)
+    resolved: bool
+
+
+class EvidenceRecordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    claim: str = Field(..., min_length=1, max_length=4000)
+    source_uri: str = Field(..., min_length=1, max_length=2000)
+    source_sha256: str = Field(..., pattern=r"^[0-9a-fA-F]{64}$")
+    evidence_summary: str = Field(..., min_length=1, max_length=4000)
+    evidence_type: str = Field(..., min_length=1, max_length=100)
+    rule_id: str = Field(..., min_length=1, max_length=128)
+    rule_version: str = Field(..., min_length=1, max_length=64)
+    test_results: List[EvidenceTestResult] = Field(default_factory=list)
+    counterexamples: List[EvidenceCounterexample] = Field(default_factory=list)
+
+
+def _get_evidence_store() -> EvidenceChainStore:
+    """Dynamically binds to audit_ledger.db_path so tests and Render /var/data stay in sync."""
+    return EvidenceChainStore(audit_ledger.db_path)
+
+
 # --- Portal, Health & Core Endpoints ---
 
 @app.get("/", include_in_schema=False)
@@ -240,8 +273,6 @@ async def health_check():
 
 
 def _inspect_text_or_block(text: str, tenant: TenantContext, context_label: str) -> None:
-    # Check semantic/obfuscated attacks BEFORE high-entropy flood so pure Base64 injections
-    # are accurately logged as prompt_injection rather than generic gibberish.
     if is_social_engineering_pii_pretext(text):
         logger.warning("security.input_blocked category=social_engineering_pii tenant=%s", tenant.tenant_id)
         audit_ledger.record_event(tenant.tenant_id, "/api/v1/guard", context_label, "BLOCKED", 422, [], "Social engineering PII pretext")
@@ -299,6 +330,47 @@ async def guard_endpoint(
         ledger_entry_hash=row["entry_hash"],
     )
 
+
+# --- Tenant-Isolated Evidence Chain Endpoints ---
+
+@app.post("/api/v1/evidence", status_code=status.HTTP_201_CREATED)
+async def create_evidence_record(
+    payload: EvidenceRecordRequest,
+    tenant: TenantContext = Depends(authenticate_and_limit),
+):
+    store = _get_evidence_store()
+    try:
+        record = store.add(tenant.tenant_id, payload.model_dump())
+    except DuplicateEvidenceError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    return record
+
+
+@app.get("/api/v1/evidence")
+async def list_evidence_records(
+    limit: int = 100,
+    tenant: TenantContext = Depends(authenticate_and_limit),
+):
+    store = _get_evidence_store()
+    return {
+        "tenant_id": tenant.tenant_id,
+        "records": store.list_records(tenant.tenant_id, limit=limit),
+    }
+
+
+@app.get("/api/v1/evidence/verify")
+async def verify_evidence_chain(
+    tenant: TenantContext = Depends(authenticate_and_limit),
+):
+    store = _get_evidence_store()
+    result = store.verify(tenant.tenant_id)
+    return {
+        "tenant_id": tenant.tenant_id,
+        **result,
+    }
+
+
+# --- Audit Ledger Endpoints ---
 
 @app.get("/api/v1/audit/ledger")
 async def get_tenant_ledger(
