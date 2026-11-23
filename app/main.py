@@ -1,330 +1,183 @@
-import os
-import csv
-import io
-import math
 import re
-import logging
-from pathlib import Path
-from typing import Any, List, Optional, Literal
-
-from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.encoders import jsonable_encoder
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Optional, Literal
+from fastapi import APIRouter, Depends, status
+from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
 
 from app.normalizer import normalize_text_for_inspection
-from app.security import TenantContext, authenticate_and_limit, verify_key_and_limit_raw
+from app.security import TenantContext, authenticate_and_limit
 from app.ledger import audit_ledger
-from app.schemas.logistics_guard import router as logistics_router
 
-logger = logging.getLogger("lucid_truth_audit")
+router = APIRouter(prefix="/api/v1/guard", tags=["Logistics Guard"])
 
-app = FastAPI(
-    title="Lucid-Truth-Audit",
-    version="2.0.2",
-    description="Production Deterministic AI Security, PII Redaction, and FMCSA Fleet Compliance Engine",
-)
-
-# Configurable CORS allowlist for external portals (e.g., Vercel React frontend)
-_cors_raw = os.getenv("LUCID_CORS_ORIGINS", "").strip()
-_cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
-if _cors_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=_cors_origins,
-        allow_credentials=False,
-        allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "X-API-Key"],
-    )
-
-app.include_router(logistics_router)
-
-
-# --- Security Headers Middleware ---
-
-@app.middleware("http")
-async def add_security_headers(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-
-    # Allow Swagger UI / ReDoc CDN assets only on documentation endpoints; keep strict CSP everywhere else
-    if request.url.path in ("/docs", "/redoc", "/docs/oauth2-redirect"):
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-            "img-src 'self' data: https://fastapi.tiangolo.com; "
-            "connect-src 'self'; frame-ancestors 'none';"
-        )
-    else:
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
-        )
-    return response
-
-
-# --- Global Validation Error Handler (Auth + Rate-Limit Gated, Pydantic v2 JSON-Safe) ---
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    if request.url.path.startswith("/api/v1/guard"):
-        tenant, auth_code, auth_detail = verify_key_and_limit_raw(request.headers.get("X-API-Key"))
-        if tenant is None:
-            return JSONResponse(status_code=auth_code, content={"detail": auth_detail})
-
-        reasons = "; ".join(err.get("msg", "validation_error") for err in exc.errors())
-        ref_id = "BLOCKED_SCHEMA"
-        if isinstance(exc.body, dict) and isinstance(exc.body.get("dispatch_id"), str):
-            ref_id = exc.body["dispatch_id"][:64]
-        audit_ledger.record_event(
-            tenant_id=tenant.tenant_id,
-            endpoint=request.url.path,
-            reference_id=ref_id,
-            decision="BLOCKED",
-            http_status=422,
-            redacted_types=[],
-            summary=reasons[:280],
-        )
-
-    safe_errors = jsonable_encoder(
-        exc.errors(),
-        custom_encoder={BaseException: str},
-    )
-    return JSONResponse(status_code=422, content={"detail": safe_errors})
-
-
-# --- Vector 1, 2 & 3 Guard Logic ---
-
-INJECTION_SIGNATURES = [
-    r"(?i)(?:ignore|disregard|forget|override)\s+(?:\w+\s+){0,4}(?:previous|prior|above|system|all)\s+(?:\w+\s+){0,2}(?:instructions?|rules?|directives?|policies|policy|constraints?)",
-    r"(?i)(?:reveal|print|dump|leak)\s+(?:\w+\s+){0,3}(?:system\s+prompt|hidden\s+(?:rules?|policy|instructions?)|developer\s+message)",
-    r"(?i)bypass\s+(?:privacy\s+policy|safety|guardrails?|audit)",
-    r"(?i)export\s+all\s+customer\s+records",
-    r"(?i)(?:^|\n)\s*(?:system|developer)\s*:\s*.*(?:unrestricted|override|comply|ignore|reveal|disable)",
-    r"(?i)\b(?:jailbreak|developer\s+mode|do\s+anything\s+now)\b",
+INJECTION_PATTERNS = [
+    r"(?i)(?:ignore|disregard|forget|drop)\s+(?:\w+\s+){0,4}(?:previous|prior|safety|hos|all)\s+(?:\w+\s+){0,2}(?:instructions?|rules?|constraints?|directives?|limits?|checks?|hos|policies|policy)",
+    r"(?i)(?:ignore|disregard|bypass|skip|avoid|disable)\s+(?:the\s+)?(?:weigh\s+station|inspection|geofence|hos(?:\s+limits?)?|safety(?:\s+checks?)?|audit|logging)",
+    r"(?i)reroute\s+(?:shipment|cargo|truck|load)\s+to\s+unverified",
+    r"(?i)override\s+(?:system|dispatch|route|safety|hos)\s+(?:policy|rules?|constraints?|limits?)",
+    r"(?i)(?:system\s+prompt|developer\s+mode|jailbreak|(?:^|\n)\s*(?:system|developer)\s*:)",
 ]
 
-SOCIAL_ENGINEERING_PII_SIGNATURES = [
-    r"(?i)(system\s+administrator|security\s+auditor|compliance\s+officer).*?(export|list|reveal|bypass).*?(customer|ssn|user|privacy)",
-]
+PII_PATTERNS = {
+    "SSN": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    "CDL": re.compile(
+        r"\b(?:CDL|commercial\s+driver(?:'s)?\s+license|driver(?:'s)?\s+license|DL)"
+        r"(?:\s*(?:no\.?|num(?:ber)?|#|:|-))?\s*"
+        r"(?:[A-Z]{1,2}[-\s]?\d(?:[\d-]{5,13}\d)|\d{7,12}|\d{2,4}-\d{2,4}-\d{3,4})\b",
+        re.IGNORECASE,
+    ),
+    "PHONE": re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+    "EMAIL": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
+}
 
-SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
-SECRET_RE = re.compile(r"\b(?:sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})\b")
-PAN_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
-CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
-
-
-def sanitize_csv_cell(value: Any) -> str:
-    """Neutralizes spreadsheet formula injection (DDE/CSV injection) on export."""
-    text = str(value)
-    if text and text[0] in CSV_FORMULA_PREFIXES:
-        return "'" + text
-    return text
+OVERSIZE_PERMIT_RE = re.compile(r"^[A-Z]{2}-OSW-\d{4,10}$")
 
 
-def contains_injection(text: str) -> bool:
-    expanded = normalize_text_for_inspection(text)
-    return any(re.search(sig, expanded) for sig in INJECTION_SIGNATURES)
+def redact_pii(text: str) -> tuple[str, List[str]]:
+    """Scrubs sensitive driver/manifest PII without corrupting operational PO/BOL/Trailer IDs."""
+    detected: List[str] = []
+    cleaned = text
+    for pii_type, pattern in PII_PATTERNS.items():
+        if pattern.search(cleaned):
+            detected.append(pii_type)
+            cleaned = pattern.sub(f"[REDACTED_{pii_type}]", cleaned)
+    return cleaned, detected
 
 
-def is_social_engineering_pii_pretext(text: str) -> bool:
-    expanded = normalize_text_for_inspection(text)
-    return any(re.search(sig, expanded) for sig in SOCIAL_ENGINEERING_PII_SIGNATURES)
+def detect_logistics_injection(text: str) -> bool:
+    normalized = normalize_text_for_inspection(text)
+    return any(re.search(pattern, normalized) for pattern in INJECTION_PATTERNS)
 
 
-def luhn_valid(digits: str) -> bool:
-    nums = [int(d) for d in digits]
-    checksum = 0
-    parity = len(nums) % 2
-    for i, n in enumerate(nums):
-        if i % 2 == parity:
-            n *= 2
-            if n > 9:
-                n -= 9
-        checksum += n
-    return checksum % 10 == 0
-
-
-def redact_sensitive_entities(text: str) -> tuple[str, List[str]]:
-    redacted_types: List[str] = []
-    out = text
-    if SSN_RE.search(out):
-        redacted_types.append("SSN")
-        out = SSN_RE.sub("[REDACTED_SSN]", out)
-    if SECRET_RE.search(out):
-        redacted_types.append("API_SECRET")
-        out = SECRET_RE.sub("[REDACTED_SECRET]", out)
-
-    def _pan_sub(match: re.Match) -> str:
-        raw = match.group(0)
-        digits = re.sub(r"\D", "", raw)
-        if 13 <= len(digits) <= 19 and luhn_valid(digits):
-            if "PAN" not in redacted_types:
-                redacted_types.append("PAN")
-            return "[REDACTED_PAN]"
-        return raw
-
-    out = PAN_RE.sub(_pan_sub, out)
-    return out, redacted_types
-
-
-def is_anomalous_flood(text: str) -> Optional[str]:
-    if re.search(r"(.)\1{19,}", text) or re.search(r"\b(\w+)(\s+\1){9,}\b", text, re.IGNORECASE):
-        return "anomaly_repeating_chars"
-    if len(text) >= 40:
-        freq = {ch: text.count(ch) / len(text) for ch in set(text)}
-        entropy = -sum(p * math.log2(p) for p in freq.values())
-        if entropy > 4.7 and " " not in text.strip():
-            return "anomaly_high_entropy"
-    return None
-
-
-class MessageTurn(BaseModel):
+class Waypoint(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    role: Literal["user", "assistant"]
-    content: str = Field(..., min_length=1, max_length=4000)
+    label: str = Field(..., min_length=1, max_length=100)
+    latitude: float = Field(..., ge=-90.0, le=90.0)
+    longitude: float = Field(..., ge=-180.0, le=180.0)
+    is_authorized_facility: bool = Field(default=True)
+
+    @field_validator("is_authorized_facility")
+    @classmethod
+    def verify_facility_authorization(cls, v: bool) -> bool:
+        if not v:
+            raise ValueError("SECURITY_VIOLATION: Unverified or unauthorized waypoint blocked.")
+        return v
 
 
-class GuardRequest(BaseModel):
+class DispatchRoutePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    prompt: str = Field(..., min_length=1, max_length=4000)
-    messages: Optional[List[MessageTurn]] = None
+
+    dispatch_id: str = Field(..., min_length=4, max_length=64)
+    driver_alias: str = Field(..., min_length=2, max_length=50)
+    vehicle_vin_hash: str = Field(..., min_length=8, max_length=64)
+
+    # FMCSA 49 CFR § 395.3 Single-Shift Property-Carrying Bounds
+    planned_drive_hours: float = Field(..., gt=0.0, le=11.0, description="Max 11.0 hrs driving")
+    on_duty_window_hours: float = Field(..., gt=0.0, le=14.0, description="Max 14.0 hr consecutive duty window")
+    continuous_drive_before_break_hours: float = Field(..., gt=0.0, le=8.0, description="Max 8.0 hrs before 30-min break")
+    rest_break_minutes: int = Field(..., ge=30, description="Minimum 30-minute rest break")
+
+    # FMCSA 60/7 or 70/8 Multi-Day Cycle Accounting
+    cycle_type: Literal["60_7", "70_8"] = "70_8"
+    cycle_hours_used_before_shift: float = Field(default=0.0, ge=0.0, le=70.0)
+
+    # Cargo, Weight & Optional Oversize Permit
+    gross_vehicle_weight_lbs: int = Field(..., gt=0, le=160000, description="80,000 lb cap unless valid oversize permit supplied")
+    oversize_permit_id: Optional[str] = Field(default=None, description="Format: e.g. MN-OSW-202604")
+    hazmat_class: Optional[Literal["NONE", "1", "2", "3", "4", "5", "6", "7", "8", "9"]] = "NONE"
+
+    # Unstructured Text (Normalized & Scanned for Prompt Injection + PII)
+    bill_of_lading_notes: str = Field(default="", max_length=2000)
+    dispatcher_summary: str = Field(default="", max_length=2000)
+
+    waypoints: List[Waypoint] = Field(..., min_length=2, max_length=25)
+
+    @field_validator("bill_of_lading_notes", "dispatcher_summary")
+    @classmethod
+    def scan_indirect_prompt_injection(cls, value: str) -> str:
+        if detect_logistics_injection(value):
+            raise ValueError(
+                "SECURITY_VIOLATION: Indirect prompt injection or obfuscated safety override detected."
+            )
+        return value
+
+    @model_validator(mode="after")
+    def validate_fmcsa_and_weight_rules(self) -> "DispatchRoutePayload":
+        if self.planned_drive_hours > self.on_duty_window_hours:
+            raise ValueError("HOS_VIOLATION: Planned drive hours cannot exceed total on-duty window.")
+
+        if self.continuous_drive_before_break_hours > self.planned_drive_hours:
+            raise ValueError(
+                "HOS_VIOLATION: Continuous drive before break cannot exceed total planned drive hours."
+            )
+
+        cycle_cap = 60.0 if self.cycle_type == "60_7" else 70.0
+        if self.cycle_hours_used_before_shift > cycle_cap:
+            raise ValueError(
+                f"HOS_CYCLE_VIOLATION: Prior cycle hours ({self.cycle_hours_used_before_shift}) exceed {cycle_cap:.0f}-hour FMCSA {self.cycle_type} cap."
+            )
+        if self.cycle_hours_used_before_shift + self.on_duty_window_hours > cycle_cap:
+            raise ValueError(
+                f"HOS_CYCLE_VIOLATION: Shift exceeds {cycle_cap:.0f}-hour FMCSA {self.cycle_type} duty cycle."
+            )
+
+        if self.gross_vehicle_weight_lbs > 80000:
+            permit = (self.oversize_permit_id or "").strip().upper()
+            if not permit or not OVERSIZE_PERMIT_RE.match(permit):
+                raise ValueError(
+                    "WEIGHT_VIOLATION: Gross weight exceeds 80,000 lbs federal cap without a valid oversize_permit_id (XX-OSW-NNNN)."
+                )
+            self.oversize_permit_id = permit
+        return self
 
 
-class GuardResponse(BaseModel):
-    status: Literal["ALLOWED", "REDACTED"]
+class DispatchGuardResponse(BaseModel):
+    status: Literal["APPROVED", "APPROVED_WITH_REDACTIONS"]
     tenant_id: str
-    sanitized_prompt: str
-    sanitized_messages: Optional[List[MessageTurn]] = None
-    redacted_entities: List[str]
-    framework_version: str = "2.0.2"
+    dispatch_id: str
+    audit_passed: bool
+    pii_redacted_types: List[str]
+    sanitized_bol_notes: str
+    sanitized_dispatcher_summary: str
+    compliance_checks: dict
     ledger_entry_hash: str
 
 
-# --- Portal, Health & Core Endpoints ---
-
-@app.get("/", include_in_schema=False)
-async def serve_web_portal():
-    portal_path = Path(__file__).resolve().parent.parent / "static" / "index.html"
-    return FileResponse(portal_path)
-
-
-@app.get("/health")
-async def health_check():
-    stats = audit_ledger.get_summary_stats()
-    return {
-        "status": "healthy",
-        "framework": "Lucid-Truth-Audit",
-        "version": "2.0.2",
-        "ledger_records": stats["ledger_records"],
-        "latest_hash_prefix": stats["latest_hash_prefix"],
-        "vectors": ["vector1_injection", "vector2_pii", "vector3_resilience", "vector4_logistics"],
-    }
-
-
-def _inspect_text_or_block(text: str, tenant: TenantContext, context_label: str) -> None:
-    # Check semantic/obfuscated attacks BEFORE high-entropy flood so pure Base64 injections
-    # are accurately logged as prompt_injection rather than generic gibberish.
-    if is_social_engineering_pii_pretext(text):
-        logger.warning("security.input_blocked category=social_engineering_pii tenant=%s", tenant.tenant_id)
-        audit_ledger.record_event(tenant.tenant_id, "/api/v1/guard", context_label, "BLOCKED", 422, [], "Social engineering PII pretext")
-        raise HTTPException(status_code=422, detail="Blocked social engineering PII request.")
-
-    if contains_injection(text):
-        category = "multi_turn_role_spoof" if context_label != "PROMPT" else "prompt_injection"
-        logger.warning("security.input_blocked category=%s tenant=%s", category, tenant.tenant_id)
-        audit_ledger.record_event(tenant.tenant_id, "/api/v1/guard", context_label, "BLOCKED", 422, [], f"Blocked: {category}")
-        raise HTTPException(status_code=422, detail=f"Blocked {category.replace('_', ' ')} attempt.")
-
-    anomaly = is_anomalous_flood(text)
-    if anomaly:
-        logger.warning("security.input_blocked category=%s tenant=%s", anomaly, tenant.tenant_id)
-        audit_ledger.record_event(tenant.tenant_id, "/api/v1/guard", context_label, "BLOCKED", 422, [], f"Blocked: {anomaly}")
-        raise HTTPException(status_code=422, detail=f"Blocked anomalous input: {anomaly}")
-
-
-@app.post("/api/v1/guard", response_model=GuardResponse)
-async def guard_endpoint(
-    payload: GuardRequest,
+@router.post("/logistics", response_model=DispatchGuardResponse, status_code=status.HTTP_200_OK)
+async def evaluate_dispatch_route(
+    payload: DispatchRoutePayload,
     tenant: TenantContext = Depends(authenticate_and_limit),
-):
-    _inspect_text_or_block(payload.prompt, tenant, "PROMPT")
-    clean_prompt, all_entities = redact_sensitive_entities(payload.prompt)
+) -> DispatchGuardResponse:
+    clean_bol, bol_pii = redact_pii(payload.bill_of_lading_notes)
+    clean_summary, summary_pii = redact_pii(payload.dispatcher_summary)
 
-    sanitized_turns: Optional[List[MessageTurn]] = None
-    if payload.messages:
-        sanitized_turns = []
-        for idx, turn in enumerate(payload.messages):
-            _inspect_text_or_block(turn.content, tenant, f"TURN_{idx}")
-            clean_turn, turn_entities = redact_sensitive_entities(turn.content)
-            for ent in turn_entities:
-                if ent not in all_entities:
-                    all_entities.append(ent)
-            sanitized_turns.append(MessageTurn(role=turn.role, content=clean_turn))
+    all_redacted = sorted(list(set(bol_pii + summary_pii)))
+    guard_status = "APPROVED_WITH_REDACTIONS" if all_redacted else "APPROVED"
 
-    all_entities = sorted(set(all_entities))
-    decision = "REDACTED" if all_entities else "ALLOWED"
-    row = audit_ledger.record_event(
-        tenant.tenant_id,
-        "/api/v1/guard",
-        "PROMPT",
-        decision,
-        200,
-        all_entities,
-        f"Prompt processed; redacted={all_entities or 'none'}",
-    )
-    return GuardResponse(
-        status=decision,
+    ledger_row = audit_ledger.record_event(
         tenant_id=tenant.tenant_id,
-        sanitized_prompt=clean_prompt,
-        sanitized_messages=sanitized_turns,
-        redacted_entities=all_entities,
-        ledger_entry_hash=row["entry_hash"],
+        endpoint="/api/v1/guard/logistics",
+        reference_id=payload.dispatch_id,
+        decision=guard_status,
+        http_status=200,
+        redacted_types=all_redacted,
+        summary=f"FMCSA/weight/BOL checks passed; redacted={all_redacted or 'none'}",
     )
 
-
-@app.get("/api/v1/audit/ledger")
-async def get_tenant_ledger(
-    limit: int = 100,
-    tenant: TenantContext = Depends(authenticate_and_limit),
-):
-    return {
-        "tenant_id": tenant.tenant_id,
-        "chain_integrity": audit_ledger.verify_chain(),
-        "events": audit_ledger.list_events(tenant.tenant_id, limit=limit),
-    }
-
-
-@app.get("/api/v1/audit/export.csv")
-async def export_tenant_ledger_csv(
-    tenant: TenantContext = Depends(authenticate_and_limit),
-):
-    events = audit_ledger.list_events(tenant.tenant_id, limit=500)
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["id", "timestamp_utc", "tenant_id", "endpoint", "reference_id", "decision", "http_status", "redacted_types", "summary", "entry_hash"])
-    for ev in events:
-        writer.writerow([
-            ev["id"],
-            sanitize_csv_cell(ev["timestamp_utc"]),
-            sanitize_csv_cell(ev["tenant_id"]),
-            sanitize_csv_cell(ev["endpoint"]),
-            sanitize_csv_cell(ev["reference_id"]),
-            sanitize_csv_cell(ev["decision"]),
-            ev["http_status"],
-            sanitize_csv_cell(";".join(ev["redacted_types"])),
-            sanitize_csv_cell(ev["summary"]),
-            sanitize_csv_cell(ev["entry_hash"]),
-        ])
-    buf.seek(0)
-    return StreamingResponse(
-        iter([buf.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="lucid_audit_{tenant.tenant_id}.csv"'},
+    return DispatchGuardResponse(
+        status=guard_status,
+        tenant_id=tenant.tenant_id,
+        dispatch_id=payload.dispatch_id,
+        audit_passed=True,
+        pii_redacted_types=all_redacted,
+        sanitized_bol_notes=clean_bol,
+        sanitized_dispatcher_summary=clean_summary,
+        compliance_checks={
+            "fmcsa_shift_hos_compliant": True,
+            "fmcsa_cycle_hos_compliant": True,
+            "geofence_waypoints_verified": True,
+            "prompt_injection_clean": True,
+            "weight_limit_compliant": True,
+            "oversize_permit_verified": bool(payload.oversize_permit_id) if payload.gross_vehicle_weight_lbs > 80000 else False,
+        },
+        ledger_entry_hash=ledger_row["entry_hash"],
     )
