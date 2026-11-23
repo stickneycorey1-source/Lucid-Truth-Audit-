@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, ConfigDict
 
 from app.normalizer import normalize_text_for_inspection
-from app.security import TenantContext, authenticate_and_limit, resolve_valid_tenant
+from app.security import TenantContext, authenticate_and_limit, verify_key_and_limit_raw
 from app.ledger import audit_ledger
 from app.schemas.logistics_guard import router as logistics_router
 
@@ -23,7 +23,7 @@ logger = logging.getLogger("lucid_truth_audit")
 
 app = FastAPI(
     title="Lucid-Truth-Audit",
-    version="2.0.1",
+    version="2.0.2",
     description="Production Deterministic AI Security, PII Redaction, and FMCSA Fleet Compliance Engine",
 )
 
@@ -51,24 +51,33 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
-    )
+
+    # Allow Swagger UI / ReDoc CDN assets only on documentation endpoints; keep strict CSP everywhere else
+    if request.url.path in ("/docs", "/redoc", "/docs/oauth2-redirect"):
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "img-src 'self' data: https://fastapi.tiangolo.com; "
+            "connect-src 'self'; frame-ancestors 'none';"
+        )
+    else:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
+        )
     return response
 
 
-# --- Global Validation Error Handler (Authenticated-Only 422 Tenant Ledger Logging) ---
+# --- Global Validation Error Handler (Auth + Rate-Limit Gated, Pydantic v2 JSON-Safe) ---
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     if request.url.path.startswith("/api/v1/guard"):
-        tenant = resolve_valid_tenant(request.headers.get("X-API-Key"))
+        tenant, auth_code, auth_detail = verify_key_and_limit_raw(request.headers.get("X-API-Key"))
         if tenant is None:
-            return JSONResponse(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                content={"detail": "Invalid, expired, or missing API key."},
-            )
+            return JSONResponse(status_code=auth_code, content={"detail": auth_detail})
+
         reasons = "; ".join(err.get("msg", "validation_error") for err in exc.errors())
         ref_id = "BLOCKED_SCHEMA"
         if isinstance(exc.body, dict) and isinstance(exc.body.get("dispatch_id"), str):
@@ -82,6 +91,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             redacted_types=[],
             summary=reasons[:280],
         )
+
     safe_errors = jsonable_encoder(
         exc.errors(),
         custom_encoder={BaseException: str},
@@ -193,7 +203,7 @@ class GuardResponse(BaseModel):
     sanitized_prompt: str
     sanitized_messages: Optional[List[MessageTurn]] = None
     redacted_entities: List[str]
-    framework_version: str = "2.0.1"
+    framework_version: str = "2.0.2"
     ledger_entry_hash: str
 
 
@@ -211,7 +221,7 @@ async def health_check():
     return {
         "status": "healthy",
         "framework": "Lucid-Truth-Audit",
-        "version": "2.0.1",
+        "version": "2.0.2",
         "ledger_records": stats["ledger_records"],
         "latest_hash_prefix": stats["latest_hash_prefix"],
         "vectors": ["vector1_injection", "vector2_pii", "vector3_resilience", "vector4_logistics"],
@@ -219,12 +229,8 @@ async def health_check():
 
 
 def _inspect_text_or_block(text: str, tenant: TenantContext, context_label: str) -> None:
-    anomaly = is_anomalous_flood(text)
-    if anomaly:
-        logger.warning("security.input_blocked category=%s tenant=%s", anomaly, tenant.tenant_id)
-        audit_ledger.record_event(tenant.tenant_id, "/api/v1/guard", context_label, "BLOCKED", 422, [], f"Blocked: {anomaly}")
-        raise HTTPException(status_code=422, detail=f"Blocked anomalous input: {anomaly}")
-
+    # Check semantic/obfuscated attacks BEFORE high-entropy flood so pure Base64 injections
+    # are accurately logged as prompt_injection rather than generic gibberish.
     if is_social_engineering_pii_pretext(text):
         logger.warning("security.input_blocked category=social_engineering_pii tenant=%s", tenant.tenant_id)
         audit_ledger.record_event(tenant.tenant_id, "/api/v1/guard", context_label, "BLOCKED", 422, [], "Social engineering PII pretext")
@@ -235,6 +241,12 @@ def _inspect_text_or_block(text: str, tenant: TenantContext, context_label: str)
         logger.warning("security.input_blocked category=%s tenant=%s", category, tenant.tenant_id)
         audit_ledger.record_event(tenant.tenant_id, "/api/v1/guard", context_label, "BLOCKED", 422, [], f"Blocked: {category}")
         raise HTTPException(status_code=422, detail=f"Blocked {category.replace('_', ' ')} attempt.")
+
+    anomaly = is_anomalous_flood(text)
+    if anomaly:
+        logger.warning("security.input_blocked category=%s tenant=%s", anomaly, tenant.tenant_id)
+        audit_ledger.record_event(tenant.tenant_id, "/api/v1/guard", context_label, "BLOCKED", 422, [], f"Blocked: {anomaly}")
+        raise HTTPException(status_code=422, detail=f"Blocked anomalous input: {anomaly}")
 
 
 @app.post("/api/v1/guard", response_model=GuardResponse)
@@ -316,86 +328,3 @@ async def export_tenant_ledger_csv(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="lucid_audit_{tenant.tenant_id}.csv"'},
     )
-
-diff --git a/app/main.py b/app/main.py
---- a/app/main.py
-+++ b/app/main.py
-@@
- from app.ledger import audit_ledger
-+from app.evidence_chain import EvidenceChainStore, DuplicateEvidenceError
-@@
- app.include_router(logistics_router)
-+
-+
-+class EvidenceCreate(BaseModel):
-+    model_config = ConfigDict(extra="forbid")
-+
-+    claim: str = Field(..., min_length=1, max_length=4000)
-+    source_uri: Optional[str] = Field(default=None, max_length=2000)
-+    source_sha256: str = Field(
-+        ..., pattern=r"^[a-fA-F0-9]{64}$"
-+    )
-+    evidence_summary: str = Field(..., min_length=1, max_length=4000)
-+    evidence_type: str = Field(..., min_length=1, max_length=100)
-+    rule_id: str = Field(..., min_length=1, max_length=150)
-+    rule_version: str = Field(..., min_length=1, max_length=50)
-+    test_results: List[dict[str, Any]] = Field(
-+        default_factory=list, max_length=100
-+    )
-+    counterexamples: List[dict[str, Any]] = Field(
-+        default_factory=list, max_length=100
-+    )
-+
-+
-+def get_evidence_store():
-+    # Resolve the current ledger path at request time so isolated
-+    # test databases and production configuration stay aligned.
-+    return EvidenceChainStore(audit_ledger.db_path)
-+
-+
-+@app.post("/api/v1/evidence", status_code=201)
-+async def create_evidence(
-+    payload: EvidenceCreate,
-+    tenant: TenantContext = Depends(authenticate_and_limit),
-+):
-+    store = get_evidence_store()
-+    try:
-+        record = store.add(tenant.tenant_id, payload.model_dump())
-+    except DuplicateEvidenceError:
-+        raise HTTPException(
-+            status_code=409,
-+            detail="Duplicate evidence record.",
-+        )
-+
-+    audit_ledger.record_event(
-+        tenant_id=tenant.tenant_id,
-+        endpoint="/api/v1/evidence",
-+        reference_id=record["evidence_id"],
-+        decision="EVIDENCE_RECORDED",
-+        http_status=201,
-+        summary="Evidence metadata and source hash recorded.",
-+    )
-+    return record
-+
-+
-+@app.get("/api/v1/evidence")
-+async def list_evidence(
-+    limit: int = 100,
-+    tenant: TenantContext = Depends(authenticate_and_limit),
-+):
-+    return {
-+        "tenant_id": tenant.tenant_id,
-+        "records": get_evidence_store().list_records(
-+            tenant.tenant_id, limit
-+        ),
-+    }
-+
-+
-+@app.get("/api/v1/evidence/verify")
-+async def verify_evidence(
-+    tenant: TenantContext = Depends(authenticate_and_limit),
-+):
-+    return {
-+        "tenant_id": tenant.tenant_id,
-+        **get_evidence_store().verify(tenant.tenant_id),
-+    }
