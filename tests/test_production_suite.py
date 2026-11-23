@@ -164,5 +164,5 @@ def test_csv_formula_injection_escaped_and_health_fast():
     assert sanitize_csv_cell("DISP-2026-9001") == "DISP-2026-9001"
     h = client.get("/health")
     assert h.status_code == 200
-    assert h.json()["version"] == "2.0.2"
+    assert h.json()["version"] == "2.0.3"
     assert "ledger_records" in h.json()
