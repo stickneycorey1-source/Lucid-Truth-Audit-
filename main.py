@@ -7,7 +7,7 @@ import unicodedata
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 logger = logging.getLogger("lucid_truth_audit")
 
@@ -108,8 +108,22 @@ def validate_output_boundary(output_text: str) -> str:
 
 
 class AuditRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    prompt: str = Field(..., min_length=1, max_length=4000)
+    model_config = ConfigDict(extra="allow")
+    prompt: Optional[str] = Field(default=None, max_length=4000)
+    text: Optional[str] = Field(default=None, max_length=4000)
+    input: Optional[str] = Field(default=None, max_length=4000)
+    message: Optional[str] = Field(default=None, max_length=4000)
+
+    @model_validator(mode="after")
+    def _ensure_non_empty_content(self):
+        val = self.prompt or self.text or self.input or self.message
+        if not val or not val.strip():
+            raise ValueError("Request must include non-empty prompt/text/input/message.")
+        return self
+
+    @property
+    def resolved_text(self) -> str:
+        return (self.prompt or self.text or self.input or self.message or "").strip()
 
 
 class AuditResponse(BaseModel):
@@ -127,13 +141,14 @@ async def guard_prompt(
     payload: AuditRequest,
     _: str = Depends(verify_api_key),
 ):
-    if contains_prompt_injection(payload.prompt):
+    content = payload.resolved_text
+    if contains_prompt_injection(content):
         logger.warning("security.input_blocked category=prompt_injection")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Prompt injection detected and blocked.",
         )
 
-    raw_output = simulate_llm_execution(payload.prompt)
+    raw_output = simulate_llm_execution(content)
     safe_output = validate_output_boundary(raw_output)
     return AuditResponse(status="ALLOWED", output=safe_output)
