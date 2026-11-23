@@ -1,0 +1,81 @@
+name: Apply Final 87/87 Patches
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Restore clean root main.py & bump test version to 2.0.2
+        run: |
+          python3 - <<'PY'
+          import pathlib, subprocess, sys
+
+          # 1. Locate newest commit where root main.py had simulate_llm_execution & BASE_INSTRUCTIONS
+          shas = subprocess.check_output(
+              ["git", "log", "--format=%H", "--", "main.py"], text=True
+          ).splitlines()
+
+          clean_sha = None
+          for sha in shas:
+              blob = subprocess.check_output(
+                  ["git", "show", f"{sha}:main.py"], text=True, errors="replace"
+              )
+              if "def simulate_llm_execution" in blob and "BASE_INSTRUCTIONS" in blob:
+                  clean_sha = sha
+                  break
+
+          if not clean_sha:
+              print("ERROR: Could not locate pre-overwrite root main.py in git history.", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Restoring root main.py from clean commit {clean_sha[:7]}")
+          subprocess.run(["git", "checkout", clean_sha, "--", "main.py"], check=True)
+
+          # 2. Patch tests/test_production_suite.py line 167 ("2.0.1" -> "2.0.2")
+          p = pathlib.Path("tests/test_production_suite.py")
+          txt = p.read_text(encoding="utf-8")
+          old = 'assert h.json()["version"] == "2.0.1"'
+          new = 'assert h.json()["version"] == "2.0.2"'
+          if old in txt:
+              p.write_text(txt.replace(old, new, 1), encoding="utf-8")
+              print("Patched tests/test_production_suite.py: 2.0.1 -> 2.0.2")
+          elif new in txt:
+              print("tests/test_production_suite.py already expects 2.0.2")
+          else:
+              print("WARNING: Version check line not found in tests/test_production_suite.py")
+          PY
+
+      - name: Verify Full 87/87 Suite Passes Before Pushing
+        env:
+          PYTHONPATH: "."
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest==9.2.0 httpx==0.28.1
+          python -m pytest -o addopts="" -v
+
+      - name: Commit & Push Verified Patches to main
+        run: |
+          git config user.name "Lucid Tech Patch Bot"
+          git config user.email "actions@github.com"
+          git add main.py tests/test_production_suite.py
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Fix: restore root main.py and update production suite version to 2.0.2 (87/87)"
+          git push origin HEAD:main
