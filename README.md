@@ -2,6 +2,7 @@
 
 [![Lucid Truth Audit CI](https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/workflows/ci.yml/badge.svg)](https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions)
 ![Pytest Suite](https://img.shields.io/badge/Pytest_Suite-62%2F62_Passing-10b981?style=flat&logo=pytest&logoColor=white)
+![Compliance Suite](https://img.shields.io/badge/Compliance_Suite-55%2F55_in_654ms-10b981?style=flat)
 ![Local Latency](https://img.shields.io/badge/Local_p95_Latency-3.67_ms-0ea5e9?style=flat)
 ![Local Throughput](https://img.shields.io/badge/Local_Throughput-295.4_req%2Fs-06b6d4?style=flat)
 ![Live API](https://img.shields.io/badge/Live_Endpoint-Render_v2.3-38bdf8?style=flat&logo=fastapi&logoColor=white)
@@ -22,10 +23,10 @@ Lucid-Truth-Audit (LTA) / Stickney-Audit-Mandate is a pre-emptive FastAPI and Py
 
 ## Verified Metrics & Benchmark Snapshot
 
-* **Automated CI Test Suite:** **62/62 passing** in GitHub Actions across `v2.1`–`v2.3` hardening cycles (including **18/18** enterprise integration tests plus legacy compliance suites; **55/55** passing in **654 ms** with zero failures or errors on Nov 20, 2026).
-* **Local Gateway Benchmark:** **3.67 ms p95 latency** and **295.4 req/s** throughput across **200 requests** *(local benchmark scope; hosted Render/network/upstream LLM round-trips vary)*
-* **Live Deployment Verification:** `GET /healthz` returns `200 OK` with **4** active policy packs; `GET /readyz` returns `200 OK` with `database_ok: true`; unauthenticated `/metrics` and `/v1/chat/completions` fail closed with `403 Forbidden`.
-* **Policy Packs (`v2.3`):** `general_enterprise`, `logistics_fmcsa`, `healthcare_hipaa`, and `finance_pci`.
+* **Current CI Suite:** **62/62 passing** in GitHub Actions across `v2.1`–`v2.3` hardening cycles (including **18/18** enterprise integration tests).
+* **55-Test Compliance & Red-Team Suite:** **55/55 passing in 654 ms** (0 failed, 0 errors, 0 skipped on Nov 20, 2026), composed of `17 + 8 + 8 + 22 = 55` tests across core gateway, PII/social engineering, resilience/multi-turn, and FMCSA/logistics dispatch[span_1](start_span)[span_1](end_span).
+* **Local Gateway Benchmark:** **3.67 ms p95 latency** and **295.4 req/s** across **200 requests** *(local benchmark scope; hosted Render/network/upstream LLM round-trips vary)*.
+* **Live Deployment Verification:** `GET /healthz` returns `200 OK` with **4** active policy packs (`general_enterprise`, `logistics_fmcsa`, `healthcare_hipaa`, `finance_pci`); `GET /readyz` returns `200 OK` with `database_ok: true`; unauthenticated `/metrics` and `/v1/chat/completions` fail closed with `403 Forbidden`.
 
 ---
 
