@@ -36,7 +36,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: lucid-truth-audit-compliance-artifacts
+          name: lucid-truth-audit-v2-0-2-compliance-artifacts
           path: |
             reports/compliance_audit.html
             reports/audit_ledger.json
