@@ -101,7 +101,7 @@ def validate_output_boundary(output_text: str) -> str:
     if BASE_INSTRUCTIONS in output_text or "SYSTEM_POLICY_V1" in output_text:
         logger.error("security.output_rejected category=instruction_leak")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Output blocked by security boundary.",
         )
     return output_text
@@ -128,7 +128,6 @@ async def guard_prompt(
     _: str = Depends(verify_api_key),
 ):
     if contains_prompt_injection(payload.prompt):
-        # Never log raw user prompt text
         logger.warning("security.input_blocked category=prompt_injection")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
