@@ -1,0 +1,220 @@
+
+diff --git a/app/evidence_chain.py b/app/evidence_chain.py
+new file mode 100644
+--- /dev/null
++++ b/app/evidence_chain.py
+@@
++import hashlib
++import json
++import os
++import sqlite3
++import uuid
++from datetime import datetime, timezone
++from typing import Any, Dict, List
++
++
++class DuplicateEvidenceError(Exception):
++    pass
++
++
++class EvidenceChainStore:
++    """Tenant-isolated, persistent, hash-chained evidence records."""
++
++    def __init__(self, db_path: str | None = None):
++        self.db_path = db_path or os.getenv(
++            "LUCID_LEDGER_DB_PATH", "lucid_audit_ledger.db"
++        )
++        self._init_db()
++
++    def _connect(self):
++        parent = os.path.dirname(os.path.abspath(self.db_path))
++        os.makedirs(parent, exist_ok=True)
++        conn = sqlite3.connect(
++            self.db_path, timeout=15.0, isolation_level=None
++        )
++        conn.row_factory = sqlite3.Row
++        conn.execute("PRAGMA journal_mode=WAL")
++        conn.execute("PRAGMA synchronous=FULL")
++        return conn
++
++    def _init_db(self):
++        with self._connect() as conn:
++            conn.execute("""
++                CREATE TABLE IF NOT EXISTS evidence_records (
++                    id INTEGER PRIMARY KEY AUTOINCREMENT,
++                    evidence_id TEXT NOT NULL,
++                    tenant_id TEXT NOT NULL,
++                    created_at TEXT NOT NULL,
++                    payload_json TEXT NOT NULL,
++                    prev_hash TEXT NOT NULL,
++                    entry_hash TEXT NOT NULL,
++                    UNIQUE(tenant_id, evidence_id)
++                )
++            """)
++            conn.execute("""
++                CREATE INDEX IF NOT EXISTS idx_evidence_tenant
++                ON evidence_records(tenant_id, id DESC)
++            """)
++
++    @staticmethod
++    def _canonical_json(value: Dict[str, Any]) -> str:
++        return json.dumps(
++            value,
++            sort_keys=True,
++            ensure_ascii=False,
++            separators=(",", ":"),
++        )
++
++    @classmethod
++    def _hash_record(
++        cls,
++        evidence_id: str,
++        tenant_id: str,
++        created_at: str,
++        payload_json: str,
++        prev_hash: str,
++    ) -> str:
++        envelope = {
++            "schema_version": 1,
++            "evidence_id": evidence_id,
++            "tenant_id": tenant_id,
++            "created_at": created_at,
++            "payload_json": payload_json,
++            "prev_hash": prev_hash,
++        }
++        encoded = cls._canonical_json(envelope).encode("utf-8")
++        return hashlib.sha256(encoded).hexdigest()
++
++    def add(
++        self, tenant_id: str, payload: Dict[str, Any]
++    ) -> Dict[str, Any]:
++        evidence_id = str(uuid.uuid4())
++        created_at = datetime.now(timezone.utc).isoformat()
++        payload_json = self._canonical_json(payload)
++
++        # BEGIN IMMEDIATE serializes competing writers before reading
++        # the previous tenant hash and inserting the next record.
++        with self._connect() as conn:
++            try:
++                conn.execute("BEGIN IMMEDIATE")
++                previous = conn.execute(
++                    """
++                    SELECT entry_hash FROM evidence_records
++                    WHERE tenant_id = ?
++                    ORDER BY id DESC LIMIT 1
++                    """,
++                    (tenant_id,),
++                ).fetchone()
++                prev_hash = previous["entry_hash"] if previous else "GENESIS"
++                entry_hash = self._hash_record(
++                    evidence_id,
++                    tenant_id,
++                    created_at,
++                    payload_json,
++                    prev_hash,
++                )
++                cur = conn.execute(
++                    """
++                    INSERT INTO evidence_records (
++                        evidence_id, tenant_id, created_at,
++                        payload_json, prev_hash, entry_hash
++                    ) VALUES (?, ?, ?, ?, ?, ?)
++                    """,
++                    (
++                        evidence_id,
++                        tenant_id,
++                        created_at,
++                        payload_json,
++                        prev_hash,
++                        entry_hash,
++                    ),
++                )
++                conn.execute("COMMIT")
++            except sqlite3.IntegrityError as exc:
++                conn.execute("ROLLBACK")
++                raise DuplicateEvidenceError(str(exc)) from exc
++            except Exception:
++                conn.execute("ROLLBACK")
++                raise
++
++        return {
++            "record_number": cur.lastrowid,
++            "evidence_id": evidence_id,
++            "tenant_id": tenant_id,
++            "created_at": created_at,
++            "payload": payload,
++            "prev_hash": prev_hash,
++            "entry_hash": entry_hash,
++        }
++
++    def list_records(
++        self, tenant_id: str, limit: int = 100
++    ) -> List[Dict[str, Any]]:
++        limit = max(1, min(limit, 500))
++        with self._connect() as conn:
++            rows = conn.execute(
++                """
++                SELECT id, evidence_id, tenant_id, created_at,
++                       payload_json, prev_hash, entry_hash
++                FROM evidence_records
++                WHERE tenant_id = ?
++                ORDER BY id DESC LIMIT ?
++                """,
++                (tenant_id, limit),
++            ).fetchall()
++
++        return [
++            {
++                "record_number": row["id"],
++                "evidence_id": row["evidence_id"],
++                "tenant_id": row["tenant_id"],
++                "created_at": row["created_at"],
++                "payload": json.loads(row["payload_json"]),
++                "prev_hash": row["prev_hash"],
++                "entry_hash": row["entry_hash"],
++            }
++            for row in rows
++        ]
++
++    def verify(self, tenant_id: str) -> Dict[str, Any]:
++        with self._connect() as conn:
++            rows = conn.execute(
++                """
++                SELECT id, evidence_id, tenant_id, created_at,
++                       payload_json, prev_hash, entry_hash
++                FROM evidence_records
++                WHERE tenant_id = ?
++                ORDER BY id ASC
++                """,
++                (tenant_id,),
++            ).fetchall()
++
++        expected_prev = "GENESIS"
++        for row in rows:
++            if row["prev_hash"] != expected_prev:
++                return {
++                    "chain_valid": False,
++                    "checked_records": len(rows),
++                    "broken_at_record": row["id"],
++                }
++
++            actual = self._hash_record(
++                row["evidence_id"],
++                row["tenant_id"],
++                row["created_at"],
++                row["payload_json"],
++                row["prev_hash"],
++            )
++            if actual != row["entry_hash"]:
++                return {
++                    "chain_valid": False,
++                    "checked_records": len(rows),
++                    "broken_at_record": row["id"],
++                }
++            expected_prev = row["entry_hash"]
++
++        return {
++            "chain_valid": True,
++            "checked_records": len(rows),
++            "broken_at_record": None,
++        }
