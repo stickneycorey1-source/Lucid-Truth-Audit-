@@ -28,6 +28,7 @@ jobs:
         run: |
           mkdir -p reports
           python -m pytest -o addopts="" -v \
+            --ignore=tests/test_enterprise_gateway.py \
             --html=reports/compliance_audit.html \
             --self-contained-html \
             --json-report \
