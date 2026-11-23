@@ -12,7 +12,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from app.normalizer import normalize_text_for_inspection
 from app.security import TenantContext, authenticate_and_limit
@@ -204,11 +204,25 @@ class MessageTurn(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(..., min_length=1, max_length=4000)
 
+    @field_validator("content")
+    @classmethod
+    def content_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("content must not be blank or whitespace-only")
+        return v
+
 
 class GuardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     prompt: str = Field(..., min_length=1, max_length=4000)
     messages: Optional[List[MessageTurn]] = None
+
+    @field_validator("prompt")
+    @classmethod
+    def prompt_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("prompt must not be blank or whitespace-only")
+        return v
 
 
 class GuardResponse(BaseModel):
