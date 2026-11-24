@@ -9,6 +9,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY lta ./lta
+COPY policy_packs ./policy_packs
 COPY static ./static
 
 RUN adduser --disabled-password --gecos "" appuser \
@@ -18,4 +20,8 @@ RUN adduser --disabled-password --gecos "" appuser \
 USER appuser
 
 EXPOSE 10000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/health', timeout=3)" || exit 1
+
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "10000"]
