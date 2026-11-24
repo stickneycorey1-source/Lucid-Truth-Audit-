@@ -68,10 +68,12 @@ jobs:
           python -m pip install -r requirements.txt pip-audit
 
       - name: Audit Python dependencies
-        run: python -m pip_audit -r requirements.txt --disable-pip
+        run: python -m pip_audit -r requirements.txt
 
   container-validation:
     runs-on: ubuntu-latest
+    env:
+      POSTGRES_PASSWORD: ci-only-postgres-password
     steps:
       - uses: actions/checkout@v4
 
@@ -86,6 +88,7 @@ jobs:
           docker run --detach --name lta-validation \
             --publish 10080:10000 \
             --env LUCID_TENANT_KEYS="" \
+            --env POSTGRES_PASSWORD=ci-only-postgres-password \
             lucid-truth-audit:ci
 
           for attempt in $(seq 1 20); do
