@@ -2,12 +2,57 @@ name: Lucid-Truth-Audit Production CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   verify-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run complete test suite with coverage
+        env:
+          PYTHONPATH: "."
+        run: |
+          mkdir -p reports
+          python -m pytest -o addopts="" -v \
+            --cov=app --cov=lta \
+            --cov-report=term-missing \
+            --cov-report=html:reports/coverage \
+            --cov-fail-under=60 \
+            --html=reports/compliance_audit.html \
+            --self-contained-html \
+            --json-report \
+            --json-report-file=reports/audit_ledger.json
+
+      - name: Upload validation artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lucid-truth-audit-${{ matrix.python-version }}-validation
+          path: reports/
+
+  dependency-security:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -15,29 +60,43 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      - name: Install Runtime & Test Reporting Dependencies
+      - name: Install audit dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest==9.2.0 pytest-html==4.2.0 pytest-json-report==1.5.0 httpx==0.28.1
+          python -m pip install -r requirements.txt pip-audit
 
-      - name: Run Production Guardrail Suite
-        env:
-          PYTHONPATH: "."
+      - name: Audit Python dependencies
+        run: python -m pip_audit -r requirements.txt --disable-pip
+
+  container-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate Compose configuration
+        run: docker compose -f docker-compose.yml config --quiet
+
+      - name: Build application image
+        run: docker build --tag lucid-truth-audit:ci .
+
+      - name: Start application and verify health
         run: |
-          mkdir -p reports
-          python -m pytest -o addopts="" -v \
-            --ignore=tests/test_enterprise_gateway.py \
-            --html=reports/compliance_audit.html \
-            --self-contained-html \
-            --json-report \
-            --json-report-file=reports/audit_ledger.json
+          docker run --detach --name lta-validation \
+            --publish 10080:10000 \
+            --env LUCID_TENANT_KEYS="" \
+            lucid-truth-audit:ci
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: lucid-truth-audit-v2-0-2-compliance-artifacts
-          path: |
-            reports/compliance_audit.html
-            reports/audit_ledger.json
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent \
+              http://127.0.0.1:10080/health >/dev/null; then
+              docker stop lta-validation
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs lta-validation
+          docker stop lta-validation
+          exit 1
