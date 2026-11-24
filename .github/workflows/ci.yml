@@ -77,8 +77,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create temporary Compose environment
+      - name: Validate Compose configuration
         run: |
           trap 'rm -f .env' EXIT
           printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD" > .env
           docker compose -f docker-compose.yml config --quiet
+
+      - name: Build application image
+        run: docker build --tag lucid-truth-audit:ci .
+
+      - name: Start application and verify health
+        run: |
+          trap 'rm -f .env' EXIT
+          printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD" > .env
+
+          docker run --detach --name lta-validation \
+            --publish 10080:10000 \
+            --env LUCID_TENANT_KEYS="" \
+            lucid-truth-audit:ci
+
+          trap 'docker rm -f lta-validation >/dev/null 2>&1 || true; rm -f .env' EXIT
+
+          for attempt in $(seq 1 20); do
+            if curl --fail --silent \
+              http://127.0.0.1:10080/health >/dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs lta-validation
+          exit 1
