@@ -515,12 +515,23 @@ class PolicyEngine:
 
         sanitized, redactions = self._redact_pii(text, pack.pii_redaction)
         if any(item in pack.block_on_pii_output for item in redactions):
+            is_secret = any(item in {"API_SECRET", "BANK_ACCOUNT"} for item in redactions)
+            vector = (
+                "security.output_secret_exfiltration"
+                if is_secret
+                else "security.output_pii_exfiltration"
+            )
+            reason = (
+                "Upstream output contained restricted secret/credential"
+                if is_secret
+                else "Upstream output contained restricted PII"
+            )
             return EvaluationResult(
                 allowed=False,
                 action="BLOCK",
                 http_status=500,
-                vector="security.output_pii_leak",
-                reason="Upstream output contained restricted PII",
+                vector=vector,
+                reason=reason,
                 policy_pack=pack.name,
                 compliance_tags=pack.compliance_frameworks,
             )
