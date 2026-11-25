@@ -94,6 +94,7 @@ class GatewayRuntime:
     audit_ledger: AuditLedger
     rate_limiter: SlidingWindowRateLimiter
     metrics: MetricsRegistry
+    auth_fail_limiter: Optional[SlidingWindowRateLimiter] = None
 
 
 def _extract_api_key(
@@ -107,6 +108,17 @@ def _extract_api_key(
         if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
             return parts[1].strip()
     return None
+
+
+def _client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        first_hop = forwarded.split(",", 1)[0].strip()
+        if first_hop:
+            return first_hop
+    if request.client and request.client.host:
+        return request.client.host
+    return "unknown"
 
 
 def _resolve_request_id(raw_id: Optional[str]) -> str:
@@ -146,6 +158,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     policy_engine = PolicyEngine(cfg.policy_dir)
     audit_ledger = AuditLedger(cfg.audit_db_url)
     rate_limiter = SlidingWindowRateLimiter(redis_url=cfg.redis_url)
+    auth_fail_limiter = SlidingWindowRateLimiter(redis_url=cfg.redis_url)
+    auth_fail_limit_rpm = int(os.getenv("LTA_AUTH_FAIL_LIMIT_RPM", "20"))
     metrics = MetricsRegistry()
     runtime = GatewayRuntime(
         settings=cfg,
@@ -153,6 +167,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         audit_ledger=audit_ledger,
         rate_limiter=rate_limiter,
         metrics=metrics,
+        auth_fail_limiter=auth_fail_limiter,
     )
 
     disable_docs = os.getenv("LTA_DISABLE_DOCS", "false").lower().strip() in ("1", "true", "yes")
@@ -172,6 +187,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     fastapi_app.state.audit_ledger = audit_ledger
     fastapi_app.state.ledger = audit_ledger
     fastapi_app.state.rate_limiter = rate_limiter
+    fastapi_app.state.auth_fail_limiter = auth_fail_limiter
 
     @fastapi_app.middleware("http")
     async def _ingress_middleware(request: Request, call_next):
@@ -224,18 +240,30 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 status_code=500,
                 detail=_blocked_detail("auth.unconfigured", "No tenant credentials configured on gateway"),
             )
+
+        def _reject_auth(vector: str, message: str) -> None:
+            ip = _client_ip(request)
+            allowed_auth, rem_auth = auth_fail_limiter.check(f"auth_fail:{ip}", auth_fail_limit_rpm)
+            if not allowed_auth:
+                raise HTTPException(
+                    status_code=429,
+                    detail=_blocked_detail(
+                        "resilience.auth_rate_limit_exceeded",
+                        "Too many failed authentication attempts",
+                    ),
+                    headers={"X-RateLimit-Remaining": str(max(0, rem_auth))},
+                )
+            raise HTTPException(
+                status_code=403,
+                detail=_blocked_detail(vector, message),
+            )
+
         token = _extract_api_key(x_api_key, authorization)
         if not token:
-            raise HTTPException(
-                status_code=403,
-                detail=_blocked_detail("auth.missing_credentials", "Missing API credentials"),
-            )
+            _reject_auth("auth.missing_credentials", "Missing API credentials")
         tenant = cfg.authenticate(token)
         if tenant is None:
-            raise HTTPException(
-                status_code=403,
-                detail=_blocked_detail("auth.invalid_credentials", "Invalid API credentials"),
-            )
+            _reject_auth("auth.invalid_credentials", "Invalid API credentials")
 
         allowed, remaining = rate_limiter.check(tenant.tenant_id, tenant.rate_limit_rpm)
         request.state.rate_limit_remaining = remaining
@@ -530,63 +558,70 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "finish_reason": "stop",
                 }
             ],
-            "usage": {
-                "prompt_tokens": upstream_resp.prompt_tokens,
-                "completion_tokens": upstream_resp.completion_tokens,
-                "total_tokens": upstream_resp.prompt_tokens + upstream_resp.completion_tokens,
-            },
-            "content": final_content,
-            "action": final_action,
-            "redactions": all_redactions,
-            "policy_pack": policy_name,
-            "audit_entry_hash": audit_rec.entry_hash,
-            "audit_seq_id": audit_rec.seq_id,
-            "latency_ms": latency_ms,
             "lta_audit": lta_audit_meta,
         }
 
     @fastapi_app.get("/health")
     @fastapi_app.get("/healthz")
-    async def health() -> Dict[str, Any]:
+    async def healthz() -> Dict[str, Any]:
         return {
             "status": "ok",
-            "version": "2.4.0",
-            "policies_loaded": len(policy_engine.list_packs()),
+            "version": "2.4.1",
+            "policy_packs": policy_engine.list_packs(),
         }
 
     @fastapi_app.get("/readyz")
     async def readyz() -> JSONResponse:
         db_ok = audit_ledger.ping()
         policies_ok = len(policy_engine.list_packs()) > 0
-        if not db_ok or not policies_ok:
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "status": "not_ready",
-                    "db_ok": db_ok,
-                    "database_ok": db_ok,
-                    "policies_ok": policies_ok,
-                },
-            )
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "ready",
-                "db_ok": True,
-                "database_ok": True,
-                "policies_ok": True,
-                "tenants_configured": len(cfg.tenants),
-            },
-        )
+        tenants_configured = len(cfg.tenants) > 0
+        ready = db_ok and policies_ok and tenants_configured
+        payload = {
+            "status": "ready" if ready else "degraded",
+            "db_ok": db_ok,
+            "database_ok": db_ok,
+            "policies_ok": policies_ok,
+            "tenants_configured": tenants_configured,
+        }
+        return JSONResponse(status_code=200 if ready else 503, content=payload)
 
     @fastapi_app.get("/v1/policies")
-    async def list_policies(
-        tenant: TenantConfig = Depends(_authenticate_tenant),
-    ) -> Dict[str, Any]:
+    async def list_policies(tenant: TenantConfig = Depends(_authenticate_tenant)) -> Dict[str, Any]:
         return {
-            "active_tenant": tenant.tenant_id,
-            "active_policy": tenant.policy_pack,
-            "available_policies": policy_engine.list_packs(),
+            "tenant_id": tenant.tenant_id,
+            "active_policy_pack": tenant.policy_pack,
+            "available_policy_packs": policy_engine.list_packs(),
+        }
+
+    @fastapi_app.post("/api/v1/guard")
+    async def legacy_guard(
+        payload: LegacyGuardRequest,
+        request: Request,
+        response: Response,
+        tenant: TenantConfig = Depends(_authenticate_tenant),
+        x_lta_policy: Optional[str] = Header(default=None, alias="X-LTA-Policy"),
+        x_lta_provider: Optional[str] = Header(default=None, alias="X-LTA-Provider"),
+    ) -> Dict[str, Any]:
+        result = await _run_pipeline(
+            request=request,
+            response=response,
+            tenant=tenant,
+            endpoint="/api/v1/guard",
+            messages=[{"role": "user", "content": payload.model_input}],
+            model=tenant.default_model,
+            temperature=None,
+            max_tokens=None,
+            metadata=payload.metadata,
+            x_lta_policy=x_lta_policy,
+            x_lta_provider=x_lta_provider,
+        )
+        content = result["choices"][0]["message"]["content"]
+        audit_meta = result["lta_audit"]
+        return {
+            "status": "cleared",
+            "output": content,
+            "choices": result["choices"],
+            "lta_audit": audit_meta,
         }
 
     @fastapi_app.post("/v1/chat/completions")
@@ -598,13 +633,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         x_lta_policy: Optional[str] = Header(default=None, alias="X-LTA-Policy"),
         x_lta_provider: Optional[str] = Header(default=None, alias="X-LTA-Provider"),
     ) -> Dict[str, Any]:
-        msgs = [{"role": m.role, "content": m.content} for m in payload.messages]
         return await _run_pipeline(
             request=request,
             response=response,
             tenant=tenant,
             endpoint="/v1/chat/completions",
-            messages=msgs,
+            messages=[{"role": m.role, "content": m.content} for m in payload.messages],
             model=payload.model,
             temperature=payload.temperature,
             max_tokens=payload.max_tokens,
@@ -613,138 +647,44 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             x_lta_provider=x_lta_provider,
         )
 
-    @fastapi_app.post("/api/v1/guard")
-    async def legacy_guard(
-        payload: LegacyGuardRequest,
-        request: Request,
-        response: Response,
-        tenant: TenantConfig = Depends(_authenticate_tenant),
-        x_lta_policy: Optional[str] = Header(default=None, alias="X-LTA-Policy"),
-        x_lta_provider: Optional[str] = Header(default=None, alias="X-LTA-Provider"),
-    ) -> Dict[str, Any]:
-        msgs = [{"role": "user", "content": payload.model_input}]
-        result = await _run_pipeline(
-            request=request,
-            response=response,
-            tenant=tenant,
-            endpoint="/api/v1/guard",
-            messages=msgs,
-            model=tenant.upstream_model,
-            temperature=None,
-            max_tokens=None,
-            metadata=payload.metadata,
-            x_lta_policy=x_lta_policy,
-            x_lta_provider=x_lta_provider,
-        )
-        return {
-            "status": "success",
-            "allowed": True,
-            **result,
-        }
-
     @fastapi_app.post("/v1/shadow/ingest", status_code=status.HTTP_202_ACCEPTED)
     async def shadow_ingest(
         payload: ShadowIngestRequest,
-        request: Request,
         shadow_actor: str = Depends(_authenticate_shadow),
     ) -> Dict[str, Any]:
-        started = time.perf_counter()
-        policy_name = (
-            "general_enterprise"
-            if "general_enterprise" in policy_engine.packs
-            else (
-                next(iter(policy_engine.packs))
-                if policy_engine.packs
-                else "general_enterprise"
-            )
-        )
-
         input_sha256 = hashlib.sha256(payload.prompt.encode("utf-8")).hexdigest()
-        eval_res = policy_engine.evaluate_input(
-            text=payload.prompt,
-            policy_name=policy_name,
-            metadata=payload.metadata,
+        audit_id = f"shd-{uuid.uuid4().hex[:12]}"
+        logger.info(
+            "shadow_ingest_accepted actor=%s audit_id=%s input_sha256=%s request_id=%s",
+            shadow_actor,
+            audit_id,
+            input_sha256,
+            payload.request_id or "",
         )
-        latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
-        action = "BLOCK" if not eval_res.allowed else eval_res.action
-
-        # Zero-retention: pass only input_sha256 to ledger; never store or return raw prompt
-        audit_rec = audit_ledger.record(
-            tenant_id=shadow_actor,
-            endpoint="/v1/shadow/ingest",
-            policy_pack=policy_name,
-            provider="shadow",
-            action=action,
-            http_status=202,
-            vector=eval_res.vector,
-            redactions=eval_res.redactions,
-            raw_payload_for_digest=input_sha256,
-            latency_ms=latency_ms,
-        )
-        metrics.observe(
-            policy_pack=policy_name,
-            http_status=202,
-            latency_ms=latency_ms,
-            vector=eval_res.vector,
-        )
-
-        audit_id = f"shd-{audit_rec.seq_id}-{input_sha256[:12]}"
         return {
-            "status": "accepted",
-            "audit_id": audit_id,
-            "seq_id": audit_rec.seq_id,
-            "entry_hash": audit_rec.entry_hash,
-            "input_sha256": input_sha256,
-            "request_id": payload.request_id or getattr(request.state, "request_id", None),
-            "model_target": payload.model_target,
-            "policy_pack": policy_name,
+            "accepted": True,
             "zero_retention": True,
+            "audit_id": audit_id,
+            "input_sha256": input_sha256,
         }
 
     @fastapi_app.get("/v1/audit/verify")
-    async def audit_verify(
-        _: TenantConfig = Depends(_require_admin),
-    ) -> Dict[str, Any]:
-        valid, total_records, first_broken_seq_id = audit_ledger.verify_chain()
-        return {
-            "chain_valid": valid,
-            "total_records": total_records,
-            "first_broken_seq_id": first_broken_seq_id,
-        }
+    async def verify_audit(admin: TenantConfig = Depends(_require_admin)) -> Dict[str, Any]:
+        return audit_ledger.verify_chain()
 
     @fastapi_app.get("/v1/audit/export")
-    async def audit_export(
+    async def export_audit(
         tenant_id: Optional[str] = Query(default=None),
-        limit: int = Query(default=500, ge=1, le=5000),
-        _: TenantConfig = Depends(_require_admin),
+        admin: TenantConfig = Depends(_require_admin),
     ) -> PlainTextResponse:
-        ndjson = audit_ledger.export_jsonl(tenant_id=tenant_id, limit=limit)
-        return PlainTextResponse(
-            content=ndjson,
-            media_type="application/x-ndjson",
-        )
+        jsonl_text = audit_ledger.export_jsonl(tenant_id=tenant_id)
+        return PlainTextResponse(content=jsonl_text, media_type="application/x-ndjson")
 
     @fastapi_app.get("/metrics")
-    async def prometheus_metrics(
-        _: TenantConfig = Depends(_require_admin),
-    ) -> PlainTextResponse:
-        return PlainTextResponse(
-            content=metrics.render_prometheus(),
-            media_type="text/plain; version=0.0.4",
-        )
+    async def get_metrics(admin: TenantConfig = Depends(_require_admin)) -> PlainTextResponse:
+        return PlainTextResponse(content=metrics.render_prometheus(), media_type="text/plain; version=0.0.4")
 
     return fastapi_app
 
 
-def _init_module_app() -> Optional[FastAPI]:
-    """Initialize module-level ASGI app with explicit diagnostic logging."""
-    try:
-        return create_app()
-    except Exception:
-        logger.exception(
-            "Failed to initialize module-level FastAPI app in lta.app; check environment config"
-        )
-        raise
-
-
-app: Optional[FastAPI] = _init_module_app()
+app = create_app()
