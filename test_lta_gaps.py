@@ -218,8 +218,7 @@ def test_latency_profile_report_only():
 def test_audit_verify_reports_something_meaningful():
     r = requests.get(f"{BASE}/v1/audit/verify", headers={"x-api-key": KEY}, timeout=TIMEOUT)
     if r.status_code == 429:
-        retry_after = float(r.headers.get("Retry-After", "5"))
-        time.sleep(min(max(retry_after, 2.0), 15.0))
+        time.sleep(62)
         r = requests.get(f"{BASE}/v1/audit/verify", headers={"x-api-key": KEY}, timeout=TIMEOUT)
     assert r.status_code == 200
     body = r.json()
