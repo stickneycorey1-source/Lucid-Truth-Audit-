@@ -509,6 +509,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 content={
                     "status": "not_ready",
                     "db_ok": db_ok,
+                    "database_ok": db_ok,
                     "policies_ok": policies_ok,
                 },
             )
@@ -517,6 +518,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             content={
                 "status": "ready",
                 "db_ok": True,
+                "database_ok": True,
                 "policies_ok": True,
                 "tenants_configured": len(cfg.tenants),
             },
