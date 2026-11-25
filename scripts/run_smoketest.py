@@ -116,8 +116,15 @@ def run_check(results, name, method, path, expected_codes, headers=None, payload
             detail = f"Expected {sorted(expected_codes)}, got {http_code}{extra}"
 
         if isinstance(body, dict):
+            lta_audit = (
+                body.get("lta_audit")
+                if isinstance(body.get("lta_audit"), dict)
+                else {}
+            )
             ledger_hash = (
-                body.get("ledger_entry_hash")
+                body.get("audit_entry_hash")
+                or lta_audit.get("entry_hash")
+                or body.get("ledger_entry_hash")
                 or body.get("input_sha256")
                 or body.get("latest_hash_prefix")
                 or body.get("merkle_root")
