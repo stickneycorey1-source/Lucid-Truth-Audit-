@@ -44,6 +44,9 @@ jobs:
             --json-report \
             --json-report-file=reports/audit_ledger.json
 
+      - name: Build Docker Image
+        run: docker build -t lucid-truth-audit:ci .
+
       - name: Run Live Endpoint Gap Tests
         if: env.LTA_API_KEY != ''
         env:
