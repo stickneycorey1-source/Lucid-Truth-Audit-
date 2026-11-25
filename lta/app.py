@@ -546,12 +546,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
 
         rounded_latency = round(latency_ms, 3)
+        final_content = out_res.sanitized_text
         audit_meta = {
             "action": final_action,
             "redactions": unique_redactions,
             "policy_pack": policy_name,
             "tenant_id": tenant.tenant_id,
             "provider": upstream.provider,
+            "entry_hash": rec.entry_hash,
             "audit_entry_hash": rec.entry_hash,
             "audit_seq_id": rec.seq_id,
             "prev_hash": rec.prev_hash,
@@ -560,8 +562,20 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         }
 
         return {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion",
-            "content": out_res.sanitized_text,
+            "created": int(time.time()),
+            "content": final_content,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_content,
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
             "model": upstream.model,
             "provider": upstream.provider,
             "prompt_tokens": upstream.prompt_tokens,
