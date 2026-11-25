@@ -631,7 +631,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             provider_override=x_lta_provider,
             metadata=body.metadata,
         )
-        return result
+        return {
+            "status": "success",
+            "allowed": True,
+            **result,
+        }
 
     return app
 
