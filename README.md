@@ -182,24 +182,24 @@ curl -sS "[https://lucid-truth-audit.onrender.com/v1/audit/verify](https://lucid
 ## Validation & Test Suite Results
 
 ### Automated `pytest` Suite (`compliance_audit.html` · `2026-11-25 20:04:37 UTC`)
-* **Result:** **101/101 passed** (`0` failed, `0` skipped, `0` errors) in `6s` (`00:00:06`) on Python `3.12.16` (`pytest 9.2.0`, `pytest-cov 6.3.0`, `CI=true`).
-* **Validated Domains:** Prompt injection and obfuscation (zero-width, soft-hyphen, combining marks, leetspeak, Cyrillic homoglyphs, Base64, hex), social-engineering PII pretexts, indirect BOL prompt injection, PII/secret/Luhn PAN/multi-state CDL redaction, output exfiltration blocking, PCI/HIPAA/FMCSA policy packs, 60/7 and 70/8 HOS/weight/permit rules, rate limiting (`429`), CSV formula escaping, auth/RBAC fail-closed checks, and audit hash-chain tamper detection.
+* **Result:** **101/101 passed** (`0` failed, `0` skipped, `0` errors) in `6s` (`00:00:06`) on Python `3.12.16` (`pytest 9.2.0`, `pytest-cov 6.3.0`, `CI=true`)[span_0](start_span)[span_0](end_span).
+* **Validated Domains:** Prompt injection and obfuscation (zero-width, soft-hyphen, combining marks, leetspeak, Cyrillic homoglyphs, Base64, hex), social-engineering PII pretexts, indirect BOL prompt injection, PII/secret/Luhn PAN/multi-state CDL redaction, output exfiltration blocking, PCI/HIPAA/FMCSA policy packs, 60/7 and 70/8 HOS/weight/permit rules, rate limiting (`429`), CSV formula escaping, auth/RBAC fail-closed checks, and audit hash-chain tamper detection[span_1](start_span)[span_1](end_span).
 
 ```mermaid
 pie title Pytest Suite Pass Breakdown (101/101 Passed)
-    "Production & Obfuscation Suite (test_production_suite.py)" : 26
+    "Production & Obfuscation Suite (test_production_suite.py)" : 28
     "Core Audit, Injection & Auth (test_audit.py)" : 16
-    "Logistics & FMCSA Vectors (test_vector4_logistics.py)" : 11
     "Enterprise Gateway & RBAC (test_enterprise_gateway.py)" : 14
-    "Resilience & Rate Limiting (test_vector3_resilience.py)" : 8
-    "PII & Secret Guardrails (test_vector2_pii.py)" : 7
+    "Logistics & FMCSA Vectors (test_vector4_logistics.py)" : 11
     "Ledger, Providers & Evidence Chain" : 9
+    "Resilience & Rate Limiting (test_vector3_resilience.py)" : 8
+    "PII & Secret Guardrails (test_vector2_pii.py)" : 8
     "Deployment & Shadow Ingest" : 7
 ```
 
 ### Shadow Router Coverage (`z_cfb6adc3f81c8e3c_shadow_py.html` · `2026-11-25 20:04 UTC`)
-* **Coverage:** **97%** (`77` run, `2` missing, `1` partial branch out of `79` statements via `coverage.py 7.17.5`).
-* **Remaining Uncovered Lines:** Line `41` (`return {}` when `LTA_TENANT_KEYS` is unset/empty in `_load_tenant_key_map`) and line `128` (`logger.info(record.model_dump_json())` in `write_audit_record`).
+* **Coverage:** **97%** (`77` run, `2` missing, `1` partial branch out of `79` statements via `coverage.py 7.17.5`)[span_2](start_span)[span_2](end_span).
+* **Remaining Uncovered Lines:** Line `41` (`return {}` when `LTA_TENANT_KEYS` is unset/empty in `_load_tenant_key_map`) and line `128` (`logger.info(record.model_dump_json())` in `write_audit_record`)[span_3](start_span)[span_3](end_span).
 
 ### CI Validation Artifact Upload (`2026-11-25T20:04:35.9606075Z`)
 * **Artifact:** `lucid-truth-audit-3.11-validation` (`lucid-truth-audit-3.11-validation.zip`, Artifact ID `15059735258`)
@@ -222,17 +222,31 @@ python scripts/run_smoketest.py
 
 ## Live Smoke Test Baseline & Latency Benchmarks (`2026-11-25 19:41:15 UTC`)
 
-* **Target:** `https://lucid-truth-audit.onrender.com`
-* **Compliance Score:** `100.0%` (`9/9` checks passed)
-* **Zero-Retention Policy:** `Verified`
-* **Latest Ledger / SHA-256 Reference:** `5c303fae2ce8e0c4e581e09f3d1445a3e6a67f77ad4d473d94df6efc10dc580d`
+* **Target:** `https://lucid-truth-audit.onrender.com`[span_4](start_span)[span_4](end_span)[span_5](start_span)[span_5](end_span)
+* **Compliance Score:** `100.0%` (`9/9` checks passed)[span_6](start_span)[span_6](end_span)
+* **Zero-Retention Policy:** `Verified`[span_7](start_span)[span_7](end_span)
+* **Latest Ledger / SHA-256 Reference:** `5c303fae2ce8e0c4e581e09f3d1445a3e6a67f77ad4d473d94df6efc10dc580d`[span_8](start_span)[span_8](end_span)
 
-```mermaid
-xychart-beta
-    title "Live Smoke Test Latency by Check (ms)"
-    x-axis ["C1 /healthz", "C2 /readyz", "C3 NoKey 403", "C4 Shadow 401", "C5 Clean 200", "C6 PII 200", "C7 Inject 400", "C8 Ledger 200", "C9 Shadow 202"]
-    y-axis "Latency (ms)" 0 --> 4500
-    bar [72.1, 68.7, 71.6, 102.8, 4269.4, 1883.9, 82.8, 71.7, 93.8]
+### Latency Bar Chart (`ms`, Relative to `4269.4 ms` Peak)
+
+```text
+1. Health (/healthz)      72.1 ms   |█                                        | 200 PASS
+2. Readiness (/readyz)     68.7 ms   |█                                        | 200 PASS
+3. Guard Missing Key       71.6 ms   |█                                        | 403 PASS
+4. Shadow Auth Check      102.8 ms   |██                                       | 401 PASS
+5. Guard Clean Prompt    4269.4 ms   |████████████████████████████████████████ | 200 PASS
+6. Guard PII Redaction   1883.9 ms   |██████████████████                       | 200 PASS
+7. Guard Evasion / Inj.    82.8 ms   |█                                        | 400 PASS
+8. Audit Ledger Verify     71.7 ms   |█                                        | 200 PASS
+9. Shadow BiDi+Homoglyph   93.8 ms   |█                                        | 202 PASS
+```
+
+### Pass / Fail & Coverage Visual Summary
+
+```text
+Live Smoke Suite:  [████████████████████████████████████████] 9/9  (100.0% PASS)
+Pytest Suite:      [████████████████████████████████████████] 101/101 (100.0% PASS, 6s)
+shadow.py Cov.:    [███████████████████████████████████████░] 97% (77/79 stmts)
 ```
 
 | # | Check | Endpoint | Latency | Visual Scale (`4.3s` max) | HTTP | Status | Detail |
@@ -245,7 +259,7 @@ xychart-beta
 | **6** | Guard PII Redaction (SSN + Secret) | `/api/v1/guard` | `1883.9 ms` | `█████████` | `200` | `PASS` | `Raw SSN not leaked in response` |
 | **7** | Guard Injection / Evasion Handling | `/api/v1/guard` | `82.8 ms` | `▏` | `400` | `PASS` | `status=handled` |
 | **8** | Audit Ledger Verify (`/v1/audit/verify`) | `/v1/audit/verify` | `71.7 ms` | `▏` | `200` | `PASS` | `OK` |
-| **9** | Shadow Ingest (BiDi + Homoglyph) | `/v1/shadow/ingest` | `93.8 ms` | `▏` | `202` | `PASS` | `audit_id=shd-4-5c303fae2ce8` |
+| **9** | Shadow Ingest (BiDi + Homoglyph) | `/v1/shadow/ingest` | `93.8 ms` | `▏` | `202` | `PASS` | `audit_id=shd-4-5c303fae2ce8`[span_9](start_span)[span_9](end_span)[span_10](start_span)[span_10](end_span) |
 
 * **Latency Benchmarks Summary:**
   * **Gateway / Auth / Ledger / Shadow Fast Path (`Checks 1–4, 7–9`):** `68.7 ms` min (`#2 /readyz`), `102.8 ms` max (`#4 /v1/shadow/ingest`), `93.8 ms` on BiDi + Homoglyph shadow ingest (`#9`), and `71.7 ms` on audit ledger verification (`#8`).
