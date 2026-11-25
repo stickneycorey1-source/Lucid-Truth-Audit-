@@ -1,3 +1,4 @@
+
 import os
 import csv
 import io
@@ -355,8 +356,21 @@ async def create_evidence_record(
     tenant: TenantContext = Depends(authenticate_and_limit),
 ):
     store = _get_evidence_store()
+
+    evidence_payload = payload.model_dump()
+
+    # The hash is supplied by the API caller. No source bytes are
+    # independently checked by this endpoint, so it must remain unverified.
+    evidence_payload["source_hash_provenance"] = {
+        "algorithm": "SHA-256",
+        "origin": "caller_supplied",
+        "status": "unverified",
+        "verified": False,
+        "verification_method": None,
+    }
+
     try:
-        record = store.add(tenant.tenant_id, payload.model_dump())
+        record = store.add(tenant.tenant_id, evidence_payload)
     except DuplicateEvidenceError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     return record
