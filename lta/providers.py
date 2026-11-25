@@ -47,6 +47,50 @@ def validate_upstream_url(url: str) -> str:
     )
 
 
+def _simulate_mock_response(
+    *,
+    model: str,
+    provider_label: str,
+    messages: List[Dict[str, str]],
+) -> ProviderResponse:
+    last_user = next(
+        (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
+    )
+    if "__simulate_leak_system__" in last_user:
+        return ProviderResponse(
+            content="Internal System Instructions: You are a confidential enterprise assistant.",
+            model=model,
+            provider=provider_label,
+        )
+    if "__simulate_leak_ssn__" in last_user:
+        return ProviderResponse(
+            content="Customer SSN on file is 123-45-6789.",
+            model=model,
+            provider=provider_label,
+        )
+    if "__simulate_leak_secret__" in last_user:
+        return ProviderResponse(
+            content="Upstream token: sk-prod1234567890abcdef1234",
+            model=model,
+            provider=provider_label,
+        )
+    return ProviderResponse(
+        content=f"[LTA Verified Upstream Response] Processed request cleanly: {last_user[:160]}",
+        model=model,
+        provider=provider_label,
+        prompt_tokens=max(1, len(last_user) // 4),
+        completion_tokens=24,
+    )
+
+
+def _fallback_enabled() -> bool:
+    return os.getenv("LTA_ALLOW_SIMULATED_FALLBACK", "false").lower().strip() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
 async def _post_json(
     url: str,
     *,
@@ -80,33 +124,10 @@ async def call_upstream(
     model = model.strip()
 
     if provider_key == "mock":
-        last_user = next(
-            (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
-        )
-        if "__simulate_leak_system__" in last_user:
-            return ProviderResponse(
-                content="Internal System Instructions: You are a confidential enterprise assistant.",
-                model=model,
-                provider="mock",
-            )
-        if "__simulate_leak_ssn__" in last_user:
-            return ProviderResponse(
-                content="Customer SSN on file is 123-45-6789.",
-                model=model,
-                provider="mock",
-            )
-        if "__simulate_leak_secret__" in last_user:
-            return ProviderResponse(
-                content="Upstream token: sk-prod1234567890abcdef1234",
-                model=model,
-                provider="mock",
-            )
-        return ProviderResponse(
-            content=f"[LTA Verified Upstream Response] Processed request cleanly: {last_user[:160]}",
+        return _simulate_mock_response(
             model=model,
-            provider="mock",
-            prompt_tokens=max(1, len(last_user) // 4),
-            completion_tokens=24,
+            provider_label="mock",
+            messages=messages,
         )
 
     try:
@@ -123,6 +144,12 @@ async def call_upstream(
                 or os.getenv("OPENAI_API_KEY", "")
             ).strip()
             if provider_key in ("openai", "azure_openai") and not api_key:
+                if _fallback_enabled():
+                    return _simulate_mock_response(
+                        model=model,
+                        provider_label=f"{provider_key}:simulated",
+                        messages=messages,
+                    )
                 raise UpstreamProviderError(
                     f"Missing API key for upstream provider '{provider_key}'"
                 )
@@ -158,6 +185,12 @@ async def call_upstream(
         if provider_key == "anthropic":
             api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
             if not api_key:
+                if _fallback_enabled():
+                    return _simulate_mock_response(
+                        model=model,
+                        provider_label="anthropic:simulated",
+                        messages=messages,
+                    )
                 raise UpstreamProviderError("Missing ANTHROPIC_API_KEY")
             system_parts = [m["content"] for m in messages if m.get("role") == "system"]
             chat_msgs = [m for m in messages if m.get("role") != "system"]
@@ -199,6 +232,12 @@ async def call_upstream(
         if provider_key == "gemini":
             api_key = os.getenv("GEMINI_API_KEY", "").strip()
             if not api_key:
+                if _fallback_enabled():
+                    return _simulate_mock_response(
+                        model=model,
+                        provider_label="gemini:simulated",
+                        messages=messages,
+                    )
                 raise UpstreamProviderError("Missing GEMINI_API_KEY")
             system_parts = [m["content"] for m in messages if m.get("role") == "system"]
             contents = [
@@ -262,6 +301,12 @@ async def call_upstream(
                 completion_tokens=int(usage.get("candidatesTokenCount", 0)),
             )
     except httpx.HTTPStatusError as exc:
+        if _fallback_enabled():
+            return _simulate_mock_response(
+                model=model,
+                provider_label=f"{provider_key}:simulated",
+                messages=messages,
+            )
         err_msg = ""
         try:
             body = exc.response.json()
@@ -273,9 +318,21 @@ async def call_upstream(
             f"Upstream '{provider_key}' HTTP {exc.response.status_code} ({model}): {safe_msg}"
         ) from exc
     except httpx.HTTPError as exc:
+        if _fallback_enabled():
+            return _simulate_mock_response(
+                model=model,
+                provider_label=f"{provider_key}:simulated",
+                messages=messages,
+            )
         safe_exc = _scrub_secrets(str(exc) or "connection or timeout error")
         raise UpstreamProviderError(
             f"Upstream '{provider_key}' {type(exc).__name__} ({model}): {safe_exc}"
         ) from exc
 
+    if _fallback_enabled():
+        return _simulate_mock_response(
+            model=model,
+            provider_label=f"{provider_key}:simulated",
+            messages=messages,
+        )
     raise UpstreamProviderError(f"Unsupported upstream provider: '{provider}'")
