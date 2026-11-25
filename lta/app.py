@@ -682,14 +682,23 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             out = dict(result)
             if "chain_valid" not in out and "valid" in out:
                 out["chain_valid"] = bool(out["valid"])
+            if "first_broken_seq_id" not in out:
+                out["first_broken_seq_id"] = out.get("broken_seq_id") or out.get("detail")
             return out
         if isinstance(result, (tuple, list)):
             valid = bool(result[0]) if len(result) > 0 else False
             count = result[1] if len(result) > 1 else 0
             detail = result[2] if len(result) > 2 else None
-            return {"chain_valid": valid, "valid": valid, "count": count, "detail": detail}
+            first_broken = None if valid else detail
+            return {
+                "chain_valid": valid,
+                "valid": valid,
+                "count": count,
+                "detail": detail,
+                "first_broken_seq_id": first_broken,
+            }
         flag = bool(result)
-        return {"chain_valid": flag, "valid": flag, "result": result}
+        return {"chain_valid": flag, "valid": flag, "first_broken_seq_id": None, "result": result}
 
     @fastapi_app.get("/v1/audit/export")
     async def export_audit(
