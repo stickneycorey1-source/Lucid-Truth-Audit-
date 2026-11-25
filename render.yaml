@@ -3,7 +3,7 @@ services:
     name: lucid-truth-audit
     runtime: docker
     plan: starter
-    healthCheckPath: /healthz
+    healthCheckPath: /health
     envVars:
       - key: LTA_TENANTS_JSON
         sync: false
