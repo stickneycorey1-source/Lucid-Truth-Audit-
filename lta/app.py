@@ -1,4 +1,4 @@
-"""Lucid-Truth-Audit (v2.4.1) FastAPI enterprise AI security & compliance gateway."""
+"""Lucid-Truth-Audit (v2.4.0) FastAPI enterprise AI security & compliance gateway."""
 
 from __future__ import annotations
 
@@ -177,7 +177,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     fastapi_app = FastAPI(
         title="Lucid-Truth-Audit Gateway",
-        version="2.4.1",
+        version="2.4.0",
         docs_url=docs_url,
         redoc_url=redoc_url,
         openapi_url=openapi_url,
@@ -566,7 +566,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def healthz() -> Dict[str, Any]:
         return {
             "status": "ok",
-            "version": "2.4.1",
+            "version": "2.4.0",
             "policy_packs": policy_engine.list_packs(),
         }
 
@@ -602,13 +602,18 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         x_lta_policy: Optional[str] = Header(default=None, alias="X-LTA-Policy"),
         x_lta_provider: Optional[str] = Header(default=None, alias="X-LTA-Provider"),
     ) -> Dict[str, Any]:
+        model = (
+            getattr(tenant, "upstream_model", None)
+            or getattr(tenant, "default_model", None)
+            or os.getenv("LTA_UPSTREAM_MODEL", "gpt-4o-mini")
+        )
         result = await _run_pipeline(
             request=request,
             response=response,
             tenant=tenant,
             endpoint="/api/v1/guard",
             messages=[{"role": "user", "content": payload.model_input}],
-            model=tenant.default_model,
+            model=model,
             temperature=None,
             max_tokens=None,
             metadata=payload.metadata,
@@ -670,7 +675,15 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @fastapi_app.get("/v1/audit/verify")
     async def verify_audit(admin: TenantConfig = Depends(_require_admin)) -> Dict[str, Any]:
-        return audit_ledger.verify_chain()
+        result = audit_ledger.verify_chain()
+        if isinstance(result, dict):
+            return result
+        if isinstance(result, (tuple, list)):
+            valid = bool(result[0]) if len(result) > 0 else False
+            count = result[1] if len(result) > 1 else 0
+            detail = result[2] if len(result) > 2 else None
+            return {"valid": valid, "count": count, "detail": detail}
+        return {"valid": bool(result), "result": result}
 
     @fastapi_app.get("/v1/audit/export")
     async def export_audit(
