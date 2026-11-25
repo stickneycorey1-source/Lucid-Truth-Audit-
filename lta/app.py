@@ -1,4 +1,3 @@
-```python
 """Lucid-Truth-Audit Enterprise FastAPI Application (Hardened v2.4.1)."""
 
 from __future__ import annotations
@@ -28,6 +27,7 @@ MAX_BODY_BYTES = int(os.getenv("LTA_MAX_BODY_BYTES", str(256 * 1024)))
 
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
     role: Literal["system", "user", "assistant"]
     content: str = Field(..., min_length=1, max_length=65536)
 
@@ -41,6 +41,7 @@ class ChatMessage(BaseModel):
 
 class OpenAIChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
     model: Optional[str] = None
     messages: List[ChatMessage] = Field(..., min_length=1, max_length=50)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
@@ -50,6 +51,7 @@ class OpenAIChatCompletionRequest(BaseModel):
 
 class LegacyGuardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
     model_input: str = Field(..., min_length=1, max_length=65536)
     metadata: Optional[Dict[str, Any]] = None
 
@@ -91,7 +93,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         openapi_url=None if disable_docs else "/openapi.json",
         description=(
             "Drop-in OpenAI-compatible AI security, PII redaction, and regulatory "
-            "compliance gateway with YAML policy packs and SHA-256 hash-chained audit logs."
+            "compliance gateway with YAML policy packs and SHA-256 hash-chained "
+            "audit logs."
         ),
     )
     app.state.settings = cfg
@@ -103,10 +106,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @app.middleware("http")
     async def security_and_body_limit_middleware(
-        request: Request, call_next: Any
+        request: Request,
+        call_next: Any,
     ) -> Response:
-        req_id = (request.headers.get("x-request-id") or "").strip()[:64] or str(
-            uuid.uuid4()
+        req_id = (
+            (request.headers.get("x-request-id") or "").strip()[:64]
+            or str(uuid.uuid4())
         )
         sec_headers = {
             "X-Request-ID": req_id,
@@ -116,10 +121,18 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         }
 
         content_length = request.headers.get("content-length")
-        if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
+        if (
+            content_length
+            and content_length.isdigit()
+            and int(content_length) > MAX_BODY_BYTES
+        ):
             return JSONResponse(
                 status_code=413,
-                content={"detail": f"Payload Too Large: exceeds {MAX_BODY_BYTES} byte limit."},
+                content={
+                    "detail": (
+                        f"Payload Too Large: exceeds {MAX_BODY_BYTES} byte limit."
+                    )
+                },
                 headers=sec_headers,
             )
 
@@ -134,7 +147,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     return JSONResponse(
                         status_code=413,
                         content={
-                            "detail": f"Payload Too Large: exceeds {MAX_BODY_BYTES} byte limit."
+                            "detail": (
+                                f"Payload Too Large: exceeds "
+                                f"{MAX_BODY_BYTES} byte limit."
+                            )
                         },
                         headers=sec_headers,
                     )
@@ -142,8 +158,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             request._body = b"".join(chunks)
 
         response = await call_next(request)
-        for k, v in sec_headers.items():
-            response.headers[k] = v
+        for key, value in sec_headers.items():
+            response.headers[key] = value
         return response
 
     def _extract_key(
@@ -162,7 +178,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if not cfg.tenants:
             raise HTTPException(
                 status_code=500,
-                detail="Fail-closed configuration error: no tenant API keys configured.",
+                detail=(
+                    "Fail-closed configuration error: "
+                    "no tenant API keys configured."
+                ),
             )
 
         tenant = cfg.authenticate(raw_key)
@@ -172,7 +191,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 detail="Forbidden: Invalid or missing API key.",
             )
 
-        allowed, remaining = limiter.check(tenant.tenant_id, tenant.rate_limit_rpm)
+        allowed, remaining = limiter.check(
+            tenant.tenant_id,
+            tenant.rate_limit_rpm,
+        )
         if not allowed:
             metrics.observe(
                 policy_pack=tenant.policy_pack,
@@ -182,27 +204,35 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
             raise HTTPException(
                 status_code=429,
-                detail="Too Many Requests: Tenant sliding-window rate limit exceeded.",
+                detail=(
+                    "Too Many Requests: Tenant sliding-window "
+                    "rate limit exceeded."
+                ),
                 headers={"X-RateLimit-Remaining": str(remaining)},
             )
         return tenant
 
-    def require_admin(tenant: TenantConfig = Depends(authenticate_tenant)) -> TenantConfig:
+    def require_admin(
+        tenant: TenantConfig = Depends(authenticate_tenant),
+    ) -> TenantConfig:
         if tenant.role != "admin":
             raise HTTPException(
                 status_code=403,
-                detail="Forbidden: Admin role required for audit administration endpoints.",
+                detail=(
+                    "Forbidden: Admin role required for audit "
+                    "administration endpoints."
+                ),
             )
         return tenant
 
-    @@app.get("/health")
-@app.get("/healthz")
-async def healthz() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "version": __version__,
-        "policies_loaded": len(engine.packs),
-    }
+    @app.get("/health")
+    @app.get("/healthz")
+    async def healthz() -> Dict[str, Any]:
+        return {
+            "status": "ok",
+            "version": __version__,
+            "policies_loaded": len(engine.packs),
+        }
 
     @app.get("/readyz")
     async def readyz() -> Dict[str, Any]:
@@ -255,7 +285,10 @@ async def healthz() -> Dict[str, Any]:
             tenant_id=tenant_id,
             limit=min(max(limit, 1), 5000),
         )
-        return Response(content=body, media_type="application/x-ndjson")
+        return Response(
+            content=body,
+            media_type="application/x-ndjson",
+        )
 
     async def _run_pipeline(
         *,
@@ -294,7 +327,10 @@ async def healthz() -> Dict[str, Any]:
             raise HTTPException(
                 status_code=403,
                 detail={
-                    "error": "Forbidden: Only admin keys may override policy pack or upstream provider.",
+                    "error": (
+                        "Forbidden: Only admin keys may override policy pack "
+                        "or upstream provider."
+                    ),
                     "vector": "security.unauthorized_policy_override",
                     "audit_entry_hash": rec.entry_hash,
                 },
@@ -302,6 +338,7 @@ async def healthz() -> Dict[str, Any]:
 
         policy_name = policy_override or tenant.policy_pack
         provider_name = provider_override or tenant.provider
+
         if policy_name not in engine.packs:
             raise HTTPException(
                 status_code=400,
@@ -309,7 +346,9 @@ async def healthz() -> Dict[str, Any]:
             )
 
         for idx, msg in enumerate(messages):
-            if msg["role"] == "system" and (idx > 0 or tenant.role != "admin"):
+            if msg["role"] == "system" and (
+                idx > 0 or tenant.role != "admin"
+            ):
                 latency_ms = (time.perf_counter() - t0) * 1000.0
                 rec = ledger.record(
                     tenant_id=tenant.tenant_id,
@@ -341,11 +380,13 @@ async def healthz() -> Dict[str, Any]:
         sanitized_messages: List[Dict[str, str]] = []
         all_redactions: List[str] = []
         non_system_contents = [
-            m["content"]
-            for m in messages
-            if m["role"] in ("user", "assistant")
+            msg["content"]
+            for msg in messages
+            if msg["role"] in ("user", "assistant")
         ]
-        combined_input_for_digest = "\n".join(m["content"] for m in messages)
+        combined_input_for_digest = "\n".join(
+            msg["content"] for msg in messages
+        )
 
         if len(non_system_contents) > 1:
             combined_res = engine.evaluate_input(
@@ -419,9 +460,13 @@ async def healthz() -> Dict[str, Any]:
                             "audit_entry_hash": rec.entry_hash,
                         },
                     )
+
                 all_redactions.extend(in_res.redactions)
                 sanitized_messages.append(
-                    {"role": msg["role"], "content": in_res.sanitized_text}
+                    {
+                        "role": msg["role"],
+                        "content": in_res.sanitized_text,
+                    }
                 )
             else:
                 sanitized_messages.append(msg)
@@ -476,7 +521,11 @@ async def healthz() -> Dict[str, Any]:
 
         all_redactions.extend(out_res.redactions)
         unique_redactions = sorted(set(all_redactions))
-        final_action = "ALLOW_REDACTED" if unique_redactions else "ALLOW"
+        final_action = (
+            "ALLOW_REDACTED"
+            if unique_redactions
+            else "ALLOW"
+        )
 
         rec = ledger.record(
             tenant_id=tenant.tenant_id,
@@ -518,79 +567,3 @@ async def healthz() -> Dict[str, Any]:
         x_lta_provider: Optional[str] = Header(default=None),
     ) -> Dict[str, Any]:
         result = await _run_pipeline(
-            tenant=tenant,
-            endpoint="/v1/chat/completions",
-            messages=[
-                {"role": m.role, "content": m.content}
-                for m in body.messages
-            ],
-            model=body.model or tenant.upstream_model,
-            policy_override=x_lta_policy,
-            provider_override=x_lta_provider,
-            metadata=body.metadata,
-            temperature=body.temperature,
-            max_tokens=body.max_tokens,
-        )
-        return {
-            "id": f"chatcmpl-lta-{uuid.uuid4().hex[:12]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": result["model"],
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": result["content"],
-                    },
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": result["prompt_tokens"],
-                "completion_tokens": result["completion_tokens"],
-                "total_tokens": (
-                    result["prompt_tokens"] + result["completion_tokens"]
-                ),
-            },
-            "lta_audit": {
-                "action": result["action"],
-                "policy_pack": result["policy_pack"],
-                "provider": result["provider"],
-                "redactions": result["redactions"],
-                "seq_id": result["audit_seq_id"],
-                "entry_hash": result["audit_entry_hash"],
-                "latency_ms": result["latency_ms"],
-            },
-        }
-
-    @app.post("/api/v1/guard")
-    async def legacy_guard(
-        body: LegacyGuardRequest,
-        tenant: TenantConfig = Depends(authenticate_tenant),
-        x_lta_policy: Optional[str] = Header(default=None),
-        x_lta_provider: Optional[str] = Header(default=None),
-    ) -> Dict[str, Any]:
-        result = await _run_pipeline(
-            tenant=tenant,
-            endpoint="/api/v1/guard",
-            messages=[{"role": "user", "content": body.model_input}],
-            model=tenant.upstream_model,
-            policy_override=x_lta_policy,
-            provider_override=x_lta_provider,
-            metadata=body.metadata,
-        )
-        return {
-            "status": "success",
-            "action": result["action"],
-            "message": result["content"],
-            "redactions": result["redactions"],
-            "policy_pack": result["policy_pack"],
-            "audit_entry_hash": result["audit_entry_hash"],
-        }
-
-    return app
-
-
-app = create_app()
-```
