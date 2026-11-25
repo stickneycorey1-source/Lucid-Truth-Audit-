@@ -16,7 +16,7 @@ TIMEOUT = int(os.getenv("LTA_TIMEOUT_S", "45"))
 def _resolve_ref(spec: dict, ref: str) -> dict:
     if not isinstance(ref, str) or not ref.startswith("#/"):
         return {}
-    curr = spec
+    curr: object = spec
     for part in ref[2:].split("/"):
         if isinstance(curr, dict):
             curr = curr.get(part, {})
@@ -27,11 +27,11 @@ def _resolve_ref(spec: dict, ref: str) -> dict:
 
 def _inspect_guard_schema(spec: dict) -> tuple[dict, list[str]]:
     post_spec = spec.get("paths", {}).get("/api/v1/guard", {}).get("post", {})
-    req_body = post_spec.get("requestBody", {})
-    content = req_body.get("content", {})
+    req_body = post_spec.get("requestBody", {}) if isinstance(post_spec, dict) else {}
+    content = req_body.get("content", {}) if isinstance(req_body, dict) else {}
     app_json = content.get("application/json", {}) if isinstance(content, dict) else {}
     schema = app_json.get("schema", {}) if isinstance(app_json, dict) else {}
-    if "$ref" in schema:
+    if isinstance(schema, dict) and "$ref" in schema:
         schema = _resolve_ref(spec, schema["$ref"])
 
     props = schema.get("properties", {}) if isinstance(schema, dict) else {}
@@ -47,22 +47,23 @@ def _build_guard_payload(prompt_text: str, props: dict, required: list[str]) -> 
         return payload
 
     payload = {}
-    if "prompt" in props or "prompt" in required:
-        payload["prompt"] = prompt_text
-
-    candidate_text_keys = ["text", "content", "input", "message", "query"]
+    candidate_text_keys = ["prompt", "text", "content", "input", "message", "query"]
     for key in candidate_text_keys:
         if key in props or key in required:
             payload[key] = prompt_text
+            break
 
     if not payload:
         payload["model_input"] = prompt_text
+
+    if "metadata" in props and "metadata" not in payload:
+        payload["metadata"] = {"source": "github_actions_smoketest"}
 
     for field in required:
         if field in payload:
             continue
         f_schema = props.get(field, {})
-        if "$ref" in f_schema:
+        if not isinstance(f_schema, dict) or "$ref" in f_schema:
             f_schema = {}
         f_type = f_schema.get("type", "string")
         if "enum" in f_schema and f_schema["enum"]:
@@ -81,6 +82,23 @@ def _build_guard_payload(prompt_text: str, props: dict, required: list[str]) -> 
             payload[field] = "smoke-test"
 
     return payload
+
+
+def _fetch_openapi_spec() -> dict:
+    last_exc: Exception | None = None
+    for _ in range(2):
+        try:
+            resp = requests.get(f"{BASE_URL}/openapi.json", timeout=TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                return data
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.5)
+    if last_exc:
+        raise last_exc
+    return {}
 
 
 def run_check(results, name, method, path, expected_codes, headers=None, payload=None, assert_fn=None):
@@ -112,8 +130,10 @@ def run_check(results, name, method, path, expected_codes, headers=None, payload
             custom_ok, custom_msg = assert_fn(body, resp.text)
 
         passed = code_ok and custom_ok
-        if code_ok:
+        if passed:
             detail = custom_msg
+        elif code_ok and not custom_ok:
+            detail = f"Assertion failed: {custom_msg}"
         else:
             extra = ""
             if http_code == 422 and isinstance(body, dict) and "detail" in body:
@@ -157,14 +177,13 @@ def main() -> int:
     guard_props = {}
     guard_required = []
 
-    # Warm Render service before fetching OpenAPI spec to reduce cold-start timeouts
     try:
         requests.get(f"{BASE_URL}/healthz", timeout=TIMEOUT)
     except Exception:
         pass
 
     try:
-        spec = requests.get(f"{BASE_URL}/openapi.json", timeout=TIMEOUT).json()
+        spec = _fetch_openapi_spec()
         live_paths = set(spec.get("paths", {}).keys())
         print("Live OpenAPI paths:", sorted(live_paths))
         guard_props, guard_required = _inspect_guard_schema(spec)
@@ -248,7 +267,10 @@ def main() -> int:
             expected_codes={200},
             headers=auth_headers,
             payload=pii_payload,
-            assert_fn=lambda _, raw: ("123-45-6789" not in raw, "Raw SSN not leaked in response"),
+            assert_fn=lambda _, raw: (
+                "123-45-6789" not in raw and "sk-1234567890abcdef1234" not in raw,
+                "Raw SSN & secret not leaked in response",
+            ),
         )
 
         injection_payload = _build_guard_payload(
@@ -261,11 +283,11 @@ def main() -> int:
             name="7. Guard Injection / Evasion Handling",
             method="POST",
             path="/api/v1/guard",
-            expected_codes={200, 400, 422},
+            expected_codes={200, 400, 403, 422},
             headers=auth_headers,
             payload=injection_payload,
-            assert_fn=lambda b, _: (
-                True,
+            assert_fn=lambda b, raw: (
+                "\u202e" not in raw,
                 f"status={b.get('status') or b.get('decision') or 'handled'}",
             ),
         )
@@ -279,7 +301,7 @@ def main() -> int:
             headers={"X-API-Key": API_KEY},
         )
 
-    if SHADOW_KEY and "/v1/shadow/ingest" in live_paths:
+    if SHADOW_KEY and ("/v1/shadow/ingest" in live_paths or not live_paths):
         run_check(
             results,
             name="9. Shadow Ingest (BiDi + Homoglyph)",
@@ -470,6 +492,10 @@ def main() -> int:
 </body>
 </html>
 """
+
+    out_dir = os.path.dirname(OUTPUT_PATH)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
     with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
         f.write(html_doc)
