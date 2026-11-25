@@ -1,4 +1,4 @@
-"""Sliding-window per-tenant rate limiter (Hardened v2.4 — Redis timeouts + resilient fallback)."""
+"""Sliding-window per-tenant & failed-auth rate limiter (Hardened v2.4 — Redis timeouts + resilient fallback)."""
 
 from __future__ import annotations
 
@@ -55,9 +55,9 @@ class SlidingWindowRateLimiter:
             )
             self._lua = self._redis.register_script(_REDIS_SLIDING_WINDOW_LUA)
 
-    def _check_memory(self, tenant_id: str, limit_rpm: int, now: float) -> Tuple[bool, int]:
+    def _check_memory(self, bucket_key: str, limit_rpm: int, now: float) -> Tuple[bool, int]:
         with self._lock:
-            bucket = self._buckets.setdefault(tenant_id, deque())
+            bucket = self._buckets.setdefault(bucket_key, deque())
             cutoff = now - self.window_seconds
             while bucket and bucket[0] < cutoff:
                 bucket.popleft()
@@ -67,7 +67,7 @@ class SlidingWindowRateLimiter:
             return True, max(0, limit_rpm - len(bucket))
 
     def check(self, tenant_id: str, limit_rpm: int) -> Tuple[bool, int]:
-        """Return (allowed, remaining_requests) for the tenant in the active window."""
+        """Return (allowed, remaining_requests) for the bucket key in the active window."""
         now = time.time()
         if self._lua is not None:
             try:
