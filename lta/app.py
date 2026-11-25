@@ -198,7 +198,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if tenant is None:
             raise HTTPException(status_code=403, detail="Invalid API credentials")
 
-        allowed, remaining = await rate_limiter.allow(tenant.tenant_id)
+        allowed, remaining = rate_limiter.check(tenant.tenant_id, tenant.rate_limit_rpm)
         request.state.rate_limit_remaining = remaining
         if not allowed:
             raise HTTPException(
@@ -245,22 +245,25 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 latency_ms=latency_ms,
             )
             metrics.observe(
-                endpoint=endpoint,
                 policy_pack=tenant.policy_pack,
-                action="BLOCK",
                 http_status=403,
-                vector="security.unauthorized_policy_override",
                 latency_ms=latency_ms,
+                vector="security.unauthorized_policy_override",
             )
             raise HTTPException(
                 status_code=403,
                 detail="Policy or provider overrides require admin privileges",
             )
 
-        policy_name = (x_lta_policy.strip() if (is_admin and x_lta_policy) else tenant.policy_pack)
+        policy_name = x_lta_policy.strip() if (is_admin and x_lta_policy) else tenant.policy_pack
         provider_name = (
             x_lta_provider.strip() if (is_admin and x_lta_provider) else tenant.provider
         )
+
+        try:
+            policy_engine.get_pack(policy_name)
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         for idx, msg in enumerate(messages):
             if msg["role"] == "system" and (idx > 0 or not is_admin):
@@ -278,51 +281,71 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     latency_ms=latency_ms,
                 )
                 metrics.observe(
-                    endpoint=endpoint,
                     policy_pack=policy_name,
-                    action="BLOCK",
                     http_status=400,
-                    vector="security.multi_turn_system_spoofing",
                     latency_ms=latency_ms,
+                    vector="security.multi_turn_system_spoofing",
                 )
                 raise HTTPException(
                     status_code=400,
                     detail="Unauthorized or misplaced system role message blocked by policy",
                 )
 
-        input_eval = policy_engine.evaluate_input(
-            policy_pack=policy_name,
-            messages=messages,
-            metadata=metadata,
-        )
-        if not input_eval.allowed:
-            latency_ms = (time.perf_counter() - started) * 1000.0
-            audit_ledger.record(
-                tenant_id=tenant.tenant_id,
-                endpoint=endpoint,
-                policy_pack=policy_name,
-                provider=provider_name,
-                action="BLOCK",
-                http_status=400,
-                vector=input_eval.vector or "policy.input_blocked",
-                redactions=input_eval.redactions,
-                raw_payload_for_digest="\n".join(m["content"] for m in messages),
-                latency_ms=latency_ms,
-            )
-            metrics.observe(
-                endpoint=endpoint,
-                policy_pack=policy_name,
-                action="BLOCK",
-                http_status=400,
-                vector=input_eval.vector or "policy.input_blocked",
-                latency_ms=latency_ms,
-            )
-            raise HTTPException(
-                status_code=400,
-                detail=input_eval.reason or "Request blocked by security policy",
-            )
+        # Evaluate each message turn individually as well as concatenated multi-turn context
+        non_system_turns = [m["content"] for m in messages if m["role"] != "system"]
+        scan_targets: List[Tuple[str, Optional[Dict[str, Any]]]] = [
+            (m["content"], metadata if m["role"] == "user" else None) for m in messages
+        ]
+        if len(non_system_turns) > 1:
+            scan_targets.append(("\n".join(non_system_turns), metadata))
 
-        sanitized_messages = input_eval.sanitized_messages
+        for target_text, target_meta in scan_targets:
+            probe_eval = policy_engine.evaluate_input(
+                text=target_text,
+                policy_name=policy_name,
+                metadata=target_meta,
+            )
+            if not probe_eval.allowed:
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                audit_ledger.record(
+                    tenant_id=tenant.tenant_id,
+                    endpoint=endpoint,
+                    policy_pack=policy_name,
+                    provider=provider_name,
+                    action="BLOCK",
+                    http_status=probe_eval.http_status,
+                    vector=probe_eval.vector or "policy.input_blocked",
+                    redactions=probe_eval.redactions,
+                    raw_payload_for_digest="\n".join(m["content"] for m in messages),
+                    latency_ms=latency_ms,
+                )
+                metrics.observe(
+                    policy_pack=policy_name,
+                    http_status=probe_eval.http_status,
+                    latency_ms=latency_ms,
+                    vector=probe_eval.vector or "policy.input_blocked",
+                )
+                raise HTTPException(
+                    status_code=probe_eval.http_status,
+                    detail=probe_eval.reason or "Request blocked by security policy",
+                )
+
+        sanitized_messages: List[Dict[str, str]] = []
+        input_redactions: List[str] = []
+        for msg in messages:
+            turn_eval = policy_engine.evaluate_input(
+                text=msg["content"],
+                policy_name=policy_name,
+                metadata=metadata if msg["role"] == "user" else None,
+            )
+            sanitized_messages.append(
+                {
+                    "role": msg["role"],
+                    "content": turn_eval.sanitized_text or msg["content"],
+                }
+            )
+            input_redactions.extend(turn_eval.redactions)
+
         try:
             upstream_resp = await call_upstream(
                 provider=provider_name,
@@ -342,24 +365,21 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 action="BLOCK",
                 http_status=502,
                 vector="upstream.provider_error",
-                redactions=input_eval.redactions,
+                redactions=sorted(set(input_redactions)),
                 raw_payload_for_digest="\n".join(m["content"] for m in sanitized_messages),
                 latency_ms=latency_ms,
             )
             metrics.observe(
-                endpoint=endpoint,
                 policy_pack=policy_name,
-                action="BLOCK",
                 http_status=502,
-                vector="upstream.provider_error",
                 latency_ms=latency_ms,
+                vector="upstream.provider_error",
             )
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         output_eval = policy_engine.evaluate_output(
-            policy_pack=policy_name,
-            content=upstream_resp.content,
-            metadata=metadata,
+            text=upstream_resp.content,
+            policy_name=policy_name,
         )
         if not output_eval.allowed:
             latency_ms = (time.perf_counter() - started) * 1000.0
@@ -369,26 +389,25 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 policy_pack=policy_name,
                 provider=provider_name,
                 action="BLOCK",
-                http_status=400,
+                http_status=output_eval.http_status,
                 vector=output_eval.vector or "policy.output_blocked",
-                redactions=sorted(set(input_eval.redactions + output_eval.redactions)),
+                redactions=sorted(set(input_redactions + output_eval.redactions)),
                 raw_payload_for_digest=upstream_resp.content,
                 latency_ms=latency_ms,
             )
             metrics.observe(
-                endpoint=endpoint,
                 policy_pack=policy_name,
-                action="BLOCK",
-                http_status=400,
-                vector=output_eval.vector or "policy.output_blocked",
+                http_status=output_eval.http_status,
                 latency_ms=latency_ms,
+                vector=output_eval.vector or "policy.output_blocked",
             )
             raise HTTPException(
-                status_code=400,
+                status_code=output_eval.http_status,
                 detail=output_eval.reason or "Response blocked by output policy",
             )
 
-        all_redactions = sorted(set(input_eval.redactions + output_eval.redactions))
+        final_content = output_eval.sanitized_text or upstream_resp.content
+        all_redactions = sorted(set(input_redactions + output_eval.redactions))
         final_action = "ALLOW_REDACTED" if all_redactions else "ALLOW"
         latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
@@ -401,16 +420,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             http_status=200,
             vector=None,
             redactions=all_redactions,
-            raw_payload_for_digest=output_eval.content,
+            raw_payload_for_digest=final_content,
             latency_ms=latency_ms,
         )
         metrics.observe(
-            endpoint=endpoint,
             policy_pack=policy_name,
-            action=final_action,
             http_status=200,
-            vector=None,
             latency_ms=latency_ms,
+            vector=None,
         )
 
         rem = getattr(request.state, "rate_limit_remaining", None)
@@ -435,7 +452,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": output_eval.content},
+                    "message": {"role": "assistant", "content": final_content},
                     "finish_reason": "stop",
                 }
             ],
@@ -444,7 +461,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "completion_tokens": upstream_resp.completion_tokens,
                 "total_tokens": upstream_resp.prompt_tokens + upstream_resp.completion_tokens,
             },
-            "content": output_eval.content,
+            "content": final_content,
             "action": final_action,
             "redactions": all_redactions,
             "policy_pack": policy_name,
@@ -460,13 +477,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return {
             "status": "ok",
             "version": "2.4.1",
-            "policies_loaded": len(policy_engine.available_policies()),
+            "policies_loaded": len(policy_engine.list_packs()),
         }
 
     @fastapi_app.get("/readyz")
     async def readyz() -> JSONResponse:
         db_ok = audit_ledger.ping()
-        policies_ok = len(policy_engine.available_policies()) > 0
+        policies_ok = len(policy_engine.list_packs()) > 0
         if not db_ok or not policies_ok:
             return JSONResponse(
                 status_code=503,
@@ -493,7 +510,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return {
             "active_tenant": tenant.tenant_id,
             "active_policy": tenant.policy_pack,
-            "available_policies": policy_engine.available_policies(),
+            "available_policies": policy_engine.list_packs(),
         }
 
     @fastapi_app.post("/v1/chat/completions")
