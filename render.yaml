@@ -1,51 +1,27 @@
 services:
-  lta-gateway:
-    build: .
-    ports:
-      - "8000:10000"
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      LTA_AUDIT_DB_URL: postgresql://lta:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/lta_audit
-      LTA_REDIS_URL: redis://redis:6379/0
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/healthz', timeout=3)\""]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    restart: unless-stopped
-
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: lta
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-      POSTGRES_DB: lta_audit
-    volumes:
-      - lta_pg_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U lta -d lta_audit"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-    restart: unless-stopped
-
-volumes:
-  lta_pg_data:
+  - type: web
+    name: lucid-truth-audit
+    runtime: docker
+    plan: starter
+    healthCheckPath: /healthz
+    envVars:
+      - key: LTA_TENANTS_JSON
+        sync: false
+      - key: LTA_API_KEY
+        sync: false
+      - key: LTA_DEFAULT_PROVIDER
+        value: "mock"
+      - key: LTA_DEFAULT_TENANT
+        value: "github-actions"
+      - key: LTA_DEFAULT_POLICY
+        value: "general_enterprise"
+      - key: LTA_AUDIT_DB_URL
+        value: "sqlite:////var/data/lta_audit_ledger.db"
+      - key: LTA_CORS_ORIGINS
+        value: ""
+      - key: LTA_RATE_LIMIT_RPM
+        value: "60"
+    disk:
+      name: lucid-audit-data
+      mountPath: /var/data
+      sizeGB: 1
