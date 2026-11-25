@@ -1,278 +1,112 @@
-# Lucid-Truth-Audit (LTA) · Enterprise AI Security & Compliance Gateway
+# Lucid-Truth-Audit (LTA) — Enterprise AI Security & Compliance Gateway
 
-[![Version](https://img.shields.io/badge/version-2.4.1-blue.svg?style=for-the-badge)](https://lucid-truth-audit.onrender.com/healthz)
-[![Smoke Test](https://img.shields.io/badge/live%20smoke%20test-9%2F9%20(100%25)-brightgreen.svg?style=for-the-badge)](https://lucid-truth-audit.onrender.com/readyz)
-[![Unit Suite](https://img.shields.io/badge/pytest-101%2F101%20passed-success.svg?style=for-the-badge)](#validation--test-suite-results)
-[![Shadow Coverage](https://img.shields.io/badge/shadow.py-97%25%20coverage-informational.svg?style=for-the-badge)](#validation--test-suite-results)
-[![Zero Retention](https://img.shields.io/badge/shadow%20ingest-zero%20retention-indigo.svg?style=for-the-badge)](#zero-retention-shadow-ingest)
-[![Ledger](https://img.shields.io/badge/audit%20ledger-SHA--256%20hash--chain-slate.svg?style=for-the-badge)](#cryptographic-audit-ledger)
-[![License](https://img.shields.io/badge/license-Apache%202.0%20%2B%20Commercial-blue.svg?style=for-the-badge)](#license)
+[![Version](https://img.shields.io/badge/version-2.4.0-blue.svg)](https://github.com/stickneycorey1-source/Lucid-Truth-Audit)
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Tests](https://img.shields.io/badge/offline%20tests-101%2F101%20passed-brightgreen.svg)](#validation--test-suites)
+[![Coverage](https://img.shields.io/badge/coverage-78.09%25-yellowgreen.svg)](#validation--test-suites)
+[![Deployment](https://img.shields.io/badge/deployment-Render%20%7C%20Docker-46E3B7.svg)](https://lucid-truth-audit.onrender.com)
 
-[![Python](https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white)](#validation--test-suite-results)
-[![FastAPI](https://img.shields.io/badge/FastAPI-Pydantic%20v2-009688?logo=fastapi&logoColor=white)](#architecture--capabilities)
-[![Gemini](https://img.shields.io/badge/Upstream-Google%20Gemini-4285F4?logo=googlegemini&logoColor=white)](#architecture--capabilities)
-[![Render](https://img.shields.io/badge/Deployed-Render-46E3B7?logo=render&logoColor=white)](https://lucid-truth-audit.onrender.com)
-[![GitHub Actions](https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)](#validation--test-suite-results)
-
-**Lucid-Truth-Audit (LTA)** is a FastAPI and Pydantic v2 enterprise AI security, policy enforcement, PII/secret redaction, and cryptographic audit gateway. It sits in front of upstream LLM providers (such as Google Gemini) and supports zero-retention shadow telemetry ingestion for enterprise evaluation and 30-day pilot deployments.
-
-* **Repository:** `https://github.com/stickneycorey1-source/Lucid-Truth-Audit-`
-* **Live Deployment:** `https://lucid-truth-audit.onrender.com`
-* **Latest Verified Smoke Run:** `2026-11-25 21:41:51 UTC` — **9/9 checks passed (100.0%)**
-* **Latest Ledger / SHA-256 Reference:** `5c303fae2ce8e0c4e581e09f3d1445a3e6a67f77ad4d473d94df6efc10dc580d`
-* **Latest Validation Artifact:** `lucid-truth-audit-3.11-validation` (`ID 15059735258`, SHA-256 `c56b18ca0644b8113bbae4f93d5a5ae000fc1c467733565fb60008292d001e20`)[span_0](start_span)[span_0](end_span)[span_1](start_span)[span_1](end_span)[span_2](start_span)[span_2](end_span)
+Lucid-Truth-Audit (LTA) is an enterprise AI security, guardrail, and compliance gateway (**v2.4.0**) built with FastAPI and Pydantic. It sits between client applications, internal tools, or LLM orchestration layers and upstream model providers to enforce input/output policies, redact sensitive data, apply sliding-window rate limiting, and record hash-chained audit logs.
 
 ---
 
-## System Architecture & Visual Flows
+## Key Capabilities & Architecture
 
-```text
-[Client / Shadow Proxy]
-       │  (X-API-Key / Bearer LTA_SHADOW_KEY)
-       ▼
-┌────────────────────────────────────────────────────────┐
-│  _ingress_middleware  (256 KiB cap -> 413, headers)   │
-└───────────────────────────┬────────────────────────────┘
-                            ▼
-┌────────────────────────────────────────────────────────┐
-│  Auth & Rate Limit  (hmac.compare_digest, 401/403/429) │
-└───────────┬───────────────────────────┬────────────────┘
-            │ /v1/shadow/ingest       │ /api/v1/guard & /v1/chat/completions
-            ▼                           ▼
-┌───────────────────────┐   ┌────────────────────────────┐
-│  Shadow Ingest (202)  │   │  Policy & Evasion Engine   │
-│  64-char input_sha256 │   │  BiDi/NFKC, PII/Secret/CDL│
-│  Zero raw retention   │   └─────────────┬──────────────┘
-└───────────┬───────────┘                 ▼
-            │                   ┌────────────────────────────┐
-            │                   │  Upstream LLM (Gemini/etc) │
-            │                   └─────────────┬──────────────┘
-            ▼                                 ▼
-┌────────────────────────────────────────────────────────┐
-│  SHA-256 Audit Ledger (/v1/audit/verify & /export)     │
-│  └─▶ Prometheus Telemetry (/metrics)                   │
-└────────────────────────────────────────────────────────┘
-```
-
-### Zero-Retention Shadow Ingest Flow
-
-```text
-1. Shadow Proxy ──▶ POST /v1/shadow/ingest (Authorization: Bearer <LTA_SHADOW_KEY>)
-2. Gateway      ──▶ Verify key (hmac.compare_digest) & strict Pydantic v2 schema
-3. Gateway      ──▶ Compute 64-char input_sha256 (raw prompt discarded immediately)
-4. Background   ──▶ Sanitize BiDi/NFKC/homoglyphs & log ZeroRetentionAuditRecord
-5. Gateway      ──▶ 202 Accepted { audit_id, input_sha256, zero_retention: true }
-```
+* **YAML Policy Engine (`lta/policy_engine.py`):** Evaluates prompts and upstream model responses against YAML policy packs (`general_enterprise`, `pci_dss`, `hipaa`, `fmcsa`, and custom packs loaded from the policy directory).
+  * **Canonicalization & De-Obfuscation:** Strips zero-width and BiDi characters, applies Unicode NFKD/NFKC normalization and diacritic stripping, folds Cyrillic/Greek homoglyphs and common leetspeak characters, collapses whitespace, and evaluates punctuation-stripped surfaces.
+  * **Bounded Payload Decoding:** Recursively decodes URL-encoded, Base64, and Hex payloads up to depth 2 before running policy checks.
+  * **Injection, Pretext & Anomaly Defense:** Blocks prompt-injection overrides, system-prompt exfiltration phrasing, social-engineering authority pretexts, and flood/high-entropy anomalies while permitting benign educational and technical prompts.
+  * **PII & Secret Redaction / Output Boundary:** Redacts SSNs (dashed `###-##-####`, space-separated `### ## ####`, and 9-digit contiguous strings), Luhn-checked PANs, emails, phone numbers, API secrets, MRNs, CDLs, and routing/account identifiers, and enforces output-boundary leak blocking (`security.output_instruction_leak`, `security.output_pii_exfiltration`, `security.output_secret_exfiltration`).
+* **Sliding-Window Rate Limiter (`lta/rate_limiter.py` & `lta/app.py`):** Enforces per-tenant request-per-minute limits via a Redis Lua sliding-window script with thread-safe in-memory fallback, alongside dedicated failed-authentication rate limiting (`429`) keyed by client IP.
+* **Tamper-Evident Audit Ledger (`lta/audit_ledger.py`):** Appends hash-chained audit records with payload SHA-256 digests (`payload_sha256` and `entry_hash`), supports chain verification (`/v1/audit/verify`), and exports SIEM-ready JSONL (`/v1/audit/export`).
+* **Zero-Retention Shadow Ingest (`/v1/shadow/ingest`):** Accepts shadow evaluation prompts (`202 Accepted`) with bearer/API-key authentication and returns a 64-character `input_sha256` digest without retaining raw prompt content.
 
 ---
 
-## Architecture & Capabilities
+## HTTP Endpoints
 
-* **Ingress & Strict Schema Validation (`lta/app.py`):**
-  * Enforces payload size caps (`LTA_MAX_BODY_BYTES`, default `262144` bytes / `256 KiB` -> HTTP `413`), hardened response headers (`X-Request-ID`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`), and strict Pydantic v2 validation (`extra="forbid"`) with finite-float metadata checks.
-* **Multi-Turn Policy & Evasion Engine (`lta/policy_engine.py` / `app/core/sanitizer.py`):**
-  * Normalizes and inspects prompts and responses against prompt injection, Unicode BiDi/homoglyph evasion, system-role spoofing, anomaly floods, and sensitive data leakage.
-  * Redacts PII and secrets (SSNs, Luhn PANs, multi-state CDLs, API keys/tokens) while preserving benign identifiers/POs and blocking raw secret/PII exfiltration.
-* **Zero-Retention Shadow Ingest (`POST /v1/shadow/ingest`):**
-  * Authenticates shadow ingest requests via `Authorization: Bearer <LTA_SHADOW_KEY>` using constant-time comparison (`hmac.compare_digest`), computes a 64-character `input_sha256` digest, records zero-retention audit metadata (`zero_retention: true`, `audit_id`, `input_sha256`), and never stores or echoes raw prompts.
-* **Cryptographic Audit Ledger (`lta/audit_ledger.py`):**
-  * Appends `ALLOW`, `ALLOW_REDACTED`, and `BLOCK` events into a tamper-evident SHA-256 hash chain verifiable via `GET /v1/audit/verify` and exportable as NDJSON via `GET /v1/audit/export`.
-* **Tenant Auth, Rate Limiting & Telemetry (`lta/config.py`, `lta/rate_limiter.py`, `lta/metrics.py`):**
-  * Enforces tenant/admin credentials (`X-API-Key` / `Authorization: Bearer`), sliding-window RPM rate limits (`429` + `X-RateLimit-Remaining`), and Prometheus metrics exposition (`GET /metrics`).
-
----
-
-## Repository Structure & Documentation Map
-
-```text
-Lucid-Truth-Audit-/
-├── README.md                          # Gateway overview, visuals, env vars, API reference, benchmarks & license
-├── LICENSE                            # Apache 2.0 + Commercial Enterprise Licensing Notice
-├── lta/
-│   ├── app.py                         # FastAPI gateway, ingress middleware, auth guards, /v1/shadow/ingest & audit routes
-│   ├── audit_ledger.py                # Tamper-evident SHA-256 hash-chained audit ledger & NDJSON export
-│   ├── config.py                      # Environment & tenant configuration loader (Settings.from_env)
-│   ├── metrics.py                     # Prometheus metrics registry
-│   ├── policy_engine.py               # Input/output guardrails, PII/secret redaction & evasion detection
-│   ├── providers.py                   # Upstream LLM adapters (Gemini, OpenAI, Anthropic, Mock)
-│   └── rate_limiter.py                # Sliding-window per-tenant rate limiter
-├── app/
-│   ├── api/shadow.py                  # Shadow router schemas, tenant key verification & ZeroRetentionAuditRecord
-│   └── core/sanitizer.py              # Unicode BiDi, NFKC & homoglyph sanitizer
-├── scripts/
-│   └── run_smoketest.py               # 9-check live smoke test + Chart.js HTML compliance report generator
-├── tests/
-│   ├── test_audit.py                  # Prompt injection, encoding evasion, auth & redaction tests
-│   ├── test_audit_ledger_and_providers.py # Hash chain tamper detection, JSONL export & upstream TLS checks
-│   ├── test_deployment_validation.py  # Dockerfile, Render, Compose & CI validation checks
-│   ├── test_enterprise_gateway.py     # RBAC, policy packs (PCI/HIPAA/FMCSA), rate limits & multi-turn spoofing
-│   ├── test_evidence_chain.py         # Evidence creation, tenant isolation, persistence & tamper detection
-│   ├── test_production_suite.py       # Hardened obfuscation, CDL redaction, HOS/weight & CSV formula checks
-│   ├── test_shadow_ingest.py          # Shadow ingest auth & zero-retention audit tests
-│   └── test_vector2_pii.py & test_vector4_logistics.py # PII pretext/Luhn & FMCSA dispatch/BOL tests
-├── reports/                           # CI validation & coverage artifacts (uploaded in validation run)
-└── .github/workflows/
-    └── smoketest.yml                  # Automated CI live verification & HTML report artifact upload
-```
+| Method & Path | Auth / Role | Purpose |
+| :--- | :--- | :--- |
+| `GET /health`, `GET /healthz` | Public | Returns service health, version (`2.4.0`), loaded policy count (`policies_loaded`), and policy packs |
+| `GET /readyz` | Public | Checks database reachability, loaded policy packs, and tenant configuration (`200` or `503`) |
+| `GET /v1/policies` | Tenant API Key | Lists the caller's active policy pack and available policy packs |
+| `POST /api/v1/guard` | Tenant API Key | Evaluates a single `model_input` payload through input guardrails, upstream call, and output guardrails |
+| `POST /v1/chat/completions` | Tenant API Key | OpenAI-compatible chat completion proxy with policy enforcement and `lta_audit` metadata |
+| `POST /v1/shadow/ingest` | Shadow Key / Tenant Key | Zero-retention shadow ingest returning `202 Accepted` and a 64-character `input_sha256` |
+| `GET /v1/audit/verify` | Admin API Key | Verifies ledger hash-chain integrity (`chain_valid`, `first_broken_seq_id`) |
+| `GET /v1/audit/export` | Admin API Key | Exports audit records as JSONL (`application/x-ndjson`), optionally filtered by `tenant_id` |
+| `GET /metrics` | Admin API Key | Exposes Prometheus metrics (`lta_requests_total`, `lta_gateway_latency_ms`, etc.) |
 
 ---
 
-## Environment Variables
+## Environment Variables & Configuration
 
-Configure these variables in Render (or `.env` locally) and map `LTA_BASE_URL`, `LTA_API_KEY`, and `LTA_SHADOW_KEY` in **GitHub → Settings → Secrets and variables → Actions**:
+* `LTA_API_KEY` — Primary client/operator API key used for gateway requests and live gap testing.
+* `LTA_SHADOW_KEY` — Dedicated credential for `/v1/shadow/ingest` authentication.
+* `LTA_AUTH_FAIL_LIMIT_RPM` — Failed-authentication sliding-window threshold per client IP per minute before returning `429` (default: `20`).
+* `LTA_REDIS_FAIL_MODE` — Fallback mode when Redis is unavailable (`memory` or `closed`; default: `memory`).
+* `LTA_MAX_BODY_BYTES` — Maximum allowed request body size in bytes before returning `413` (default: `262144` / 256 KiB).
+* `LTA_DISABLE_DOCS` — Set to `true` to disable `/docs`, `/redoc`, and `/openapi.json` in hardened deployments.
+* `LTA_UPSTREAM_MODEL` — Fallback upstream model name when a tenant configuration does not specify one.
 
-| Variable | Required | Default | Description |
-| :--- | :---: | :--- | :--- |
-| `LTA_API_KEY` | Yes* | — | Primary gateway API key (`X-API-Key` or `Authorization: Bearer`) for single-key admin mode |
-| `LTA_SHADOW_KEY` | Yes | — | Dedicated secret token for `POST /v1/shadow/ingest` (`Authorization: Bearer`, `hmac.compare_digest`) |
-| `LTA_TENANT_KEYS` | Optional | — | JSON mapping of tenant IDs to API keys for tenant-scoped shadow/key verification |
-| `LTA_DEFAULT_PROVIDER` | No | `mock` | Upstream provider (`gemini`, `openai`, `anthropic`, `mock`) |
-| `LTA_UPSTREAM_MODEL` | No | `gpt-4o-mini` | Upstream model ID in single-key mode (`gemini-2.5-flash-lite` for Gemini live checks) |
-| `GEMINI_API_KEY` | If Gemini | — | Google AI Studio API key passed via `x-goog-api-key` when `LTA_DEFAULT_PROVIDER=gemini` |
-| `LTA_TENANTS_JSON` | No | — | Optional JSON tenant registry overriding single-key mode |
-| `LTA_MAX_BODY_BYTES` | No | `262144` | Maximum allowed HTTP request payload size in bytes (`413` when exceeded) |
-| `LTA_DISABLE_DOCS` | No | `false` | Set `true` to disable `/docs`, `/redoc`, and `/openapi.json` |
-| `LTA_BASE_URL` | CI / Test | `https://lucid-truth-audit.onrender.com` | Target base URL for `scripts/run_smoketest.py` |
-| `LTA_TIMEOUT_S` | CI / Test | `45` | HTTP timeout in seconds per smoke-test check |
-| `LTA_REPORT_PATH` | CI / Test | `lta_smoketest_report.html` | Output path for the generated HTML compliance report |
+> **Security Note:** Store API keys and shadow credentials without trailing newlines or whitespace, avoid publicly documented default keys in live environments, and rotate keys immediately if exposed.
 
 ---
 
-## API Reference & Quick `curl` Checks
+## Running Locally, via Docker, or on Render
 
-| Method | Endpoint | Auth | Purpose |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/health`, `/healthz` | Public | Liveness check and loaded policy pack count |
-| `GET` | `/readyz` | Public | Readiness check (`db_ok`, `database_ok`, `policies_ok`, `tenants_configured`) |
-| `GET` | `/v1/policies` | `X-API-Key` / `Bearer` | List active tenant policy pack and available policy packs |
-| `POST` | `/api/v1/guard` | `X-API-Key` / `Bearer` | Guarded prompt execution (`{"model_input": "...", "metadata": {...}}`) |
-| `POST` | `/v1/chat/completions` | `X-API-Key` / `Bearer` | OpenAI-compatible guarded chat completions with `lta_audit` metadata |
-| `POST` | `/v1/shadow/ingest` | `Bearer <LTA_SHADOW_KEY>` | Zero-retention shadow telemetry ingest (`202 Accepted`, 64-char `input_sha256`) |
-| `GET` | `/v1/audit/verify` | Admin `X-API-Key` | Verify cryptographic SHA-256 hash-chain integrity across all ledger records |
-| `GET` | `/v1/audit/export` | Admin `X-API-Key` | Export hash-chained audit records as `application/x-ndjson` |
-| `GET` | `/metrics` | Admin `X-API-Key` | Prometheus text exposition metrics |
+### Local Development
 
 ```bash
-# 1. Guarded Prompt
-curl -sS -X POST "[https://lucid-truth-audit.onrender.com/api/v1/guard](https://lucid-truth-audit.onrender.com/api/v1/guard)" \
-  -H "X-API-Key: $LTA_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"model_input": "Summarize Q4 fleet safety metrics.", "metadata": {"source": "cli"}}'
+python -m pip install -r requirements.txt
+uvicorn lta.app:app --host 0.0.0.0 --port 8000 --reload
 
-# 2. Zero-Retention Shadow Ingest (BiDi + Homoglyph test payload)
-curl -sS -X POST "[https://lucid-truth-audit.onrender.com/v1/shadow/ingest](https://lucid-truth-audit.onrender.com/v1/shadow/ingest)" \
-  -H "Authorization: Bearer $LTA_SHADOW_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"prompt": "SSN 123-45-6789 \u202e p\u0430ssword", "request_id": "pilot-req-001", "model_target": "gemini-2.5-flash-lite"}'
+Docker Build & Run
+docker build -t lucid-truth-audit:2.4.0 .
+docker run --rm -p 8000:8000 \
+  -e LTA_API_KEY="<your-api-key>" \
+  -e LTA_SHADOW_KEY="<your-shadow-key>" \
+  lucid-truth-audit:2.4.0
 
-# 3. Verify Audit Hash Chain
-curl -sS "[https://lucid-truth-audit.onrender.com/v1/audit/verify](https://lucid-truth-audit.onrender.com/v1/audit/verify)" \
-  -H "X-API-Key: $LTA_API_KEY"
-```
+Render Deployment
+Deploy from the repository with /healthz configured as the health check path and persistent storage mounted for the audit database so hash-chain continuity survives restarts.
+Benchmarks & Test Suites
+Latest Benchmark Snapshot
+| Suite / Metric | Result | Timing / Notes |
+|---|---|---|
+| Offline Suite (--ignore=test_lta_gaps.py) | 101 / 101 passed (0 failed, 0 skipped) | ~3.2s–4.0s on Python 3.11.18 (pytest 9.2.0) |
+| Statement & Branch Coverage | 78.09% total (minimum gate: 60%) | HTML & JSON artifacts in reports/ |
+| Live Smoke — Health (/healthz) | 200 OK | 229.2 ms client round trip |
+| Live Smoke — Readiness (/readyz) | 200 OK | 117.4 ms client round trip |
+| Live Smoke — Guard Missing Key | Rejected (401 / 403) | 108.0 ms client round trip |
+| Live Smoke — Shadow Auth Check | Rejected (401 / 403) | 120.4 ms client round trip |
+| Live Smoke — Guard Clean Prompt (Upstream LLM) | Allowed (200 OK) | 5,140.0 ms (includes upstream LLM latency) |
+| Live Smoke — Guard PII Redaction | Redacted (ALLOW_REDACTED) | 950.6 ms client round trip |
+| Live Smoke — Guard Evasion / Injection | Blocked (400) | 111.6 ms client round trip |
+| Live Smoke — Audit Ledger Verify (/v1/audit/verify) | Verified (200 OK) | 107.7 ms client round trip |
+| Live Smoke — Shadow BiDi+Homoglyph | Accepted (202 OK) | 129.2 ms client round trip |
+1. Offline Unit, Policy & Gateway Suite (101 Tests)
+mkdir -p reports
+python -m pytest -o addopts="" -v \
+  --ignore=test_lta_gaps.py \
+  --cov=app --cov=lta \
+  --cov-report=term-missing \
+  --cov-report=html:reports/coverage \
+  --cov-fail-under=60 \
+  --html=reports/compliance_audit.html \
+  --self-contained-html \
+  --json-report \
+  --json-report-file=reports/audit_ledger.json
 
----
+2. Live Deployment Gap Verification (test_lta_gaps.py)
+pip install pytest requests
+LTA_BASE_URL=[https://lucid-truth-audit.onrender.com](https://lucid-truth-audit.onrender.com) \
+LTA_API_KEY="<your-api-key>" \
+LTA_SHADOW_KEY="<optional-shadow-key>" \
+python -m pytest -o addopts="" -v test_lta_gaps.py
 
-## Validation & Test Suite Results
+When test_rate_limit_on_bad_keys triggers 429 on repeated invalid keys within a 60-second window, test_audit_verify_reports_something_meaningful waits for the sliding window to clear before re-checking /v1/audit/verify.
+3. CI/CD Supply-Chain & Build Checks
+CI pipelines validate dependency hygiene with pip-audit, verify container builds with docker build, enforce minimum coverage thresholds, and archive HTML/JSON compliance artifacts under reports/.
 
-### Automated `pytest` Suite (`compliance_audit.html` · `2026-11-25 20:04:37 UTC`)
-* **Result:** **101/101 passed** (`0` failed, `0` skipped, `0` errors) in `6s` (`00:00:06`) on Python `3.12.16` (`pytest 9.2.0`, `pytest-cov 6.3.0`, `CI=true`).
-* **Validated Domains:** Prompt injection and obfuscation (zero-width, soft-hyphen, combining marks, leetspeak, Cyrillic homoglyphs, Base64, hex), social-engineering PII pretexts, indirect BOL prompt injection, PII/secret/Luhn PAN/multi-state CDL redaction, output exfiltration blocking, PCI/HIPAA/FMCSA policy packs, 60/7 and 70/8 HOS/weight/permit rules, rate limiting (`429`), CSV formula escaping, auth/RBAC fail-closed checks, and audit hash-chain tamper detection[span_3](start_span)[span_3](end_span).
-
-```text
-Pytest Suite Pass Breakdown (101/101 Passed · 100%)
-───────────────────────────────────────────────────────────────────────────────
-Production & Obfuscation (test_production_suite.py)     28 |███████████       |
-Core Audit, Injection & Auth (test_audit.py)            16 |██████            |
-Enterprise Gateway & RBAC (test_enterprise_gateway.py)  14 |██████            |
-Logistics & FMCSA Vectors (test_vector4_logistics.py)   11 |████              |
-Ledger, Providers & Evidence Chain                       9 |████              |
-Resilience & Rate Limiting (test_vector3_resilience.py)  8 |███               |
-PII & Secret Guardrails (test_vector2_pii.py)            8 |███               |
-Deployment & Shadow Ingest                               7 |███               |
-```
-
-### Shadow Router Coverage (`z_cfb6adc3f81c8e3c_shadow_py.html` · `2026-11-25 20:04 UTC`)
-* **Coverage:** **97%** (`77` run, `2` missing, `1` partial branch out of `79` statements via `coverage.py 7.17.5`).
-* **Remaining Uncovered Lines:** Line `41` (`return {}` when `LTA_TENANT_KEYS` is unset/empty in `_load_tenant_key_map`) and line `128` (`logger.info(record.model_dump_json())` in `write_audit_record`)[span_4](start_span)[span_4](end_span).
-
-### CI Validation Artifact Upload (`2026-11-25T20:04:35.9606075Z`)
-* **Artifact:** `lucid-truth-audit-3.11-validation` (`lucid-truth-audit-3.11-validation.zip`, Artifact ID `15059735258`)
-* **Payload:** `reports/` (`26` files, `193,334` bytes, Python `3.11.18` matrix runner)
-* **Artifact SHA-256:** `c56b18ca0644b8113bbae4f93d5a5ae000fc1c467733565fb60008292d001e20`
-* **Download URL:** `https://github.com/stickneycorey1-source/Lucid-Truth-Audit-/actions/runs/45691354070/artifacts/15059735258`[span_5](start_span)[span_5](end_span)
-
-### Local Test & Smoke Commands
-```bash
-python -m py_compile lta/app.py scripts/run_smoketest.py
-PYTHONPATH=. python -m pytest -o addopts="" -v tests/test_shadow_ingest.py tests/test_enterprise_gateway.py
-
-LTA_BASE_URL="[https://lucid-truth-audit.onrender.com](https://lucid-truth-audit.onrender.com)" \
-LTA_API_KEY="$LTA_API_KEY" \
-LTA_SHADOW_KEY="$LTA_SHADOW_KEY" \
-python scripts/run_smoketest.py
-```
-
----
-
-## Live Smoke Test Baseline & Latency Benchmarks (`2026-11-25 21:41:51 UTC`)
-
-* **Target:** `https://lucid-truth-audit.onrender.com`
-* **Compliance Score:** `100.0%` (`9/9` checks passed)
-* **Zero-Retention Policy:** `Verified`
-* **Latest Ledger / SHA-256 Reference:** `5c303fae2ce8e0c4e581e09f3d1445a3e6a67f77ad4d473d94df6efc10dc580d`[span_6](start_span)[span_6](end_span)
-
-### Latency Bar Chart (`ms`, Relative to `5140.0 ms` Peak)
-
-```text
-1. Health (/healthz)     229.2 ms   |██                                      | 200 PASS
-2. Readiness (/readyz)    117.4 ms   |█                                       | 200 PASS
-3. Guard Missing Key      108.0 ms   |█                                       | 403 PASS
-4. Shadow Auth Check      120.4 ms   |█                                       | 401 PASS
-5. Guard Clean Prompt    5140.0 ms   |████████████████████████████████████████ | 200 PASS
-6. Guard PII Redaction    950.6 ms   |███████                                 | 200 PASS
-7. Guard Evasion / Inj.   111.6 ms   |█                                       | 400 PASS
-8. Audit Ledger Verify    107.7 ms   |█                                       | 200 PASS
-9. Shadow BiDi+Homoglyph  129.2 ms   |█                                       | 202 PASS
-```
-
-### Pass / Fail & Coverage Visual Summary
-
-```text
-Live Smoke Suite:  [████████████████████████████████████████] 9/9  (100.0% PASS)
-Pytest Suite:      [████████████████████████████████████████] 101/101 (100.0% PASS, 6s)
-shadow.py Cov.:    [███████████████████████████████████████░] 97% (77/79 stmts)
-```
-
-| # | Check | Endpoint | Latency | Visual Scale (`5.1s` max) | HTTP | Status | Detail |
-| :--- | :--- | :--- | :---: | :--- | :---: | :---: | :--- |
-| **1** | Health / Liveness (`/healthz`) | `/healthz` | `229.2 ms` | `▏` | `200` | `PASS` | `OK` |
-| **2** | Readiness Check (`/readyz`) | `/readyz` | `117.4 ms` | `▏` | `200` | `PASS` | `OK` |
-| **3** | Guard Rejects Missing Key | `/api/v1/guard` | `108.0 ms` | `▏` | `403` | `PASS` | `OK` |
-| **4** | Shadow Ingest (`/v1/shadow/ingest`) | `/v1/shadow/ingest` | `120.4 ms` | `▏` | `401` | `PASS` | `Mounted & auth-guarded` |
-| **5** | Guard Clean Prompt | `/api/v1/guard` | `5140.0 ms` | `████████████████████` | `200` | `PASS` | `OK` |
-| **6** | Guard PII Redaction (SSN + Secret) | `/api/v1/guard` | `950.6 ms` | `████` | `200` | `PASS` | `Raw SSN & secret not leaked in response` |
-| **7** | Guard Injection / Evasion Handling | `/api/v1/guard` | `111.6 ms` | `▏` | `400` | `PASS` | `status=handled` |
-| **8** | Audit Ledger Verify (`/v1/audit/verify`) | `/v1/audit/verify` | `107.7 ms` | `▏` | `200` | `PASS` | `OK` |
-| **9** | Shadow Ingest (BiDi + Homoglyph) | `/v1/shadow/ingest` | `129.2 ms` | `▏` | `202` | `PASS` | `audit_id=shd-4-5c303fae2ce8`[span_7](start_span)[span_7](end_span) |
-
-* **Latency Benchmarks Summary:**
-  * **Gateway / Auth / Ledger / Shadow Fast Path (`Checks 1–4, 7–9`):** `107.7 ms` min (`#8 /v1/audit/verify`), `229.2 ms` max (`#1 /healthz`), `129.2 ms` on BiDi + Homoglyph shadow ingest (`#9`), and `107.7 ms` on audit ledger verification (`#8`).
-  * **Upstream LLM Guard Path (`Checks 5–6`):** `950.6 ms` (PII + secret redaction turn) and `5140.0 ms` (clean prompt turn)[span_8](start_span)[span_8](end_span).
-
----
-
-## License
-
-**Dual License: Apache License 2.0 + Commercial Enterprise Licensing**
-
-Copyright 2026 Corey Allen Stickney / Lucid Tech
-
-Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except in compliance with the License. You may obtain a copy of the License at:
-
-* `http://www.apache.org/licenses/LICENSE-2.0`
-
-Unless required by applicable law or agreed to in writing, software distributed under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the [LICENSE](./LICENSE) file for the specific language governing permissions and limitations under the License.
-
-### Commercial Enterprise Licensing Notice
-
-Commercial enterprise licenses, private VPC deployment rights, custom regulatory policy packs, SLA guarantees, and 30-day shadow deployment pilots for **Lucid-Truth-Audit** are available separately from **Corey Allen Stickney / Lucid Tech** (`https://github.com/stickneycorey1-source/Lucid-Truth-Audit-`).
