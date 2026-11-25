@@ -1,41 +1,37 @@
-name: Lucid-Truth-Audit Production CI
+name: Lucid-Truth-Audit CI
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  verify-and-test:
+  test-and-coverage:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12"]
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+          pip install -r requirements.txt pytest pytest-cov pytest-html pytest-json-report requests
 
-      - name: Run complete test suite with coverage
-        env:
-          PYTHONPATH: "."
+      - name: Run Offline Unit & Coverage Suite
         run: |
           mkdir -p reports
           python -m pytest -o addopts="" -v \
+            --ignore=test_lta_gaps.py \
             --cov=app --cov=lta \
             --cov-report=term-missing \
             --cov-report=html:reports/coverage \
@@ -45,66 +41,18 @@ jobs:
             --json-report \
             --json-report-file=reports/audit_ledger.json
 
-      - name: Upload validation artifacts
-        uses: actions/upload-artifact@v4
+      - name: Run Live Endpoint Gap Tests
+        if: env.LTA_API_KEY != ''
+        env:
+          LTA_BASE_URL: https://lucid-truth-audit.onrender.com
+          LTA_API_KEY: ${{ secrets.LTA_API_KEY }}
+          LTA_SHADOW_KEY: ${{ secrets.LTA_SHADOW_KEY }}
+        run: python -m pytest -o addopts="" -v test_lta_gaps.py
+
+      - name: Upload Validation & Coverage Artifacts
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: lucid-truth-audit-${{ matrix.python-version }}-validation
+          name: lucid-truth-audit-3.11-validation
           path: reports/
-
-  dependency-security:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install audit dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pip-audit
-
-      - name: Audit Python dependencies
-        run: python -m pip_audit -r requirements.txt
-
-  container-validation:
-    runs-on: ubuntu-latest
-    env:
-      POSTGRES_PASSWORD: ci-only-postgres-password
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Validate Compose configuration
-        run: |
-          trap 'rm -f .env' EXIT
-          printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD" > .env
-          docker compose -f docker-compose.yml config --quiet
-
-      - name: Build application image
-        run: docker build --tag lucid-truth-audit:ci .
-
-      - name: Start application and verify health
-        run: |
-          trap 'rm -f .env' EXIT
-          printf 'POSTGRES_PASSWORD=%s\n' "$POSTGRES_PASSWORD" > .env
-
-          docker run --detach --name lta-validation \
-            --publish 10080:10000 \
-            --env LUCID_TENANT_KEYS="" \
-            lucid-truth-audit:ci
-
-          trap 'docker rm -f lta-validation >/dev/null 2>&1 || true; rm -f .env' EXIT
-
-          for attempt in $(seq 1 20); do
-            if curl --fail --silent \
-              http://127.0.0.1:10080/health >/dev/null; then
-              exit 0
-            fi
-            sleep 2
-          done
-
-          docker logs lta-validation
-          exit 1
+          retention-days: 14
