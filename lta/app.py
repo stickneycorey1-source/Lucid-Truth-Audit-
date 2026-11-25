@@ -566,4 +566,41 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         x_lta_policy: Optional[str] = Header(default=None),
         x_lta_provider: Optional[str] = Header(default=None),
     ) -> Dict[str, Any]:
-        default_model = getattr(tenan
+        default_model = getattr(tenant, "default_model", None) or getattr(
+            cfg, "default_model", "gpt-4o-mini"
+        )
+        result = await _run_pipeline(
+            tenant=tenant,
+            endpoint="/v1/chat/completions",
+            messages=[{"role": m.role, "content": m.content} for m in body.messages],
+            model=body.model or default_model,
+            policy_override=x_lta_policy,
+            provider_override=x_lta_provider,
+            metadata=body.metadata,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+        )
+        return result
+
+    @app.post("/api/v1/guard")
+    async def guard_legacy(
+        body: LegacyGuardRequest,
+        tenant: TenantConfig = Depends(authenticate_tenant),
+        x_lta_policy: Optional[str] = Header(default=None),
+        x_lta_provider: Optional[str] = Header(default=None),
+    ) -> Dict[str, Any]:
+        default_model = getattr(tenant, "default_model", None) or getattr(
+            cfg, "default_model", "gpt-4o-mini"
+        )
+        result = await _run_pipeline(
+            tenant=tenant,
+            endpoint="/api/v1/guard",
+            messages=[{"role": "user", "content": body.model_input}],
+            model=default_model,
+            policy_override=x_lta_policy,
+            provider_override=x_lta_provider,
+            metadata=body.metadata,
+        )
+        return result
+
+    return app
