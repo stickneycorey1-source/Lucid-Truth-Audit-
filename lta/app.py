@@ -195,14 +195,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
         return tenant
 
-    @app.get("/health")
-    @app.get("/healthz")
-    async def healthz() -> Dict[str, Any]:
-        return {
-            "status": "ok",
-            "version": __version__,
-            "policies_loaded": len(engine.packs),
-        }
+    @@app.get("/health")
+@app.get("/healthz")
+async def healthz() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "version": __version__,
+        "policies_loaded": len(engine.packs),
+    }
 
     @app.get("/readyz")
     async def readyz() -> Dict[str, Any]:
