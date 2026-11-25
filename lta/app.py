@@ -1,312 +1,237 @@
-"""Lucid-Truth-Audit Enterprise FastAPI Application (Hardened v2.4.1)."""
+"""Lucid-Truth-Audit (v2.4.1) FastAPI enterprise AI security & compliance gateway."""
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Dict, List, Literal, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-import httpx
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from lta import __version__
 from lta.audit_ledger import AuditLedger
-from lta.config import Settings, TenantConfig
+from lta.config import Settings, TenantConfig, load_settings
 from lta.metrics import MetricsRegistry
 from lta.policy_engine import PolicyEngine
 from lta.providers import UpstreamProviderError, call_upstream
 from lta.rate_limiter import SlidingWindowRateLimiter
 
+logger = logging.getLogger("lta.app")
 
-MAX_BODY_BYTES = int(os.getenv("LTA_MAX_BODY_BYTES", str(256 * 1024)))
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     role: Literal["system", "user", "assistant"]
-    content: str = Field(..., min_length=1, max_length=65536)
-
-    @field_validator("content")
-    @classmethod
-    def _non_blank_content(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("Message content cannot be blank or whitespace-only.")
-        return v
+    content: str = Field(..., min_length=1)
 
 
 class OpenAIChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: Optional[str] = None
-    messages: List[ChatMessage] = Field(..., min_length=1, max_length=50)
+    model: str = Field(default="gpt-4o-mini", min_length=1)
+    messages: List[ChatMessage] = Field(..., min_length=1)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
-    max_tokens: Optional[int] = Field(default=None, ge=1, le=32768)
-    metadata: Optional[Dict[str, Any]] = None
+    max_tokens: Optional[int] = Field(default=None, ge=1, le=128000)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_metadata(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        for k, v in value.items():
+            if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+                raise ValueError(f"Non-finite float in metadata key '{k}'")
+        return value
 
 
 class LegacyGuardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model_input: str = Field(..., min_length=1, max_length=65536)
-    metadata: Optional[Dict[str, Any]] = None
+    model_input: str = Field(..., min_length=1)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
-    @field_validator("model_input")
+    @field_validator("metadata")
     @classmethod
-    def _non_blank_input(cls, v: str) -> str:
-        if not v.strip():
-            raise ValueError("model_input cannot be blank or whitespace-only.")
-        return v
+    def _validate_metadata(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        for k, v in value.items():
+            if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+                raise ValueError(f"Non-finite float in metadata key '{k}'")
+        return value
+
+
+@dataclass
+class GatewayRuntime:
+    settings: Settings
+    policy_engine: PolicyEngine
+    audit_ledger: AuditLedger
+    rate_limiter: SlidingWindowRateLimiter
+    metrics: MetricsRegistry
+
+
+def _extract_api_key(
+    x_api_key: Optional[str],
+    authorization: Optional[str],
+) -> Optional[str]:
+    if x_api_key and x_api_key.strip():
+        return x_api_key.strip()
+    if authorization and authorization.strip():
+        parts = authorization.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1].strip():
+            return parts[1].strip()
+    return None
+
+
+def _resolve_request_id(raw_id: Optional[str]) -> str:
+    if raw_id and _REQUEST_ID_RE.match(raw_id.strip()):
+        return raw_id.strip()
+    return str(uuid.uuid4())
+
+
+def _apply_security_headers(response: Response, request_id: str) -> None:
+    response.headers["X-Request-ID"] = request_id
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+
+
+@asynccontextmanager
+async def _app_lifespan(fastapi_app: FastAPI):
+    runtime: Optional[GatewayRuntime] = getattr(fastapi_app.state, "lta_runtime", None)
+    logger.info("Lucid-Truth-Audit startup complete")
+    try:
+        yield
+    finally:
+        if runtime is not None:
+            try:
+                runtime.audit_ledger.close()
+            except Exception as exc:
+                logger.warning("Error closing audit ledger during shutdown: %s", exc)
+        logger.info("Lucid-Truth-Audit shutdown complete")
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
-    cfg = settings or Settings.from_env()
-    engine = PolicyEngine(cfg.policy_dir)
-    ledger = AuditLedger(cfg.audit_db_url)
-    limiter = SlidingWindowRateLimiter(redis_url=cfg.redis_url)
+    cfg = settings or load_settings()
+    policy_engine = PolicyEngine(cfg.policy_dir)
+    audit_ledger = AuditLedger(cfg.audit_db_url)
+    rate_limiter = SlidingWindowRateLimiter(
+        redis_url=cfg.redis_url,
+        fail_mode=cfg.redis_fail_mode,
+    )
     metrics = MetricsRegistry()
-    disable_docs = os.getenv("LTA_DISABLE_DOCS", "false").lower().strip() in (
-        "1",
-        "true",
-        "yes",
+    runtime = GatewayRuntime(
+        settings=cfg,
+        policy_engine=policy_engine,
+        audit_ledger=audit_ledger,
+        rate_limiter=rate_limiter,
+        metrics=metrics,
     )
 
-    @asynccontextmanager
-    async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        application.state.http_client = httpx.AsyncClient(timeout=cfg.upstream_timeout_s)
-        try:
-            yield
-        finally:
-            await application.state.http_client.aclose()
-            ledger.close()
+    docs_url = None if cfg.disable_docs else "/docs"
+    redoc_url = None if cfg.disable_docs else "/redoc"
+    openapi_url = None if cfg.disable_docs else "/openapi.json"
 
-    app = FastAPI(
-        title="Lucid-Truth-Audit Enterprise Gateway",
-        version=__version__,
-        lifespan=lifespan,
-        docs_url=None if disable_docs else "/docs",
-        redoc_url=None if disable_docs else "/redoc",
-        openapi_url=None if disable_docs else "/openapi.json",
-        description=(
-            "Drop-in OpenAI-compatible AI security, PII redaction, and regulatory "
-            "compliance gateway with YAML policy packs and SHA-256 hash-chained "
-            "audit logs."
-        ),
+    fastapi_app = FastAPI(
+        title="Lucid-Truth-Audit Gateway",
+        version="2.4.1",
+        docs_url=docs_url,
+        redoc_url=redoc_url,
+        openapi_url=openapi_url,
+        lifespan=_app_lifespan,
     )
-    app.state.settings = cfg
-    app.state.engine = engine
-    app.state.ledger = ledger
-    app.state.limiter = limiter
-    app.state.metrics = metrics
-    app.state.http_client = None
+    fastapi_app.state.lta_runtime = runtime
+    fastapi_app.state.audit_ledger = audit_ledger
 
-    @app.middleware("http")
-    async def security_and_body_limit_middleware(
-        request: Request,
-        call_next: Any,
-    ) -> Response:
-        req_id = (
-            (request.headers.get("x-request-id") or "").strip()[:64]
-            or str(uuid.uuid4())
-        )
-        sec_headers = {
-            "X-Request-ID": req_id,
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            "X-Frame-Options": "DENY",
-        }
+    @fastapi_app.middleware("http")
+    async def _ingress_middleware(request: Request, call_next):
+        req_id = _resolve_request_id(request.headers.get("X-Request-ID"))
+        request.state.request_id = req_id
 
         content_length = request.headers.get("content-length")
-        if (
-            content_length
-            and content_length.isdigit()
-            and int(content_length) > MAX_BODY_BYTES
-        ):
-            return JSONResponse(
-                status_code=413,
-                content={
-                    "detail": (
-                        f"Payload Too Large: exceeds {MAX_BODY_BYTES} byte limit."
-                    )
-                },
-                headers=sec_headers,
-            )
-
-        if request.method in ("POST", "PUT", "PATCH") and not (
-            content_length and content_length.isdigit()
-        ):
-            chunks: List[bytes] = []
-            total = 0
-            async for chunk in request.stream():
-                total += len(chunk)
-                if total > MAX_BODY_BYTES:
-                    return JSONResponse(
+        if content_length is not None:
+            try:
+                if int(content_length) > cfg.max_body_bytes:
+                    resp = JSONResponse(
                         status_code=413,
-                        content={
-                            "detail": (
-                                f"Payload Too Large: exceeds "
-                                f"{MAX_BODY_BYTES} byte limit."
-                            )
-                        },
-                        headers=sec_headers,
+                        content={"detail": "Request body exceeds maximum allowed size"},
                     )
-                chunks.append(chunk)
-            request._body = b"".join(chunks)
+                    _apply_security_headers(resp, req_id)
+                    return resp
+            except ValueError:
+                pass
+
+        body_bytes = await request.body()
+        if len(body_bytes) > cfg.max_body_bytes:
+            resp = JSONResponse(
+                status_code=413,
+                content={"detail": "Request body exceeds maximum allowed size"},
+            )
+            _apply_security_headers(resp, req_id)
+            return resp
 
         response = await call_next(request)
-        for key, value in sec_headers.items():
-            response.headers[key] = value
+        _apply_security_headers(response, req_id)
         return response
 
-    def _extract_key(
-        authorization: Optional[str] = Header(default=None),
-        x_api_key: Optional[str] = Header(default=None),
-    ) -> Optional[str]:
-        if x_api_key:
-            return x_api_key.strip()
-        if authorization and authorization.lower().startswith("bearer "):
-            return authorization[7:].strip()
-        return None
-
-    def authenticate_tenant(
-        raw_key: Optional[str] = Depends(_extract_key),
+    async def _authenticate_tenant(
+        request: Request,
+        x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
     ) -> TenantConfig:
         if not cfg.tenants:
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    "Fail-closed configuration error: "
-                    "no tenant API keys configured."
-                ),
+                detail="No tenant credentials configured on gateway",
             )
+        token = _extract_api_key(x_api_key, authorization)
+        if not token:
+            raise HTTPException(status_code=403, detail="Missing API credentials")
+        tenant = cfg.get_tenant_by_key(token)
+        if tenant is None:
+            raise HTTPException(status_code=403, detail="Invalid API credentials")
 
-        tenant = cfg.authenticate(raw_key)
-        if not tenant:
-            raise HTTPException(
-                status_code=403,
-                detail="Forbidden: Invalid or missing API key.",
-            )
-
-        allowed, remaining = limiter.check(
-            tenant.tenant_id,
-            tenant.rate_limit_rpm,
-        )
+        allowed, remaining = await rate_limiter.allow(tenant.tenant_id)
+        request.state.rate_limit_remaining = remaining
         if not allowed:
-            metrics.observe(
-                policy_pack=tenant.policy_pack,
-                http_status=429,
-                latency_ms=0.1,
-                vector="resilience.rate_limit_exceeded",
-            )
             raise HTTPException(
                 status_code=429,
-                detail=(
-                    "Too Many Requests: Tenant sliding-window "
-                    "rate limit exceeded."
-                ),
-                headers={"X-RateLimit-Remaining": str(remaining)},
+                detail="Tenant rate limit exceeded",
+                headers={"X-RateLimit-Remaining": str(max(0, remaining))},
             )
         return tenant
 
-    def require_admin(
-        tenant: TenantConfig = Depends(authenticate_tenant),
-    ) -> TenantConfig:
-        if tenant.role != "admin":
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "Forbidden: Admin role required for audit "
-                    "administration endpoints."
-                ),
-            )
+    async def _require_admin(tenant: TenantConfig = Depends(_authenticate_tenant)) -> TenantConfig:
+        if tenant.role.lower() != "admin":
+            raise HTTPException(status_code=403, detail="Admin role required")
         return tenant
-
-    @app.get("/health")
-    @app.get("/healthz")
-    async def healthz() -> Dict[str, Any]:
-        return {
-            "status": "ok",
-            "version": __version__,
-            "policies_loaded": len(engine.packs),
-        }
-
-    @app.get("/readyz")
-    async def readyz() -> Dict[str, Any]:
-        db_ok = ledger.ping()
-        if not db_ok or not cfg.tenants or not engine.packs:
-            raise HTTPException(status_code=503, detail="Gateway not ready")
-        return {
-            "status": "ready",
-            "database_ok": db_ok,
-            "policies_loaded": len(engine.packs),
-        }
-
-    @app.get("/metrics")
-    async def prometheus_metrics(
-        _: TenantConfig = Depends(require_admin),
-    ) -> Response:
-        return Response(
-            content=metrics.render_prometheus(),
-            media_type="text/plain; version=0.0.4; charset=utf-8",
-        )
-
-    @app.get("/v1/policies")
-    async def list_policies(
-        tenant: TenantConfig = Depends(authenticate_tenant),
-    ) -> Dict[str, Any]:
-        return {
-            "active_tenant": tenant.tenant_id,
-            "active_policy": tenant.policy_pack,
-            "available_policies": engine.list_packs(),
-        }
-
-    @app.get("/v1/audit/verify")
-    async def verify_audit_chain(
-        _: TenantConfig = Depends(require_admin),
-    ) -> Dict[str, Any]:
-        valid, total, broken_seq = ledger.verify_chain()
-        return {
-            "chain_valid": valid,
-            "total_records": total,
-            "first_broken_seq_id": broken_seq,
-        }
-
-    @app.get("/v1/audit/export")
-    async def export_audit_jsonl(
-        tenant_id: Optional[str] = None,
-        limit: int = 500,
-        _: TenantConfig = Depends(require_admin),
-    ) -> Response:
-        body = ledger.export_jsonl(
-            tenant_id=tenant_id,
-            limit=min(max(limit, 1), 5000),
-        )
-        return Response(
-            content=body,
-            media_type="application/x-ndjson",
-        )
 
     async def _run_pipeline(
         *,
+        request: Request,
+        response: Response,
         tenant: TenantConfig,
         endpoint: str,
         messages: List[Dict[str, str]],
         model: str,
-        policy_override: Optional[str],
-        provider_override: Optional[str],
-        metadata: Optional[Dict[str, Any]],
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+        metadata: Dict[str, Any],
+        x_lta_policy: Optional[str],
+        x_lta_provider: Optional[str],
     ) -> Dict[str, Any]:
-        t0 = time.perf_counter()
+        started = time.perf_counter()
+        is_admin = tenant.role.lower() == "admin"
 
-        if (policy_override or provider_override) and tenant.role != "admin":
-            latency_ms = (time.perf_counter() - t0) * 1000.0
-            rec = ledger.record(
+        if (x_lta_policy or x_lta_provider) and not is_admin:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            record = audit_ledger.record(
                 tenant_id=tenant.tenant_id,
                 endpoint=endpoint,
                 policy_pack=tenant.policy_pack,
@@ -315,42 +240,31 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 http_status=403,
                 vector="security.unauthorized_policy_override",
                 redactions=[],
-                raw_payload_for_digest=f"{policy_override}|{provider_override}",
+                raw_payload_for_digest="\n".join(m["content"] for m in messages),
                 latency_ms=latency_ms,
             )
             metrics.observe(
+                endpoint=endpoint,
                 policy_pack=tenant.policy_pack,
+                action="BLOCK",
                 http_status=403,
-                latency_ms=latency_ms,
                 vector="security.unauthorized_policy_override",
+                latency_ms=latency_ms,
             )
             raise HTTPException(
                 status_code=403,
-                detail={
-                    "error": (
-                        "Forbidden: Only admin keys may override policy pack "
-                        "or upstream provider."
-                    ),
-                    "vector": "security.unauthorized_policy_override",
-                    "audit_entry_hash": rec.entry_hash,
-                },
+                detail="Policy or provider overrides require admin privileges",
             )
 
-        policy_name = policy_override or tenant.policy_pack
-        provider_name = provider_override or tenant.provider
-
-        if policy_name not in engine.packs:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown policy pack: '{policy_name}'",
-            )
+        policy_name = (x_lta_policy.strip() if (is_admin and x_lta_policy) else tenant.policy_pack)
+        provider_name = (
+            x_lta_provider.strip() if (is_admin and x_lta_provider) else tenant.provider
+        )
 
         for idx, msg in enumerate(messages):
-            if msg["role"] == "system" and (
-                idx > 0 or tenant.role != "admin"
-            ):
-                latency_ms = (time.perf_counter() - t0) * 1000.0
-                rec = ledger.record(
+            if msg["role"] == "system" and (idx > 0 or not is_admin):
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                audit_ledger.record(
                     tenant_id=tenant.tenant_id,
                     endpoint=endpoint,
                     policy_pack=policy_name,
@@ -363,273 +277,270 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     latency_ms=latency_ms,
                 )
                 metrics.observe(
+                    endpoint=endpoint,
                     policy_pack=policy_name,
+                    action="BLOCK",
                     http_status=400,
-                    latency_ms=latency_ms,
                     vector="security.multi_turn_system_spoofing",
+                    latency_ms=latency_ms,
                 )
                 raise HTTPException(
                     status_code=400,
-                    detail={
-                        "error": "Blocked unauthorized system-role message",
-                        "vector": "security.multi_turn_system_spoofing",
-                        "audit_entry_hash": rec.entry_hash,
-                    },
+                    detail="Unauthorized or misplaced system role message blocked by policy",
                 )
 
-        sanitized_messages: List[Dict[str, str]] = []
-        all_redactions: List[str] = []
-        non_system_contents = [
-            msg["content"]
-            for msg in messages
-            if msg["role"] in ("user", "assistant")
-        ]
-        combined_input_for_digest = "\n".join(
-            msg["content"] for msg in messages
+        input_eval = policy_engine.evaluate_input(
+            policy_pack=policy_name,
+            messages=messages,
+            metadata=metadata,
         )
-
-        if len(non_system_contents) > 1:
-            combined_res = engine.evaluate_input(
-                " ".join(non_system_contents),
-                policy_name=policy_name,
-                metadata=metadata,
+        if not input_eval.allowed:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            audit_ledger.record(
+                tenant_id=tenant.tenant_id,
+                endpoint=endpoint,
+                policy_pack=policy_name,
+                provider=provider_name,
+                action="BLOCK",
+                http_status=400,
+                vector=input_eval.vector or "policy.input_blocked",
+                redactions=input_eval.redactions,
+                raw_payload_for_digest="\n".join(m["content"] for m in messages),
+                latency_ms=latency_ms,
             )
-            if not combined_res.allowed:
-                latency_ms = (time.perf_counter() - t0) * 1000.0
-                rec = ledger.record(
-                    tenant_id=tenant.tenant_id,
-                    endpoint=endpoint,
-                    policy_pack=policy_name,
-                    provider=provider_name,
-                    action="BLOCK",
-                    http_status=combined_res.http_status,
-                    vector=combined_res.vector,
-                    redactions=[],
-                    raw_payload_for_digest=combined_input_for_digest,
-                    latency_ms=latency_ms,
-                )
-                metrics.observe(
-                    policy_pack=policy_name,
-                    http_status=combined_res.http_status,
-                    latency_ms=latency_ms,
-                    vector=combined_res.vector,
-                )
-                raise HTTPException(
-                    status_code=combined_res.http_status,
-                    detail={
-                        "error": combined_res.reason,
-                        "vector": combined_res.vector,
-                        "policy_pack": policy_name,
-                        "audit_entry_hash": rec.entry_hash,
-                    },
-                )
+            metrics.observe(
+                endpoint=endpoint,
+                policy_pack=policy_name,
+                action="BLOCK",
+                http_status=400,
+                vector=input_eval.vector or "policy.input_blocked",
+                latency_ms=latency_ms,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=input_eval.reason or "Request blocked by security policy",
+            )
 
-        for msg in messages:
-            if msg["role"] in ("user", "assistant"):
-                in_res = engine.evaluate_input(
-                    msg["content"],
-                    policy_name=policy_name,
-                    metadata=metadata,
-                )
-                if not in_res.allowed:
-                    latency_ms = (time.perf_counter() - t0) * 1000.0
-                    rec = ledger.record(
-                        tenant_id=tenant.tenant_id,
-                        endpoint=endpoint,
-                        policy_pack=policy_name,
-                        provider=provider_name,
-                        action="BLOCK",
-                        http_status=in_res.http_status,
-                        vector=in_res.vector,
-                        redactions=[],
-                        raw_payload_for_digest=combined_input_for_digest,
-                        latency_ms=latency_ms,
-                    )
-                    metrics.observe(
-                        policy_pack=policy_name,
-                        http_status=in_res.http_status,
-                        latency_ms=latency_ms,
-                        vector=in_res.vector,
-                    )
-                    raise HTTPException(
-                        status_code=in_res.http_status,
-                        detail={
-                            "error": in_res.reason,
-                            "vector": in_res.vector,
-                            "policy_pack": policy_name,
-                            "audit_entry_hash": rec.entry_hash,
-                        },
-                    )
-
-                all_redactions.extend(in_res.redactions)
-                sanitized_messages.append(
-                    {
-                        "role": msg["role"],
-                        "content": in_res.sanitized_text,
-                    }
-                )
-            else:
-                sanitized_messages.append(msg)
-
+        sanitized_messages = input_eval.sanitized_messages
         try:
-            upstream = await call_upstream(
+            upstream_resp = await call_upstream(
                 provider=provider_name,
                 model=model,
                 messages=sanitized_messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout_s=cfg.upstream_timeout_s,
-                http_client=app.state.http_client,
             )
         except UpstreamProviderError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-        out_res = engine.evaluate_output(
-            upstream.content,
-            policy_name=policy_name,
-        )
-        latency_ms = (time.perf_counter() - t0) * 1000.0
-
-        if not out_res.allowed:
-            rec = ledger.record(
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            audit_ledger.record(
                 tenant_id=tenant.tenant_id,
                 endpoint=endpoint,
                 policy_pack=policy_name,
                 provider=provider_name,
                 action="BLOCK",
-                http_status=out_res.http_status,
-                vector=out_res.vector,
-                redactions=sorted(set(all_redactions)),
-                raw_payload_for_digest=combined_input_for_digest,
+                http_status=502,
+                vector="upstream.provider_error",
+                redactions=input_eval.redactions,
+                raw_payload_for_digest=upstream_resp_text if (upstream_resp_text := "") else "",
                 latency_ms=latency_ms,
             )
             metrics.observe(
+                endpoint=endpoint,
                 policy_pack=policy_name,
-                http_status=out_res.http_status,
+                action="BLOCK",
+                http_status=502,
+                vector="upstream.provider_error",
                 latency_ms=latency_ms,
-                vector=out_res.vector,
+            )
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        output_eval = policy_engine.evaluate_output(
+            policy_pack=policy_name,
+            content=upstream_resp.content,
+            metadata=metadata,
+        )
+        if not output_eval.allowed:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            audit_ledger.record(
+                tenant_id=tenant.tenant_id,
+                endpoint=endpoint,
+                policy_pack=policy_name,
+                provider=provider_name,
+                action="BLOCK",
+                http_status=400,
+                vector=output_eval.vector or "policy.output_blocked",
+                redactions=sorted(set(input_eval.redactions + output_eval.redactions)),
+                raw_payload_for_digest=upstream_resp.content,
+                latency_ms=latency_ms,
+            )
+            metrics.observe(
+                endpoint=endpoint,
+                policy_pack=policy_name,
+                action="BLOCK",
+                http_status=400,
+                vector=output_eval.vector or "policy.output_blocked",
+                latency_ms=latency_ms,
             )
             raise HTTPException(
-                status_code=out_res.http_status,
-                detail={
-                    "error": out_res.reason,
-                    "vector": out_res.vector,
-                    "policy_pack": policy_name,
-                    "audit_entry_hash": rec.entry_hash,
-                },
+                status_code=400,
+                detail=output_eval.reason or "Response blocked by output policy",
             )
 
-        all_redactions.extend(out_res.redactions)
-        unique_redactions = sorted(set(all_redactions))
-        final_action = (
-            "ALLOW_REDACTED"
-            if unique_redactions
-            else "ALLOW"
-        )
+        all_redactions = sorted(set(input_eval.redactions + output_eval.redactions))
+        final_action = "ALLOW_REDACTED" if all_redactions else "ALLOW"
+        latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
-        rec = ledger.record(
+        audit_rec = audit_ledger.record(
             tenant_id=tenant.tenant_id,
             endpoint=endpoint,
             policy_pack=policy_name,
-            provider=provider_name,
+            provider=upstream_resp.provider,
             action=final_action,
             http_status=200,
             vector=None,
-            redactions=unique_redactions,
-            raw_payload_for_digest=combined_input_for_digest,
+            redactions=all_redactions,
+            raw_payload_for_digest=output_eval.content,
             latency_ms=latency_ms,
         )
         metrics.observe(
+            endpoint=endpoint,
             policy_pack=policy_name,
+            action=final_action,
             http_status=200,
+            vector=None,
             latency_ms=latency_ms,
         )
 
-        rounded_latency = round(latency_ms, 3)
-        final_content = out_res.sanitized_text
-        audit_meta = {
-            "action": final_action,
-            "redactions": unique_redactions,
+        rem = getattr(request.state, "rate_limit_remaining", None)
+        if rem is not None:
+            response.headers["X-RateLimit-Remaining"] = str(max(0, rem))
+
+        lta_audit_meta = {
+            "seq_id": audit_rec.seq_id,
+            "entry_hash": audit_rec.entry_hash,
+            "payload_sha256": audit_rec.payload_sha256,
             "policy_pack": policy_name,
-            "tenant_id": tenant.tenant_id,
-            "provider": upstream.provider,
-            "entry_hash": rec.entry_hash,
-            "audit_entry_hash": rec.entry_hash,
-            "audit_seq_id": rec.seq_id,
-            "prev_hash": rec.prev_hash,
-            "payload_sha256": rec.payload_sha256,
-            "latency_ms": rounded_latency,
+            "action": final_action,
+            "redactions": all_redactions,
+            "latency_ms": latency_ms,
         }
 
         return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
             "object": "chat.completion",
             "created": int(time.time()),
-            "content": final_content,
+            "model": upstream_resp.model,
             "choices": [
                 {
                     "index": 0,
-                    "message": {
-                        "role": "assistant",
-                        "content": final_content,
-                    },
+                    "message": {"role": "assistant", "content": output_eval.content},
                     "finish_reason": "stop",
                 }
             ],
-            "model": upstream.model,
-            "provider": upstream.provider,
-            "prompt_tokens": upstream.prompt_tokens,
-            "completion_tokens": upstream.completion_tokens,
+            "usage": {
+                "prompt_tokens": upstream_resp.prompt_tokens,
+                "completion_tokens": upstream_resp.completion_tokens,
+                "total_tokens": upstream_resp.prompt_tokens + upstream_resp.completion_tokens,
+            },
+            "content": output_eval.content,
             "action": final_action,
-            "redactions": unique_redactions,
+            "redactions": all_redactions,
             "policy_pack": policy_name,
-            "audit_entry_hash": rec.entry_hash,
-            "audit_seq_id": rec.seq_id,
-            "latency_ms": rounded_latency,
-            "lta_audit": audit_meta,
+            "audit_entry_hash": audit_rec.entry_hash,
+            "audit_seq_id": audit_rec.seq_id,
+            "latency_ms": latency_ms,
+            "lta_audit": lta_audit_meta,
         }
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(
-        body: OpenAIChatCompletionRequest,
-        tenant: TenantConfig = Depends(authenticate_tenant),
-        x_lta_policy: Optional[str] = Header(default=None),
-        x_lta_provider: Optional[str] = Header(default=None),
-    ) -> Dict[str, Any]:
-        default_model = getattr(tenant, "default_model", None) or getattr(
-            cfg, "default_model", "gpt-4o-mini"
+    @fastapi_app.get("/health")
+    @fastapi_app.get("/healthz")
+    async def health() -> Dict[str, Any]:
+        return {
+            "status": "ok",
+            "version": "2.4.1",
+            "policies_loaded": len(policy_engine.available_policies()),
+        }
+
+    @fastapi_app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        db_ok = audit_ledger.ping()
+        policies_ok = len(policy_engine.available_policies()) > 0
+        if not db_ok or not policies_ok:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "not_ready",
+                    "db_ok": db_ok,
+                    "policies_ok": policies_ok,
+                },
+            )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "ready",
+                "db_ok": True,
+                "policies_ok": True,
+                "tenants_configured": len(cfg.tenants),
+            },
         )
-        result = await _run_pipeline(
+
+    @fastapi_app.get("/v1/policies")
+    async def list_policies(
+        tenant: TenantConfig = Depends(_authenticate_tenant),
+    ) -> Dict[str, Any]:
+        return {
+            "active_tenant": tenant.tenant_id,
+            "active_policy": tenant.policy_pack,
+            "available_policies": policy_engine.available_policies(),
+        }
+
+    @fastapi_app.post("/v1/chat/completions")
+    async def chat_completions(
+        payload: OpenAIChatCompletionRequest,
+        request: Request,
+        response: Response,
+        tenant: TenantConfig = Depends(_authenticate_tenant),
+        x_lta_policy: Optional[str] = Header(default=None, alias="X-LTA-Policy"),
+        x_lta_provider: Optional[str] = Header(default=None, alias="X-LTA-Provider"),
+    ) -> Dict[str, Any]:
+        msgs = [{"role": m.role, "content": m.content} for m in payload.messages]
+        return await _run_pipeline(
+            request=request,
+            response=response,
             tenant=tenant,
             endpoint="/v1/chat/completions",
-            messages=[{"role": m.role, "content": m.content} for m in body.messages],
-            model=body.model or default_model,
-            policy_override=x_lta_policy,
-            provider_override=x_lta_provider,
-            metadata=body.metadata,
-            temperature=body.temperature,
-            max_tokens=body.max_tokens,
+            messages=msgs,
+            model=payload.model,
+            temperature=payload.temperature,
+            max_tokens=payload.max_tokens,
+            metadata=payload.metadata,
+            x_lta_policy=x_lta_policy,
+            x_lta_provider=x_lta_provider,
         )
-        return result
 
-    @app.post("/api/v1/guard")
-    async def guard_legacy(
-        body: LegacyGuardRequest,
-        tenant: TenantConfig = Depends(authenticate_tenant),
-        x_lta_policy: Optional[str] = Header(default=None),
-        x_lta_provider: Optional[str] = Header(default=None),
+    @fastapi_app.post("/api/v1/guard")
+    async def legacy_guard(
+        payload: LegacyGuardRequest,
+        request: Request,
+        response: Response,
+        tenant: TenantConfig = Depends(_authenticate_tenant),
+        x_lta_policy: Optional[str] = Header(default=None, alias="X-LTA-Policy"),
+        x_lta_provider: Optional[str] = Header(default=None, alias="X-LTA-Provider"),
     ) -> Dict[str, Any]:
-        default_model = getattr(tenant, "default_model", None) or getattr(
-            cfg, "default_model", "gpt-4o-mini"
-        )
+        msgs = [{"role": "user", "content": payload.model_input}]
         result = await _run_pipeline(
+            request=request,
+            response=response,
             tenant=tenant,
             endpoint="/api/v1/guard",
-            messages=[{"role": "user", "content": body.model_input}],
-            model=default_model,
-            policy_override=x_lta_policy,
-            provider_override=x_lta_provider,
-            metadata=body.metadata,
+            messages=msgs,
+            model=tenant.default_model,
+            temperature=None,
+            max_tokens=None,
+            metadata=payload.metadata,
+            x_lta_policy=x_lta_policy,
+            x_lta_provider=x_lta_provider,
         )
         return {
             "status": "success",
@@ -637,14 +548,50 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             **result,
         }
 
-    return app
+    @fastapi_app.get("/v1/audit/verify")
+    async def audit_verify(
+        _: TenantConfig = Depends(_require_admin),
+    ) -> Dict[str, Any]:
+        valid, total_records, first_broken_seq_id = audit_ledger.verify_chain()
+        return {
+            "chain_valid": valid,
+            "total_records": total_records,
+            "first_broken_seq_id": first_broken_seq_id,
+        }
+
+    @fastapi_app.get("/v1/audit/export")
+    async def audit_export(
+        tenant_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=500, ge=1, le=5000),
+        _: TenantConfig = Depends(_require_admin),
+    ) -> PlainTextResponse:
+        ndjson = audit_ledger.export_jsonl(tenant_id=tenant_id, limit=limit)
+        return PlainTextResponse(
+            content=ndjson,
+            media_type="application/x-ndjson",
+        )
+
+    @fastapi_app.get("/metrics")
+    async def prometheus_metrics(
+        _: TenantConfig = Depends(_require_admin),
+    ) -> PlainTextResponse:
+        return PlainTextResponse(
+            content=metrics.render_prometheus(),
+            media_type="text/plain; version=0.0.4",
+        )
+
+    return fastapi_app
 
 
 def _init_module_app() -> Optional[FastAPI]:
+    """Initialize module-level ASGI app with explicit diagnostic logging."""
     try:
         return create_app()
     except Exception:
-        return None
+        logger.exception(
+            "Failed to initialize module-level FastAPI app in lta.app; check environment config"
+        )
+        raise
 
 
 app: Optional[FastAPI] = _init_module_app()
