@@ -9,7 +9,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -39,7 +39,7 @@ class OpenAIChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str = Field(default="gpt-4o-mini", min_length=1)
-    messages: List[ChatMessage] = Field(..., min_length=1)
+    messages: List[ChatMessage] = Field(..., min_length=1, max_length=50)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     max_tokens: Optional[int] = Field(default=None, ge=1, le=128000)
     metadata: Dict[str, Any] = Field(default_factory=dict)
@@ -103,6 +103,10 @@ def _apply_security_headers(response: Response, request_id: str) -> None:
     response.headers["X-Frame-Options"] = "DENY"
 
 
+def _blocked_detail(vector: str, message: str) -> Dict[str, str]:
+    return {"vector": vector, "message": message}
+
+
 @asynccontextmanager
 async def _app_lifespan(fastapi_app: FastAPI):
     runtime: Optional[GatewayRuntime] = getattr(fastapi_app.state, "lta_runtime", None)
@@ -161,7 +165,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 if int(content_length) > MAX_BODY_BYTES:
                     resp = JSONResponse(
                         status_code=413,
-                        content={"detail": "Request body exceeds maximum allowed size"},
+                        content={"detail": _blocked_detail("ingress.body_too_large", "Request body exceeds maximum allowed size")},
                     )
                     _apply_security_headers(resp, req_id)
                     return resp
@@ -172,7 +176,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if len(body_bytes) > MAX_BODY_BYTES:
             resp = JSONResponse(
                 status_code=413,
-                content={"detail": "Request body exceeds maximum allowed size"},
+                content={"detail": _blocked_detail("ingress.body_too_large", "Request body exceeds maximum allowed size")},
             )
             _apply_security_headers(resp, req_id)
             return resp
@@ -189,28 +193,37 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if not cfg.tenants:
             raise HTTPException(
                 status_code=500,
-                detail="No tenant credentials configured on gateway",
+                detail=_blocked_detail("auth.unconfigured", "No tenant credentials configured on gateway"),
             )
         token = _extract_api_key(x_api_key, authorization)
         if not token:
-            raise HTTPException(status_code=403, detail="Missing API credentials")
+            raise HTTPException(
+                status_code=403,
+                detail=_blocked_detail("auth.missing_credentials", "Missing API credentials"),
+            )
         tenant = cfg.authenticate(token)
         if tenant is None:
-            raise HTTPException(status_code=403, detail="Invalid API credentials")
+            raise HTTPException(
+                status_code=403,
+                detail=_blocked_detail("auth.invalid_credentials", "Invalid API credentials"),
+            )
 
         allowed, remaining = rate_limiter.check(tenant.tenant_id, tenant.rate_limit_rpm)
         request.state.rate_limit_remaining = remaining
         if not allowed:
             raise HTTPException(
                 status_code=429,
-                detail="Tenant rate limit exceeded",
+                detail=_blocked_detail("resilience.rate_limit_exceeded", "Tenant rate limit exceeded"),
                 headers={"X-RateLimit-Remaining": str(max(0, remaining))},
             )
         return tenant
 
     async def _require_admin(tenant: TenantConfig = Depends(_authenticate_tenant)) -> TenantConfig:
         if tenant.role.lower() != "admin":
-            raise HTTPException(status_code=403, detail="Admin role required")
+            raise HTTPException(
+                status_code=403,
+                detail=_blocked_detail("auth.admin_required", "Admin role required"),
+            )
         return tenant
 
     async def _run_pipeline(
@@ -232,6 +245,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         if (x_lta_policy or x_lta_provider) and not is_admin:
             latency_ms = (time.perf_counter() - started) * 1000.0
+            vector = "security.unauthorized_policy_override"
+            msg = "Policy or provider overrides require admin privileges"
             audit_ledger.record(
                 tenant_id=tenant.tenant_id,
                 endpoint=endpoint,
@@ -239,7 +254,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 provider=tenant.provider,
                 action="BLOCK",
                 http_status=403,
-                vector="security.unauthorized_policy_override",
+                vector=vector,
                 redactions=[],
                 raw_payload_for_digest="\n".join(m["content"] for m in messages),
                 latency_ms=latency_ms,
@@ -248,12 +263,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 policy_pack=tenant.policy_pack,
                 http_status=403,
                 latency_ms=latency_ms,
-                vector="security.unauthorized_policy_override",
+                vector=vector,
             )
-            raise HTTPException(
-                status_code=403,
-                detail="Policy or provider overrides require admin privileges",
-            )
+            raise HTTPException(status_code=403, detail=_blocked_detail(vector, msg))
 
         policy_name = x_lta_policy.strip() if (is_admin and x_lta_policy) else tenant.policy_pack
         provider_name = (
@@ -263,11 +275,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         try:
             policy_engine.get_pack(policy_name)
         except KeyError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=400,
+                detail=_blocked_detail("policy.unknown_pack", str(exc)),
+            ) from exc
 
         for idx, msg in enumerate(messages):
             if msg["role"] == "system" and (idx > 0 or not is_admin):
                 latency_ms = (time.perf_counter() - started) * 1000.0
+                vector = "security.multi_turn_system_spoofing"
+                reason = "Unauthorized or misplaced system role message blocked by policy"
                 audit_ledger.record(
                     tenant_id=tenant.tenant_id,
                     endpoint=endpoint,
@@ -275,7 +292,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     provider=provider_name,
                     action="BLOCK",
                     http_status=400,
-                    vector="security.multi_turn_system_spoofing",
+                    vector=vector,
                     redactions=[],
                     raw_payload_for_digest=msg["content"],
                     latency_ms=latency_ms,
@@ -284,14 +301,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     policy_pack=policy_name,
                     http_status=400,
                     latency_ms=latency_ms,
-                    vector="security.multi_turn_system_spoofing",
+                    vector=vector,
                 )
-                raise HTTPException(
-                    status_code=400,
-                    detail="Unauthorized or misplaced system role message blocked by policy",
-                )
+                raise HTTPException(status_code=400, detail=_blocked_detail(vector, reason))
 
-        # Evaluate each message turn individually as well as concatenated multi-turn context
         non_system_turns = [m["content"] for m in messages if m["role"] != "system"]
         scan_targets: List[Tuple[str, Optional[Dict[str, Any]]]] = [
             (m["content"], metadata if m["role"] == "user" else None) for m in messages
@@ -307,6 +320,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
             if not probe_eval.allowed:
                 latency_ms = (time.perf_counter() - started) * 1000.0
+                vector = probe_eval.vector or "policy.input_blocked"
+                reason = probe_eval.reason or "Request blocked by security policy"
                 audit_ledger.record(
                     tenant_id=tenant.tenant_id,
                     endpoint=endpoint,
@@ -314,7 +329,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     provider=provider_name,
                     action="BLOCK",
                     http_status=probe_eval.http_status,
-                    vector=probe_eval.vector or "policy.input_blocked",
+                    vector=vector,
                     redactions=probe_eval.redactions,
                     raw_payload_for_digest="\n".join(m["content"] for m in messages),
                     latency_ms=latency_ms,
@@ -323,11 +338,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     policy_pack=policy_name,
                     http_status=probe_eval.http_status,
                     latency_ms=latency_ms,
-                    vector=probe_eval.vector or "policy.input_blocked",
+                    vector=vector,
                 )
                 raise HTTPException(
                     status_code=probe_eval.http_status,
-                    detail=probe_eval.reason or "Request blocked by security policy",
+                    detail=_blocked_detail(vector, reason),
                 )
 
         sanitized_messages: List[Dict[str, str]] = []
@@ -357,6 +372,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
         except UpstreamProviderError as exc:
             latency_ms = (time.perf_counter() - started) * 1000.0
+            vector = "upstream.provider_error"
+            reason = str(exc)
             audit_ledger.record(
                 tenant_id=tenant.tenant_id,
                 endpoint=endpoint,
@@ -364,7 +381,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 provider=provider_name,
                 action="BLOCK",
                 http_status=502,
-                vector="upstream.provider_error",
+                vector=vector,
                 redactions=sorted(set(input_redactions)),
                 raw_payload_for_digest="\n".join(m["content"] for m in sanitized_messages),
                 latency_ms=latency_ms,
@@ -373,9 +390,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 policy_pack=policy_name,
                 http_status=502,
                 latency_ms=latency_ms,
-                vector="upstream.provider_error",
+                vector=vector,
             )
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            raise HTTPException(status_code=502, detail=_blocked_detail(vector, reason)) from exc
 
         output_eval = policy_engine.evaluate_output(
             text=upstream_resp.content,
@@ -383,6 +400,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
         if not output_eval.allowed:
             latency_ms = (time.perf_counter() - started) * 1000.0
+            vector = output_eval.vector or "policy.output_blocked"
+            reason = output_eval.reason or "Response blocked by output policy"
             audit_ledger.record(
                 tenant_id=tenant.tenant_id,
                 endpoint=endpoint,
@@ -390,7 +409,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 provider=provider_name,
                 action="BLOCK",
                 http_status=output_eval.http_status,
-                vector=output_eval.vector or "policy.output_blocked",
+                vector=vector,
                 redactions=sorted(set(input_redactions + output_eval.redactions)),
                 raw_payload_for_digest=upstream_resp.content,
                 latency_ms=latency_ms,
@@ -399,11 +418,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 policy_pack=policy_name,
                 http_status=output_eval.http_status,
                 latency_ms=latency_ms,
-                vector=output_eval.vector or "policy.output_blocked",
+                vector=vector,
             )
             raise HTTPException(
                 status_code=output_eval.http_status,
-                detail=output_eval.reason or "Response blocked by output policy",
+                detail=_blocked_detail(vector, reason),
             )
 
         final_content = output_eval.sanitized_text or upstream_resp.content
@@ -476,7 +495,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def health() -> Dict[str, Any]:
         return {
             "status": "ok",
-            "version": "2.4.1",
+            "version": "2.4.0",
             "policies_loaded": len(policy_engine.list_packs()),
         }
 
