@@ -20,55 +20,48 @@
 * **Live Deployment:** `https://lucid-truth-audit.onrender.com`
 * **Latest Verified Smoke Run:** `2026-11-25 19:41:15 UTC` — **9/9 checks passed (100.0%)**
 * **Latest Ledger / SHA-256 Reference:** `5c303fae2ce8e0c4e581e09f3d1445a3e6a67f77ad4d473d94df6efc10dc580d`
-* **Latest Validation Artifact:** `lucid-truth-audit-3.11-validation` (`ID 15059735258`, SHA-256 `c56b18ca0644b8113bbae4f93d5a5ae000fc1c467733565fb60008292d001e20`)
+* **Latest Validation Artifact:** `lucid-truth-audit-3.11-validation` (`ID 15059735258`, SHA-256 `c56b18ca0644b8113bbae4f93d5a5ae000fc1c467733565fb60008292d001e20`)[span_0](start_span)[span_0](end_span)[span_1](start_span)[span_1](end_span)
 
 ---
 
 ## System Architecture & Visual Flows
 
-```mermaid
-flowchart LR
-    Client["Client / Shadow Proxy\n(X-API-Key / Bearer LTA_SHADOW_KEY)"]
-
-    subgraph Gateway["Lucid-Truth-Audit v2.4.1 (Render)"]
-        Ingress["_ingress_middleware\n(Body Cap 413, Security Headers, X-Request-ID)"]
-        Auth["Auth & Rate Limit\n(hmac.compare_digest, 401/403/429)"]
-        Policy["Policy & Evasion Engine\n(BiDi/NFKC/Homoglyph, PII/Secret/CDL Redaction)"]
-        Shadow["POST /v1/shadow/ingest\n(202 Accepted, 64-char input_sha256, Zero Retention)"]
-        Ledger["SHA-256 Audit Ledger\n(/v1/audit/verify & /v1/audit/export)"]
-        Metrics["Prometheus Telemetry\n(/metrics)"]
-    end
-
-    Upstream["Upstream LLM\n(Google Gemini / OpenAI / Anthropic / Mock)"]
-
-    Client --> Ingress
-    Ingress --> Auth
-    Auth -->|"/v1/shadow/ingest"| Shadow
-    Shadow -->|"Metadata + SHA-256 only"| Ledger
-    Auth -->|"/api/v1/guard & /v1/chat/completions"| Policy
-    Policy -->|"Sanitized Prompt"| Upstream
-    Upstream -->|"Response"| Policy
-    Policy -->|"ALLOW / ALLOW_REDACTED / BLOCK"| Ledger
-    Auth -->|"/v1/audit/* & /metrics"| Ledger
-    Ledger --> Metrics
+```text
+[Client / Shadow Proxy]
+       │  (X-API-Key / Bearer LTA_SHADOW_KEY)
+       ▼
+┌────────────────────────────────────────────────────────┐
+│  _ingress_middleware  (256 KiB cap -> 413, headers)   │
+└───────────────────────────┬────────────────────────────┘
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│  Auth & Rate Limit  (hmac.compare_digest, 401/403/429) │
+└───────────┬───────────────────────────┬────────────────┘
+            │ /v1/shadow/ingest       │ /api/v1/guard & /v1/chat/completions
+            ▼                           ▼
+┌───────────────────────┐   ┌────────────────────────────┐
+│  Shadow Ingest (202)  │   │  Policy & Evasion Engine   │
+│  64-char input_sha256 │   │  BiDi/NFKC, PII/Secret/CDL│
+│  Zero raw retention   │   └─────────────┬──────────────┘
+└───────────┬───────────┘                 ▼
+            │                   ┌────────────────────────────┐
+            │                   │  Upstream LLM (Gemini/etc) │
+            │                   └─────────────┬──────────────┘
+            ▼                                 ▼
+┌────────────────────────────────────────────────────────┐
+│  SHA-256 Audit Ledger (/v1/audit/verify & /export)     │
+│  └─▶ Prometheus Telemetry (/metrics)                   │
+└────────────────────────────────────────────────────────┘
 ```
 
 ### Zero-Retention Shadow Ingest Flow
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant Proxy as Shadow Proxy / Caller
-    participant API as POST /v1/shadow/ingest
-    participant BG as Background Sanitizer
-    participant Log as Zero-Retention Audit Sink
-
-    Proxy->>API: POST /v1/shadow/ingest (Bearer LTA_SHADOW_KEY)
-    API->>API: Verify key (hmac.compare_digest) & validate schema
-    API->>API: Compute 64-char input_sha256 (no raw prompt stored)
-    API->>BG: Enqueue sanitization & risk flag scan
-    API-->>Proxy: 202 Accepted (audit_id, input_sha256, zero_retention)
-    BG->>Log: Write ZeroRetentionAuditRecord (hashes, flags, ms only)
+```text
+1. Shadow Proxy ──▶ POST /v1/shadow/ingest (Authorization: Bearer <LTA_SHADOW_KEY>)
+2. Gateway      ──▶ Verify key (hmac.compare_digest) & strict Pydantic v2 schema
+3. Gateway      ──▶ Compute 64-char input_sha256 (raw prompt discarded immediately)
+4. Background   ──▶ Sanitize BiDi/NFKC/homoglyphs & log ZeroRetentionAuditRecord
+5. Gateway      ──▶ 202 Accepted { audit_id, input_sha256, zero_retention: true }
 ```
 
 ---
@@ -182,23 +175,24 @@ curl -sS "[https://lucid-truth-audit.onrender.com/v1/audit/verify](https://lucid
 ## Validation & Test Suite Results
 
 ### Automated `pytest` Suite (`compliance_audit.html` · `2026-11-25 20:04:37 UTC`)
-* **Result:** **101/101 passed** (`0` failed, `0` skipped, `0` errors) in `6s` (`00:00:06`) on Python `3.12.16` (`pytest 9.2.0`, `pytest-cov 6.3.0`, `CI=true`)[span_0](start_span)[span_0](end_span).
-* **Validated Domains:** Prompt injection and obfuscation (zero-width, soft-hyphen, combining marks, leetspeak, Cyrillic homoglyphs, Base64, hex), social-engineering PII pretexts, indirect BOL prompt injection, PII/secret/Luhn PAN/multi-state CDL redaction, output exfiltration blocking, PCI/HIPAA/FMCSA policy packs, 60/7 and 70/8 HOS/weight/permit rules, rate limiting (`429`), CSV formula escaping, auth/RBAC fail-closed checks, and audit hash-chain tamper detection[span_1](start_span)[span_1](end_span).
+* **Result:** **101/101 passed** (`0` failed, `0` skipped, `0` errors) in `6s` (`00:00:06`) on Python `3.12.16` (`pytest 9.2.0`, `pytest-cov 6.3.0`, `CI=true`).
+* **Validated Domains:** Prompt injection and obfuscation (zero-width, soft-hyphen, combining marks, leetspeak, Cyrillic homoglyphs, Base64, hex), social-engineering PII pretexts, indirect BOL prompt injection, PII/secret/Luhn PAN/multi-state CDL redaction, output exfiltration blocking, PCI/HIPAA/FMCSA policy packs, 60/7 and 70/8 HOS/weight/permit rules, rate limiting (`429`), CSV formula escaping, auth/RBAC fail-closed checks, and audit hash-chain tamper detection[span_2](start_span)[span_2](end_span).
 
-```mermaid
-pie title Pytest Suite Pass Breakdown (101/101 Passed)
-    "Production & Obfuscation Suite (test_production_suite.py)" : 28
-    "Core Audit, Injection & Auth (test_audit.py)" : 16
-    "Enterprise Gateway & RBAC (test_enterprise_gateway.py)" : 14
-    "Logistics & FMCSA Vectors (test_vector4_logistics.py)" : 11
-    "Ledger, Providers & Evidence Chain" : 9
-    "Resilience & Rate Limiting (test_vector3_resilience.py)" : 8
-    "PII & Secret Guardrails (test_vector2_pii.py)" : 8
-    "Deployment & Shadow Ingest" : 7
+```text
+Pytest Suite Pass Breakdown (101/101 Passed · 100%)
+───────────────────────────────────────────────────────────────────────────────
+Production & Obfuscation (test_production_suite.py)     28 |███████████       |
+Core Audit, Injection & Auth (test_audit.py)            16 |██████            |
+Enterprise Gateway & RBAC (test_enterprise_gateway.py)  14 |██████            |
+Logistics & FMCSA Vectors (test_vector4_logistics.py)   11 |████              |
+Ledger, Providers & Evidence Chain                       9 |████              |
+Resilience & Rate Limiting (test_vector3_resilience.py)  8 |███               |
+PII & Secret Guardrails (test_vector2_pii.py)            8 |███               |
+Deployment & Shadow Ingest                               7 |███               |
 ```
 
 ### Shadow Router Coverage (`z_cfb6adc3f81c8e3c_shadow_py.html` · `2026-11-25 20:04 UTC`)
-* **Coverage:** **97%** (`77` run, `2` missing, `1` partial branch out of `79` statements via `coverage.py 7.17.5`)[span_2](start_span)[span_2](end_span).
+* **Coverage:** **97%** (`77` run, `2` missing, `1` partial branch out of `79` statements via `coverage.py 7.17.5`).
 * **Remaining Uncovered Lines:** Line `41` (`return {}` when `LTA_TENANT_KEYS` is unset/empty in `_load_tenant_key_map`) and line `128` (`logger.info(record.model_dump_json())` in `write_audit_record`)[span_3](start_span)[span_3](end_span).
 
 ### CI Validation Artifact Upload (`2026-11-25T20:04:35.9606075Z`)
@@ -222,10 +216,10 @@ python scripts/run_smoketest.py
 
 ## Live Smoke Test Baseline & Latency Benchmarks (`2026-11-25 19:41:15 UTC`)
 
-* **Target:** `https://lucid-truth-audit.onrender.com`[span_4](start_span)[span_4](end_span)[span_5](start_span)[span_5](end_span)
-* **Compliance Score:** `100.0%` (`9/9` checks passed)[span_6](start_span)[span_6](end_span)
-* **Zero-Retention Policy:** `Verified`[span_7](start_span)[span_7](end_span)
-* **Latest Ledger / SHA-256 Reference:** `5c303fae2ce8e0c4e581e09f3d1445a3e6a67f77ad4d473d94df6efc10dc580d`[span_8](start_span)[span_8](end_span)
+* **Target:** `https://lucid-truth-audit.onrender.com`
+* **Compliance Score:** `100.0%` (`9/9` checks passed)
+* **Zero-Retention Policy:** `Verified`
+* **Latest Ledger / SHA-256 Reference:** `5c303fae2ce8e0c4e581e09f3d1445a3e6a67f77ad4d473d94df6efc10dc580d`[span_4](start_span)[span_4](end_span)[span_5](start_span)[span_5](end_span)
 
 ### Latency Bar Chart (`ms`, Relative to `4269.4 ms` Peak)
 
@@ -259,11 +253,11 @@ shadow.py Cov.:    [████████████████████
 | **6** | Guard PII Redaction (SSN + Secret) | `/api/v1/guard` | `1883.9 ms` | `█████████` | `200` | `PASS` | `Raw SSN not leaked in response` |
 | **7** | Guard Injection / Evasion Handling | `/api/v1/guard` | `82.8 ms` | `▏` | `400` | `PASS` | `status=handled` |
 | **8** | Audit Ledger Verify (`/v1/audit/verify`) | `/v1/audit/verify` | `71.7 ms` | `▏` | `200` | `PASS` | `OK` |
-| **9** | Shadow Ingest (BiDi + Homoglyph) | `/v1/shadow/ingest` | `93.8 ms` | `▏` | `202` | `PASS` | `audit_id=shd-4-5c303fae2ce8`[span_9](start_span)[span_9](end_span)[span_10](start_span)[span_10](end_span) |
+| **9** | Shadow Ingest (BiDi + Homoglyph) | `/v1/shadow/ingest` | `93.8 ms` | `▏` | `202` | `PASS` | `audit_id=shd-4-5c303fae2ce8`[span_6](start_span)[span_6](end_span)[span_7](start_span)[span_7](end_span) |
 
 * **Latency Benchmarks Summary:**
-  * **Gateway / Auth / Ledger / Shadow Fast Path (`Checks 1–4, 7–9`):** `68.7 ms` min (`#2 /readyz`), `102.8 ms` max (`#4 /v1/shadow/ingest`), `93.8 ms` on BiDi + Homoglyph shadow ingest (`#9`), and `71.7 ms` on audit ledger verification (`#8`).
-  * **Upstream LLM Guard Path (`Checks 5–6`):** `1883.9 ms` (PII + secret redaction turn) and `4269.4 ms` (clean prompt turn).
+  * **Gateway / Auth / Ledger / Shadow Fast Path (`Checks 1–4, 7–9`):** `68.7 ms` min (`#2 /readyz`), `102.8 ms` max (`#4 /v1/shadow/ingest`), `93.8 ms` on BiDi + Homoglyph shadow ingest (`#9`), and `71.7 ms` on audit ledger verification (`#8`)[span_8](start_span)[span_8](end_span).
+  * **Upstream LLM Guard Path (`Checks 5–6`):** `1883.9 ms` (PII + secret redaction turn) and `4269.4 ms` (clean prompt turn)[span_9](start_span)[span_9](end_span).
 
 ---
 
