@@ -100,7 +100,7 @@ jobs:
 
           for attempt in $(seq 1 20); do
             if curl --fail --silent \
-              http://127.0.0.1:10080/healthz >/dev/null; then
+              http://127.0.0.1:10080/health >/dev/null; then
               exit 0
             fi
             sleep 2
