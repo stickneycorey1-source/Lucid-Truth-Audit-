@@ -98,6 +98,12 @@ def main() -> int:
         expected_codes={401},
         payload={"prompt": "ping"},
     )
+    try:
+        spec = requests.get(f"{BASE_URL}/openapi.json", timeout=TIMEOUT).json()
+        paths = sorted(spec.get("paths", {}).keys())
+        print("Live OpenAPI paths:", paths)
+    except Exception as exc:
+        print("OpenAPI fetch failed:", exc)
 
     if API_KEY:
         auth_headers = {"X-API-Key": API_KEY, "Content-Type": "application/json"}
