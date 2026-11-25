@@ -10,7 +10,7 @@ BASE_URL = os.getenv("LTA_BASE_URL", "https://lucid-truth-audit.onrender.com").r
 API_KEY = os.getenv("LTA_API_KEY", "").strip()
 SHADOW_KEY = os.getenv("LTA_SHADOW_KEY", "").strip()
 OUTPUT_PATH = os.getenv("LTA_REPORT_PATH", "lta_smoketest_report.html")
-TIMEOUT = 25
+TIMEOUT = int(os.getenv("LTA_TIMEOUT_S", "45"))
 
 
 def _resolve_ref(spec: dict, ref: str) -> dict:
@@ -40,18 +40,23 @@ def _inspect_guard_schema(spec: dict) -> tuple[dict, list[str]]:
 
 
 def _build_guard_payload(prompt_text: str, props: dict, required: list[str]) -> dict:
-    if "model_input" in props or "model_input" in required:
-        payload = {"model_input": prompt_text}
+    if "model_input" in props or "model_input" in required or not props:
+        payload: dict = {"model_input": prompt_text}
         if "metadata" in props:
             payload["metadata"] = {"source": "github_actions_smoketest"}
         return payload
 
-    payload = {"prompt": prompt_text}
-    candidate_text_keys = ["text", "content", "input", "message", "query"]
+    payload = {}
+    if "prompt" in props or "prompt" in required:
+        payload["prompt"] = prompt_text
 
+    candidate_text_keys = ["text", "content", "input", "message", "query"]
     for key in candidate_text_keys:
         if key in props or key in required:
             payload[key] = prompt_text
+
+    if not payload:
+        payload["model_input"] = prompt_text
 
     for field in required:
         if field in payload:
@@ -151,6 +156,12 @@ def main() -> int:
     live_paths = set()
     guard_props = {}
     guard_required = []
+
+    # Warm service before fetching /openapi.json so Render cold start does not time out
+    try:
+        requests.get(f"{BASE_URL}/healthz", timeout=TIMEOUT)
+    except Exception:
+        pass
 
     try:
         spec = requests.get(f"{BASE_URL}/openapi.json", timeout=TIMEOUT).json()
