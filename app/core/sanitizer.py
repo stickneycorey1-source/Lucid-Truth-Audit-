@@ -4,8 +4,12 @@ import re
 import unicodedata
 from typing import Final
 
-from confusable_homoglyphs import confusables
 from pydantic import BaseModel, Field
+
+try:
+    from confusable_homoglyphs import confusables as _confusables
+except ImportError:  # pragma: no cover - fallback when optional dep is absent
+    _confusables = None
 
 # Explicit Trojan Source / BiDi override codepoints (subset of Unicode Cf)
 BIDI_CONTROL_CHARS: Final[frozenset[str]] = frozenset(
@@ -30,6 +34,77 @@ SAFE_CONTROL_CHARS: Final[frozenset[str]] = frozenset({"\t", "\n", "\r"})
 
 # Tokenizer for word-level UTS #39 inspection
 TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"\S+")
+
+# Built-in fallback table of high-risk Cyrillic/Greek Latin-confusable codepoints
+FALLBACK_CONFUSABLES: Final[dict[str, str]] = {
+    "\u0410": "CYRILLIC",  # А -> A
+    "\u0412": "CYRILLIC",  # В -> B
+    "\u0421": "CYRILLIC",  # С -> C
+    "\u0415": "CYRILLIC",  # Е -> E
+    "\u041d": "CYRILLIC",  # Н -> H
+    "\u0406": "CYRILLIC",  # І -> I
+    "\u041a": "CYRILLIC",  # К -> K
+    "\u041c": "CYRILLIC",  # М -> M
+    "\u041e": "CYRILLIC",  # О -> O
+    "\u0420": "CYRILLIC",  # Р -> P
+    "\u0422": "CYRILLIC",  # Т -> T
+    "\u0425": "CYRILLIC",  # Х -> X
+    "\u0430": "CYRILLIC",  # а -> a
+    "\u0441": "CYRILLIC",  # с -> c
+    "\u0435": "CYRILLIC",  # е -> e
+    "\u0456": "CYRILLIC",  # і -> i
+    "\u0458": "CYRILLIC",  # ј -> j
+    "\u043e": "CYRILLIC",  # о -> o
+    "\u0440": "CYRILLIC",  # р -> p
+    "\u0455": "CYRILLIC",  # ѕ -> s
+    "\u0445": "CYRILLIC",  # х -> x
+    "\u0443": "CYRILLIC",  # у -> y
+    "\u0391": "GREEK",     # Α -> A
+    "\u0392": "GREEK",     # Β -> B
+    "\u0395": "GREEK",     # Ε -> E
+    "\u0396": "GREEK",     # Ζ -> Z
+    "\u0397": "GREEK",     # Η -> H
+    "\u0399": "GREEK",     # Ι -> I
+    "\u039a": "GREEK",     # Κ -> K
+    "\u039c": "GREEK",     # Μ -> M
+    "\u039d": "GREEK",     # Ν -> N
+    "\u039f": "GREEK",     # Ο -> O
+    "\u03a1": "GREEK",     # Ρ -> P
+    "\u03a4": "GREEK",     # Τ -> T
+    "\u03a7": "GREEK",     # Χ -> X
+    "\u03bf": "GREEK",     # ο -> o
+}
+
+
+def _fallback_detect_homoglyphs(
+    token: str, token_index: int, preferred_aliases: list[str]
+) -> list[HomoglyphFinding]:
+    """Stdlib-only fallback detector when confusable-homoglyphs is not installed."""
+    scripts_in_token: set[str] = set()
+    for ch in token:
+        if ch.isalpha():
+            name = unicodedata.name(ch, "")
+            if "LATIN" in name:
+                scripts_in_token.add("LATIN")
+            elif "CYRILLIC" in name:
+                scripts_in_token.add("CYRILLIC")
+            elif "GREEK" in name:
+                scripts_in_token.add("GREEK")
+
+    is_mixed = len(scripts_in_token) > 1
+    findings: list[HomoglyphFinding] = []
+    for ch in token:
+        alias = FALLBACK_CONFUSABLES.get(ch)
+        if alias and alias not in preferred_aliases:
+            findings.append(
+                HomoglyphFinding(
+                    token_index=token_index,
+                    codepoint=f"U+{ord(ch):04X}",
+                    script_alias=alias,
+                    is_mixed_script=is_mixed,
+                )
+            )
+    return findings
 
 
 class HomoglyphFinding(BaseModel):
@@ -64,7 +139,6 @@ class InputSanitizer:
     """
 
     def __init__(self, preferred_aliases: list[str] | None = None) -> None:
-        # Default to Latin as the baseline expected script for enterprise English prompts
         self.preferred_aliases: list[str] = preferred_aliases or ["LATIN"]
 
     def sanitize(self, text: str) -> SanitizationResult:
@@ -103,24 +177,28 @@ class InputSanitizer:
         findings: list[HomoglyphFinding] = []
         for idx, match in enumerate(TOKEN_PATTERN.finditer(normalized_text)):
             token = match.group(0)
-            is_mixed = bool(confusables.is_dangerous(token))
-            confusable_hits = confusables.is_confusable(
-                token,
-                greedy=True,
-                preferred_aliases=self.preferred_aliases,
-            )
-
-            if confusable_hits:
-                for hit in confusable_hits:
-                    char = hit["character"]
-                    findings.append(
-                        HomoglyphFinding(
-                            token_index=idx,
-                            codepoint=f"U+{ord(char):04X}",
-                            script_alias=hit.get("alias", "UNKNOWN"),
-                            is_mixed_script=is_mixed,
+            if _confusables is not None:
+                is_mixed = bool(_confusables.is_dangerous(token))
+                confusable_hits = _confusables.is_confusable(
+                    token,
+                    greedy=True,
+                    preferred_aliases=self.preferred_aliases,
+                )
+                if confusable_hits:
+                    for hit in confusable_hits:
+                        char = hit["character"]
+                        findings.append(
+                            HomoglyphFinding(
+                                token_index=idx,
+                                codepoint=f"U+{ord(char):04X}",
+                                script_alias=hit.get("alias", "UNKNOWN"),
+                                is_mixed_script=is_mixed,
+                            )
                         )
-                    )
+            else:
+                findings.extend(
+                    _fallback_detect_homoglyphs(token, idx, self.preferred_aliases)
+                )
 
         # Build deterministic risk flags for audit logging (no raw PII stored)
         risk_flags: list[str] = []
