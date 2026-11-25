@@ -1,0 +1,37 @@
+name: Live Render Smoke Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoketest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install requests
+        run: pip install requests
+
+      - name: Run Live Smoke Test
+        env:
+          LTA_BASE_URL: https://lucid-truth-audit.onrender.com
+          LTA_API_KEY: ${{ secrets.LTA_API_KEY }}
+          LTA_SHADOW_KEY: ${{ secrets.LTA_SHADOW_KEY }}
+        run: python scripts/run_smoketest.py
+
+      - name: Upload HTML Report (Unzipped)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          path: lta_smoketest_report.html
+          archive: false
+          retention-days: 14
