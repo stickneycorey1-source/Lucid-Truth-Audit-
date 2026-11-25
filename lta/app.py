@@ -564,10 +564,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     @fastapi_app.get("/health")
     @fastapi_app.get("/healthz")
     async def healthz() -> Dict[str, Any]:
+        packs = policy_engine.list_packs()
         return {
             "status": "ok",
             "version": "2.4.0",
-            "policy_packs": policy_engine.list_packs(),
+            "policies_loaded": len(packs),
+            "policy_packs": packs,
         }
 
     @fastapi_app.get("/readyz")
@@ -623,7 +625,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         content = result["choices"][0]["message"]["content"]
         audit_meta = result["lta_audit"]
         return {
-            "status": "cleared",
+            "status": "success",
             "output": content,
             "choices": result["choices"],
             "lta_audit": audit_meta,
@@ -677,13 +679,17 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def verify_audit(admin: TenantConfig = Depends(_require_admin)) -> Dict[str, Any]:
         result = audit_ledger.verify_chain()
         if isinstance(result, dict):
-            return result
+            out = dict(result)
+            if "chain_valid" not in out and "valid" in out:
+                out["chain_valid"] = bool(out["valid"])
+            return out
         if isinstance(result, (tuple, list)):
             valid = bool(result[0]) if len(result) > 0 else False
             count = result[1] if len(result) > 1 else 0
             detail = result[2] if len(result) > 2 else None
-            return {"valid": valid, "count": count, "detail": detail}
-        return {"valid": bool(result), "result": result}
+            return {"chain_valid": valid, "valid": valid, "count": count, "detail": detail}
+        flag = bool(result)
+        return {"chain_valid": flag, "valid": flag, "result": result}
 
     @fastapi_app.get("/v1/audit/export")
     async def export_audit(
