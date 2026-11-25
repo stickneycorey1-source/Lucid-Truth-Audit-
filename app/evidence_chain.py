@@ -1,3 +1,4 @@
+
 from contextlib import closing
 import hashlib
 import json
@@ -9,15 +10,17 @@ from typing import Any, Dict, List, Optional
 
 
 class DuplicateEvidenceError(Exception):
+    """Raised when an evidence record conflicts with a database constraint."""
     pass
 
 
 class EvidenceChainStore:
-    """Tenant-isolated, persistent, hash-chained evidence records."""
+    """Tenant-isolated, persistent, SHA-256 hash-chained evidence records."""
 
     def __init__(self, db_path: Optional[str] = None):
         self.db_path = db_path or os.getenv(
-            "LUCID_LEDGER_DB_PATH", "lucid_audit_ledger.db"
+            "LUCID_LEDGER_DB_PATH",
+            "lucid_audit_ledger.db",
         )
         self._init_db()
 
@@ -25,8 +28,11 @@ class EvidenceChainStore:
         parent = os.path.dirname(os.path.abspath(self.db_path))
         if parent:
             os.makedirs(parent, exist_ok=True)
+
         conn = sqlite3.connect(
-            self.db_path, timeout=15.0, isolation_level=None
+            self.db_path,
+            timeout=15.0,
+            isolation_level=None,
         )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
@@ -49,6 +55,7 @@ class EvidenceChainStore:
                 )
                 """
             )
+
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_evidence_tenant
@@ -58,6 +65,7 @@ class EvidenceChainStore:
 
     @staticmethod
     def _canonical_json(value: Dict[str, Any]) -> str:
+        """Serialize payload consistently for deterministic hashing."""
         return json.dumps(
             value,
             sort_keys=True,
@@ -74,6 +82,7 @@ class EvidenceChainStore:
         payload_json: str,
         prev_hash: str,
     ) -> str:
+        """Calculate the SHA-256 hash for one evidence-chain record."""
         envelope = {
             "schema_version": 1,
             "evidence_id": evidence_id,
@@ -82,43 +91,69 @@ class EvidenceChainStore:
             "payload_json": payload_json,
             "prev_hash": prev_hash,
         }
+
         encoded = cls._canonical_json(envelope).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
     def add(
-        self, tenant_id: str, payload: Dict[str, Any]
+        self,
+        tenant_id: str,
+        payload: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """Append an evidence record to the tenant's hash chain."""
+
+        if not isinstance(tenant_id, str) or not tenant_id.strip():
+            raise ValueError("tenant_id must be a non-empty string")
+
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dictionary")
+
         evidence_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
         payload_json = self._canonical_json(payload)
 
-        # BEGIN IMMEDIATE serializes competing writers before reading
-        # the previous tenant hash and inserting the next record.
+        # Serialize concurrent writers so each tenant's chain
+        # receives the correct previous hash.
         with closing(self._connect()) as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
+
                 previous = conn.execute(
                     """
-                    SELECT entry_hash FROM evidence_records
+                    SELECT entry_hash
+                    FROM evidence_records
                     WHERE tenant_id = ?
-                    ORDER BY id DESC LIMIT 1
+                    ORDER BY id DESC
+                    LIMIT 1
                     """,
                     (tenant_id,),
                 ).fetchone()
-                prev_hash = previous["entry_hash"] if previous else "GENESIS"
-                entry_hash = self._hash_record(
-                    evidence_id,
-                    tenant_id,
-                    created_at,
-                    payload_json,
-                    prev_hash,
+
+                prev_hash = (
+                    previous["entry_hash"]
+                    if previous
+                    else "GENESIS"
                 )
+
+                entry_hash = self._hash_record(
+                    evidence_id=evidence_id,
+                    tenant_id=tenant_id,
+                    created_at=created_at,
+                    payload_json=payload_json,
+                    prev_hash=prev_hash,
+                )
+
                 cur = conn.execute(
                     """
                     INSERT INTO evidence_records (
-                        evidence_id, tenant_id, created_at,
-                        payload_json, prev_hash, entry_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?)
+                        evidence_id,
+                        tenant_id,
+                        created_at,
+                        payload_json,
+                        prev_hash,
+                        entry_hash
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         evidence_id,
@@ -129,16 +164,22 @@ class EvidenceChainStore:
                         entry_hash,
                     ),
                 )
+
+                record_number = cur.lastrowid
                 conn.execute("COMMIT")
+
             except sqlite3.IntegrityError as exc:
-                conn.execute("ROLLBACK")
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
                 raise DuplicateEvidenceError(str(exc)) from exc
+
             except Exception:
-                conn.execute("ROLLBACK")
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
                 raise
 
         return {
-            "record_number": cur.lastrowid,
+            "record_number": record_number,
             "evidence_id": evidence_id,
             "tenant_id": tenant_id,
             "created_at": created_at,
@@ -148,17 +189,29 @@ class EvidenceChainStore:
         }
 
     def list_records(
-        self, tenant_id: str, limit: int = 100
+        self,
+        tenant_id: str,
+        limit: int = 100,
     ) -> List[Dict[str, Any]]:
+        """Return records belonging only to the requested tenant."""
+
         limit = max(1, min(limit, 500))
+
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
-                SELECT id, evidence_id, tenant_id, created_at,
-                       payload_json, prev_hash, entry_hash
+                SELECT
+                    id,
+                    evidence_id,
+                    tenant_id,
+                    created_at,
+                    payload_json,
+                    prev_hash,
+                    entry_hash
                 FROM evidence_records
                 WHERE tenant_id = ?
-                ORDER BY id DESC LIMIT ?
+                ORDER BY id DESC
+                LIMIT ?
                 """,
                 (tenant_id, limit),
             ).fetchall()
@@ -177,11 +230,19 @@ class EvidenceChainStore:
         ]
 
     def verify(self, tenant_id: str) -> Dict[str, Any]:
+        """Verify the complete hash chain for one tenant."""
+
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
-                SELECT id, evidence_id, tenant_id, created_at,
-                       payload_json, prev_hash, entry_hash
+                SELECT
+                    id,
+                    evidence_id,
+                    tenant_id,
+                    created_at,
+                    payload_json,
+                    prev_hash,
+                    entry_hash
                 FROM evidence_records
                 WHERE tenant_id = ?
                 ORDER BY id ASC
@@ -190,7 +251,10 @@ class EvidenceChainStore:
             ).fetchall()
 
         expected_prev = "GENESIS"
+
         for row in rows:
+            # Verify that this record points to the expected
+            # previous record in the tenant's chain.
             if row["prev_hash"] != expected_prev:
                 return {
                     "chain_valid": False,
@@ -198,19 +262,24 @@ class EvidenceChainStore:
                     "broken_at_record": row["id"],
                 }
 
-            actual = self._hash_record(
-                row["evidence_id"],
-                row["tenant_id"],
-                row["created_at"],
-                row["payload_json"],
-                row["prev_hash"],
+            # Recalculate the record hash from stored data.
+            actual_hash = self._hash_record(
+                evidence_id=row["evidence_id"],
+                tenant_id=row["tenant_id"],
+                created_at=row["created_at"],
+                payload_json=row["payload_json"],
+                prev_hash=row["prev_hash"],
             )
-            if actual != row["entry_hash"]:
+
+            # Detect payload changes, metadata changes,
+            # hash changes, and chain-link changes.
+            if actual_hash != row["entry_hash"]:
                 return {
                     "chain_valid": False,
                     "checked_records": len(rows),
                     "broken_at_record": row["id"],
                 }
+
             expected_prev = row["entry_hash"]
 
         return {
