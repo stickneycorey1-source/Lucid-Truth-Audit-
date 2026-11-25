@@ -11,10 +11,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -26,12 +26,14 @@ jobs:
           LTA_BASE_URL: https://lucid-truth-audit.onrender.com
           LTA_API_KEY: ${{ secrets.LTA_API_KEY }}
           LTA_SHADOW_KEY: ${{ secrets.LTA_SHADOW_KEY }}
+          LTA_REPORT_PATH: lta_smoketest_report.html
         run: python scripts/run_smoketest.py
 
       - name: Upload HTML Report (Unzipped)
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
+          name: lucid-truth-audit-smoketest-report
           path: lta_smoketest_report.html
           archive: false
           retention-days: 14
