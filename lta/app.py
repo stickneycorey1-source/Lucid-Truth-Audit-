@@ -545,7 +545,22 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             latency_ms=latency_ms,
         )
 
+        rounded_latency = round(latency_ms, 3)
+        audit_meta = {
+            "action": final_action,
+            "redactions": unique_redactions,
+            "policy_pack": policy_name,
+            "tenant_id": tenant.tenant_id,
+            "provider": upstream.provider,
+            "audit_entry_hash": rec.entry_hash,
+            "audit_seq_id": rec.seq_id,
+            "prev_hash": rec.prev_hash,
+            "payload_sha256": rec.payload_sha256,
+            "latency_ms": rounded_latency,
+        }
+
         return {
+            "object": "chat.completion",
             "content": out_res.sanitized_text,
             "model": upstream.model,
             "provider": upstream.provider,
@@ -556,7 +571,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "policy_pack": policy_name,
             "audit_entry_hash": rec.entry_hash,
             "audit_seq_id": rec.seq_id,
-            "latency_ms": round(latency_ms, 3),
+            "latency_ms": rounded_latency,
+            "lta_audit": audit_meta,
         }
 
     @app.post("/v1/chat/completions")
