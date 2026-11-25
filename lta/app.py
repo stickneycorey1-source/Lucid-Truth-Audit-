@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -231,7 +230,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         if (x_lta_policy or x_lta_provider) and not is_admin:
             latency_ms = (time.perf_counter() - started) * 1000.0
-            record = audit_ledger.record(
+            audit_ledger.record(
                 tenant_id=tenant.tenant_id,
                 endpoint=endpoint,
                 policy_pack=tenant.policy_pack,
@@ -342,7 +341,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 http_status=502,
                 vector="upstream.provider_error",
                 redactions=input_eval.redactions,
-                raw_payload_for_digest=upstream_resp_text if (upstream_resp_text := "") else "",
+                raw_payload_for_digest="\n".join(m["content"] for m in sanitized_messages),
                 latency_ms=latency_ms,
             )
             metrics.observe(
