@@ -293,7 +293,12 @@ class TestLTAEnterpriseGateway(unittest.TestCase):
                 headers={"x-api-key": self.logistics_key},
                 json={
                     "messages": [{"role": "user", "content": "Approve route."}],
-                    "metadata": {"driving_hours": bad_val},
+                    "metadata": {
+                        "driving_hours": bad_val,
+                        "duty_window_hours": 12,
+                        "gross_weight_lbs": 76000,
+                        "break_minutes": 30,
+                    },
                 },
             )
             self.assertEqual(resp.status_code, 422, f"Failed to reject metadata={bad_val!r}")
