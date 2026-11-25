@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -11,7 +13,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -57,6 +59,23 @@ class LegacyGuardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model_input: str = Field(..., min_length=1)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("metadata")
+    @classmethod
+    def _validate_metadata(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        for k, v in value.items():
+            if isinstance(v, float) and (v != v or v in (float("inf"), float("-inf"))):
+                raise ValueError(f"Non-finite float in metadata key '{k}'")
+        return value
+
+
+class ShadowIngestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    prompt: str = Field(..., min_length=1)
+    request_id: Optional[str] = Field(default=None, max_length=128)
+    model_target: Optional[str] = Field(default=None, max_length=128)
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("metadata")
@@ -165,7 +184,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 if int(content_length) > MAX_BODY_BYTES:
                     resp = JSONResponse(
                         status_code=413,
-                        content={"detail": _blocked_detail("ingress.body_too_large", "Request body exceeds maximum allowed size")},
+                        content={
+                            "detail": _blocked_detail(
+                                "ingress.body_too_large",
+                                "Request body exceeds maximum allowed size",
+                            )
+                        },
                     )
                     _apply_security_headers(resp, req_id)
                     return resp
@@ -176,7 +200,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if len(body_bytes) > MAX_BODY_BYTES:
             resp = JSONResponse(
                 status_code=413,
-                content={"detail": _blocked_detail("ingress.body_too_large", "Request body exceeds maximum allowed size")},
+                content={
+                    "detail": _blocked_detail(
+                        "ingress.body_too_large",
+                        "Request body exceeds maximum allowed size",
+                    )
+                },
             )
             _apply_security_headers(resp, req_id)
             return resp
@@ -217,6 +246,32 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 headers={"X-RateLimit-Remaining": str(max(0, remaining))},
             )
         return tenant
+
+    async def _authenticate_shadow(
+        x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    ) -> str:
+        token = _extract_api_key(x_api_key, authorization)
+        if not token:
+            raise HTTPException(
+                status_code=401,
+                detail=_blocked_detail("auth.missing_credentials", "Missing shadow ingest credentials"),
+            )
+        shadow_key = os.getenv("LTA_SHADOW_KEY", "").strip()
+        if shadow_key:
+            if hmac.compare_digest(token, shadow_key):
+                return "shadow_ingest"
+            raise HTTPException(
+                status_code=403,
+                detail=_blocked_detail("auth.invalid_credentials", "Invalid shadow ingest credentials"),
+            )
+        tenant = cfg.authenticate(token)
+        if tenant is None:
+            raise HTTPException(
+                status_code=403,
+                detail=_blocked_detail("auth.invalid_credentials", "Invalid shadow ingest credentials"),
+            )
+        return tenant.tenant_id
 
     async def _require_admin(tenant: TenantConfig = Depends(_authenticate_tenant)) -> TenantConfig:
         if tenant.role.lower() != "admin":
@@ -585,6 +640,65 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "status": "success",
             "allowed": True,
             **result,
+        }
+
+    @fastapi_app.post("/v1/shadow/ingest", status_code=status.HTTP_202_ACCEPTED)
+    async def shadow_ingest(
+        payload: ShadowIngestRequest,
+        request: Request,
+        shadow_actor: str = Depends(_authenticate_shadow),
+    ) -> Dict[str, Any]:
+        started = time.perf_counter()
+        policy_name = (
+            "general_enterprise"
+            if "general_enterprise" in policy_engine.packs
+            else (
+                next(iter(policy_engine.packs))
+                if policy_engine.packs
+                else "general_enterprise"
+            )
+        )
+
+        input_sha256 = hashlib.sha256(payload.prompt.encode("utf-8")).hexdigest()
+        eval_res = policy_engine.evaluate_input(
+            text=payload.prompt,
+            policy_name=policy_name,
+            metadata=payload.metadata,
+        )
+        latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        action = "BLOCK" if not eval_res.allowed else eval_res.action
+
+        # Zero-retention: pass only input_sha256 to ledger; never store or return raw prompt
+        audit_rec = audit_ledger.record(
+            tenant_id=shadow_actor,
+            endpoint="/v1/shadow/ingest",
+            policy_pack=policy_name,
+            provider="shadow",
+            action=action,
+            http_status=202,
+            vector=eval_res.vector,
+            redactions=eval_res.redactions,
+            raw_payload_for_digest=input_sha256,
+            latency_ms=latency_ms,
+        )
+        metrics.observe(
+            policy_pack=policy_name,
+            http_status=202,
+            latency_ms=latency_ms,
+            vector=eval_res.vector,
+        )
+
+        audit_id = f"shd-{audit_rec.seq_id}-{input_sha256[:12]}"
+        return {
+            "status": "accepted",
+            "audit_id": audit_id,
+            "seq_id": audit_rec.seq_id,
+            "entry_hash": audit_rec.entry_hash,
+            "input_sha256": input_sha256,
+            "request_id": payload.request_id or getattr(request.state, "request_id", None),
+            "model_target": payload.model_target,
+            "policy_pack": policy_name,
+            "zero_retention": True,
         }
 
     @fastapi_app.get("/v1/audit/verify")
