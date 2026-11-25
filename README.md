@@ -97,3 +97,16 @@ curl -X POST [https://lucid-truth-audit.onrender.com/v1/chat/completions](https:
       {"role": "user", "content": "Summarize discharge for MRN-90817263 SSN 123-45-6789."}
     ]
   }'
+---
+
+## Licensing
+
+**Lucid-Truth-Audit (LTA)** is available under a dual-licensing model:
+
+1. **Open-Source Evaluation & Community Use — Apache License 2.0:**
+   The core gateway (`lta/`), policy engine, and open-source evaluation suites are licensed under the **Apache License, Version 2.0** (`SPDX-License-Identifier: Apache-2.0`). You may use, modify, and distribute the software in compliance with the terms in [`LICENSE`](LICENSE), including retention of copyright notices and modification statements.
+2. **Enterprise Production, Custom Regulatory Packs & 30-Day Shadow Pilots — Commercial License:**
+   Organizations deploying Lucid-Truth-Audit in regulated production environments, requiring dedicated VPC/private-cloud hosting, custom HIPAA/PCI-DSS/FMCSA policy pack engineering, SLA-backed support, or a **30-day zero-disruption shadow deployment pilot** may obtain a commercial enterprise license from **Lucid Tech / Corey Allen Stickney** (`https://github.com/stickneycorey1-source/Lucid-Truth-Audit-`).
+
+* **Copyright:** © 2026 Corey Allen Stickney / Lucid Tech. All rights reserved.
+* **Third-Party Dependencies:** Direct dependencies (`FastAPI`, `Uvicorn`, `Pydantic`, `httpx`, `PyYAML`, `psycopg`, `redis`, `pytest`) remain governed by their respective upstream open-source licenses.
