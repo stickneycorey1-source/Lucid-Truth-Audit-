@@ -1,41 +1,21 @@
+Copyright 2026 Corey Allen Stickney / Lucid Tech
 
----
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-## 2. Licensing Strategy: Which `LICENSE` Fits Lucid Tech Best?
+    http://www.apache.org/licenses/LICENSE-2.0
 
-Because your React storefront references an **MIT reference gateway** while you are simultaneously launching commercial B2B SaaS tiers ($599–$6,400/month), there are three legitimate licensing approaches—each with distinct trade-offs[span_13](start_span)[span_13](end_span):
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 
-| Option | Legal Friction for Pilots | Patent & Brand Protection | Commercial Moat | When to Choose It |
-| :--- | :--- | :--- | :--- | :--- |
-| **Option A: MIT License (Recommended for Pilot Launch)** | Lowest (instant trust; zero counsel review needed) | Basic (no explicit patent grant) | Relies on managed hosting, custom rules, and SLAs | Best right now while closing your 5 Founding Partners (matches your storefront's MIT reference)[span_14](start_span)[span_14](end_span). |
-| **Option B: Apache License 2.0** | Very low (standard enterprise permissive license) | Strong (explicit patent grant + trademark exclusion) | Same open-core model, stronger legal hygiene | Best if larger carriers or TMS vendors ask for formal patent-indemnity clarity before adopting the open core. |
-| **Option C: Dual-License (MIT Core + Commercial Pro)** | Medium (requires clear boundary between repos/folders) | Strongest | High (proprietary multi-tenant billing, managed connectors, and compliance binders stay closed) | Best once you scale past 5+ paying clients and want a private `lucid-truth-enterprise` repo for paid add-ons. |
-
----
-
-## 3. Ready-to-Paste `LICENSE` (Option A: MIT License)
-
-Save this as `LICENSE` at the root of `Lucid-Truth-Audit`:
-
-```text
-MIT License
-
-Copyright (c) 2026 Corey Allen Stickney (Lucid Tech)
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+-------------------------------------------------------------------------------
+COMMERCIAL ENTERPRISE LICENSING NOTICE
+-------------------------------------------------------------------------------
+Commercial enterprise licenses, private VPC deployment rights, custom
+regulatory policy packs, SLA guarantees, and 30-day shadow deployment pilots
+for Lucid-Truth-Audit are available separately from Corey Allen Stickney /
+Lucid Tech (https://github.com/stickneycorey1-source/Lucid-Truth-Audit-).
