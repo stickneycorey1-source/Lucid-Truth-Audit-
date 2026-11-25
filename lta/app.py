@@ -193,9 +193,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             )
         return tenant
 
+    @app.get("/health")
     @app.get("/healthz")
     async def healthz() -> Dict[str, Any]:
-        return {"status": "ok", "version": __version__, "policies_loaded": len(engine.packs)}
+        return {
+            "status": "ok",
+            "version": __version__,
+            "policies_loaded": len(engine.packs),
+        }
 
     @app.get("/readyz")
     async def readyz() -> Dict[str, Any]:
@@ -294,7 +299,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         provider_name = provider_override or tenant.provider
         if policy_name not in engine.packs:
             raise HTTPException(
-                status_code=400, detail=f"Unknown policy pack: '{policy_name}'"
+                status_code=400,
+                detail=f"Unknown policy pack: '{policy_name}'",
             )
 
         for idx, msg in enumerate(messages):
@@ -336,7 +342,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         if len(non_system_contents) > 1:
             combined_res = engine.evaluate_input(
-                " ".join(non_system_contents), policy_name=policy_name, metadata=metadata
+                " ".join(non_system_contents),
+                policy_name=policy_name,
+                metadata=metadata,
             )
             if not combined_res.allowed:
                 latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -371,7 +379,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         for msg in messages:
             if msg["role"] in ("user", "assistant"):
                 in_res = engine.evaluate_input(
-                    msg["content"], policy_name=policy_name, metadata=metadata
+                    msg["content"],
+                    policy_name=policy_name,
+                    metadata=metadata,
                 )
                 if not in_res.allowed:
                     latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -424,142 +434,3 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         out_res = engine.evaluate_output(upstream.content, policy_name=policy_name)
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        if not out_res.allowed:
-            rec = ledger.record(
-                tenant_id=tenant.tenant_id,
-                endpoint=endpoint,
-                policy_pack=policy_name,
-                provider=provider_name,
-                action="BLOCK",
-                http_status=out_res.http_status,
-                vector=out_res.vector,
-                redactions=sorted(set(all_redactions)),
-                raw_payload_for_digest=combined_input_for_digest,
-                latency_ms=latency_ms,
-            )
-            metrics.observe(
-                policy_pack=policy_name,
-                http_status=out_res.http_status,
-                latency_ms=latency_ms,
-                vector=out_res.vector,
-            )
-            raise HTTPException(
-                status_code=out_res.http_status,
-                detail={
-                    "error": out_res.reason,
-                    "vector": out_res.vector,
-                    "policy_pack": policy_name,
-                    "audit_entry_hash": rec.entry_hash,
-                },
-            )
-
-        all_redactions.extend(out_res.redactions)
-        unique_redactions = sorted(set(all_redactions))
-        final_action = "ALLOW_REDACTED" if unique_redactions else "ALLOW"
-        rec = ledger.record(
-            tenant_id=tenant.tenant_id,
-            endpoint=endpoint,
-            policy_pack=policy_name,
-            provider=provider_name,
-            action=final_action,
-            http_status=200,
-            vector=None,
-            redactions=unique_redactions,
-            raw_payload_for_digest=combined_input_for_digest,
-            latency_ms=latency_ms,
-        )
-        metrics.observe(
-            policy_pack=policy_name,
-            http_status=200,
-            latency_ms=latency_ms,
-        )
-
-        return {
-            "content": out_res.sanitized_text,
-            "model": upstream.model,
-            "provider": upstream.provider,
-            "prompt_tokens": upstream.prompt_tokens,
-            "completion_tokens": upstream.completion_tokens,
-            "action": final_action,
-            "redactions": unique_redactions,
-            "policy_pack": policy_name,
-            "audit_entry_hash": rec.entry_hash,
-            "audit_seq_id": rec.seq_id,
-            "latency_ms": round(latency_ms, 3),
-        }
-
-    @app.post("/v1/chat/completions")
-    async def chat_completions(
-        body: OpenAIChatCompletionRequest,
-        tenant: TenantConfig = Depends(authenticate_tenant),
-        x_lta_policy: Optional[str] = Header(default=None),
-        x_lta_provider: Optional[str] = Header(default=None),
-    ) -> Dict[str, Any]:
-        result = await _run_pipeline(
-            tenant=tenant,
-            endpoint="/v1/chat/completions",
-            messages=[{"role": m.role, "content": m.content} for m in body.messages],
-            model=body.model or tenant.upstream_model,
-            policy_override=x_lta_policy,
-            provider_override=x_lta_provider,
-            metadata=body.metadata,
-            temperature=body.temperature,
-            max_tokens=body.max_tokens,
-        )
-        return {
-            "id": f"chatcmpl-lta-{uuid.uuid4().hex[:12]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": result["model"],
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": result["content"]},
-                    "finish_reason": "stop",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": result["prompt_tokens"],
-                "completion_tokens": result["completion_tokens"],
-                "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
-            },
-            "lta_audit": {
-                "action": result["action"],
-                "policy_pack": result["policy_pack"],
-                "provider": result["provider"],
-                "redactions": result["redactions"],
-                "seq_id": result["audit_seq_id"],
-                "entry_hash": result["audit_entry_hash"],
-                "latency_ms": result["latency_ms"],
-            },
-        }
-
-    @app.post("/api/v1/guard")
-    async def legacy_guard(
-        body: LegacyGuardRequest,
-        tenant: TenantConfig = Depends(authenticate_tenant),
-        x_lta_policy: Optional[str] = Header(default=None),
-        x_lta_provider: Optional[str] = Header(default=None),
-    ) -> Dict[str, Any]:
-        result = await _run_pipeline(
-            tenant=tenant,
-            endpoint="/api/v1/guard",
-            messages=[{"role": "user", "content": body.model_input}],
-            model=tenant.upstream_model,
-            policy_override=x_lta_policy,
-            provider_override=x_lta_provider,
-            metadata=body.metadata,
-        )
-        return {
-            "status": "success",
-            "action": result["action"],
-            "message": result["content"],
-            "redactions": result["redactions"],
-            "policy_pack": result["policy_pack"],
-            "audit_entry_hash": result["audit_entry_hash"],
-        }
-
-    return app
-
-
-app = create_app()
