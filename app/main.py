@@ -75,4 +75,11 @@ async def add_security_headers(request: Request, call_next):
             "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
             "img-src 'self' data: https://fastapi.tiangolo.com; "
-            "connect-src 'self'; frame-
+            "connect-src 'self'; "
+            "frame-ancestors 'none';"
+        )
+    else:
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "
