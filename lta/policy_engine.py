@@ -32,7 +32,13 @@ EXFIL_ACTION_RE = re.compile(
     r"\b(?:reveal|dump|print|show|output|ignore|override|bypass|leak|verbatim|disclose|expose|repeat)\b"
 )
 SYSTEM_PROMPT_EXFIL_RE = re.compile(
-    r"\b(?:reveal|dump|print|show|output|leak|disclose|expose|repeat)\b.{0,35}\b(?:system prompt|hidden instructions|developer prompt)\b"
+    r"\b(?:reveal|dump|print|show|output|leak|disclose|expose|repeat)\b.{0,45}\b(?:system prompt|system message|hidden instructions|hidden rules|developer prompt)\b"
+)
+OVERRIDE_INSTRUCTIONS_RE = re.compile(
+    r"\b(?:ignore|disregard|forget|bypass|override)\b.{0,80}\b(?:prior|previous|above|earlier|system|safety)\b.{0,80}\b(?:instructions?|rules?|directives?|constraints?|guardrails?)\b"
+)
+DISREGARD_REVEAL_RE = re.compile(
+    r"\bdisregard\s+(?:everything|all|prior|previous)\s+(?:above|below|before)\b.{0,100}\b(?:reveal|show|print|output|expose|leak|dump)\b"
 )
 HOMOGLYPH_MAP = str.maketrans(
     {
@@ -79,7 +85,7 @@ BASE64_CANDIDATE_RE = re.compile(
 )
 HEX_CANDIDATE_RE = re.compile(r"\b(?:0x)?[0-9a-fA-F]{24,}\b")
 
-SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+SSN_RE = re.compile(r"(?<!\d)(?:\d{3}[-\s]\d{2}[-\s]\d{4}|\d{9})(?!\d)")
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE_RE = re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
 PAN_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
@@ -291,28 +297,29 @@ class PolicyEngine:
     def _redact_pii(self, text: str, types: List[str]) -> Tuple[str, List[str]]:
         sanitized = text
         found: List[str] = []
+        active_types = set(types) if types else {"SSN"}
 
-        if "BANK_ACCOUNT" in types and ROUTING_ACCOUNT_RE.search(sanitized):
+        if "BANK_ACCOUNT" in active_types and ROUTING_ACCOUNT_RE.search(sanitized):
             sanitized = ROUTING_ACCOUNT_RE.sub("[REDACTED_ACCOUNT]", sanitized)
             found.append("BANK_ACCOUNT")
 
-        if "MRN" in types and MRN_RE.search(sanitized):
+        if "MRN" in active_types and MRN_RE.search(sanitized):
             sanitized = MRN_RE.sub("[REDACTED_MRN]", sanitized)
             found.append("MRN")
 
-        if "CDL" in types and CDL_RE.search(sanitized):
+        if "CDL" in active_types and CDL_RE.search(sanitized):
             sanitized = CDL_RE.sub("[REDACTED_CDL]", sanitized)
             found.append("CDL")
 
-        if "API_SECRET" in types and API_SECRET_RE.search(sanitized):
+        if "API_SECRET" in active_types and API_SECRET_RE.search(sanitized):
             sanitized = API_SECRET_RE.sub("[REDACTED_SECRET]", sanitized)
             found.append("API_SECRET")
 
-        if "SSN" in types and SSN_RE.search(sanitized):
+        if "SSN" in active_types and SSN_RE.search(sanitized):
             sanitized = SSN_RE.sub("[REDACTED_SSN]", sanitized)
             found.append("SSN")
 
-        if "PAN" in types:
+        if "PAN" in active_types:
             def _replace_pan(match: re.Match[str]) -> str:
                 raw = match.group(0)
                 digits = re.sub(r"[ -]", "", raw)
@@ -324,11 +331,11 @@ class PolicyEngine:
 
             sanitized = PAN_CANDIDATE_RE.sub(_replace_pan, sanitized)
 
-        if "EMAIL" in types and EMAIL_RE.search(sanitized):
+        if "EMAIL" in active_types and EMAIL_RE.search(sanitized):
             sanitized = EMAIL_RE.sub("[REDACTED_EMAIL]", sanitized)
             found.append("EMAIL")
 
-        if "PHONE" in types and PHONE_RE.search(sanitized):
+        if "PHONE" in active_types and PHONE_RE.search(sanitized):
             sanitized = PHONE_RE.sub("[REDACTED_PHONE]", sanitized)
             found.append("PHONE")
 
@@ -364,7 +371,11 @@ class PolicyEngine:
             and not EXFIL_ACTION_RE.search(punct_clean)
         )
         for idx, surface in enumerate(surfaces):
-            if SYSTEM_PROMPT_EXFIL_RE.search(surface):
+            if (
+                SYSTEM_PROMPT_EXFIL_RE.search(surface)
+                or OVERRIDE_INSTRUCTIONS_RE.search(surface)
+                or DISREGARD_REVEAL_RE.search(surface)
+            ):
                 source_tag = "encoded_payload" if idx > 1 else "direct_or_obfuscated"
                 return EvaluationResult(
                     allowed=False,
@@ -489,7 +500,6 @@ class PolicyEngine:
         """Inspect upstream LLM output on both raw and canonicalized surfaces."""
         pack = self.get_pack(policy_name)
         normalized = canonicalize(text)
-        surfaces = (text, normalized)
 
         for phrase in pack.output_block_phrases:
             if phrase in normalized:
@@ -498,62 +508,27 @@ class PolicyEngine:
                     action="BLOCK",
                     http_status=500,
                     vector="security.output_instruction_leak",
-                    reason="Upstream model output leaked protected system instructions",
-                    policy_pack=pack.name,
-                    compliance_tags=pack.compliance_frameworks,
-                )
-
-        if "SSN" in pack.block_on_pii_output and any(SSN_RE.search(s) for s in surfaces):
-            return EvaluationResult(
-                allowed=False,
-                action="BLOCK",
-                http_status=500,
-                vector="security.output_pii_exfiltration",
-                reason="Upstream model output attempted raw SSN exfiltration",
-                policy_pack=pack.name,
-                compliance_tags=pack.compliance_frameworks,
-            )
-
-        if "API_SECRET" in pack.block_on_pii_output and any(
-            API_SECRET_RE.search(s) for s in surfaces
-        ):
-            return EvaluationResult(
-                allowed=False,
-                action="BLOCK",
-                http_status=500,
-                vector="security.output_secret_exfiltration",
-                reason="Upstream model output attempted raw API secret exfiltration",
-                policy_pack=pack.name,
-                compliance_tags=pack.compliance_frameworks,
-            )
-
-        if "MRN" in pack.block_on_pii_output and any(MRN_RE.search(s) for s in surfaces):
-            return EvaluationResult(
-                allowed=False,
-                action="BLOCK",
-                http_status=500,
-                vector="security.output_phi_exfiltration",
-                reason="Upstream model output attempted raw MRN/PHI exfiltration",
-                policy_pack=pack.name,
-                compliance_tags=pack.compliance_frameworks,
-            )
-
-        for rule_name, pattern in pack.domain_block_patterns:
-            if any(pattern.search(s) for s in surfaces):
-                return EvaluationResult(
-                    allowed=False,
-                    action="BLOCK",
-                    http_status=500,
-                    vector=f"domain.output_{rule_name}",
-                    reason=f"Upstream model output violated domain policy ({rule_name})",
+                    reason="Upstream output contained restricted instruction disclosure",
                     policy_pack=pack.name,
                     compliance_tags=pack.compliance_frameworks,
                 )
 
         sanitized, redactions = self._redact_pii(text, pack.pii_redaction)
+        if any(item in pack.block_on_pii_output for item in redactions):
+            return EvaluationResult(
+                allowed=False,
+                action="BLOCK",
+                http_status=500,
+                vector="security.output_pii_leak",
+                reason="Upstream output contained restricted PII",
+                policy_pack=pack.name,
+                compliance_tags=pack.compliance_frameworks,
+            )
+
+        action = "ALLOW_REDACTED" if redactions else "ALLOW"
         return EvaluationResult(
             allowed=True,
-            action="ALLOW_REDACTED" if redactions else "ALLOW",
+            action=action,
             http_status=200,
             sanitized_text=sanitized,
             redactions=redactions,
