@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 import uuid
@@ -15,7 +16,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lta.audit_ledger import AuditLedger
-from lta.config import Settings, TenantConfig, load_settings
+from lta.config import Settings, TenantConfig
 from lta.metrics import MetricsRegistry
 from lta.policy_engine import PolicyEngine
 from lta.providers import UpstreamProviderError, call_upstream
@@ -23,6 +24,7 @@ from lta.rate_limiter import SlidingWindowRateLimiter
 
 logger = logging.getLogger("lta.app")
 
+MAX_BODY_BYTES = int(os.getenv("LTA_MAX_BODY_BYTES", str(256 * 1024)))
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 
@@ -117,13 +119,10 @@ async def _app_lifespan(fastapi_app: FastAPI):
 
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
-    cfg = settings or load_settings()
+    cfg = settings or Settings.from_env()
     policy_engine = PolicyEngine(cfg.policy_dir)
     audit_ledger = AuditLedger(cfg.audit_db_url)
-    rate_limiter = SlidingWindowRateLimiter(
-        redis_url=cfg.redis_url,
-        fail_mode=cfg.redis_fail_mode,
-    )
+    rate_limiter = SlidingWindowRateLimiter(redis_url=cfg.redis_url)
     metrics = MetricsRegistry()
     runtime = GatewayRuntime(
         settings=cfg,
@@ -133,9 +132,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         metrics=metrics,
     )
 
-    docs_url = None if cfg.disable_docs else "/docs"
-    redoc_url = None if cfg.disable_docs else "/redoc"
-    openapi_url = None if cfg.disable_docs else "/openapi.json"
+    disable_docs = os.getenv("LTA_DISABLE_DOCS", "false").lower().strip() in ("1", "true", "yes")
+    docs_url = None if disable_docs else "/docs"
+    redoc_url = None if disable_docs else "/redoc"
+    openapi_url = None if disable_docs else "/openapi.json"
 
     fastapi_app = FastAPI(
         title="Lucid-Truth-Audit Gateway",
@@ -156,7 +156,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         content_length = request.headers.get("content-length")
         if content_length is not None:
             try:
-                if int(content_length) > cfg.max_body_bytes:
+                if int(content_length) > MAX_BODY_BYTES:
                     resp = JSONResponse(
                         status_code=413,
                         content={"detail": "Request body exceeds maximum allowed size"},
@@ -167,7 +167,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 pass
 
         body_bytes = await request.body()
-        if len(body_bytes) > cfg.max_body_bytes:
+        if len(body_bytes) > MAX_BODY_BYTES:
             resp = JSONResponse(
                 status_code=413,
                 content={"detail": "Request body exceeds maximum allowed size"},
@@ -192,7 +192,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         token = _extract_api_key(x_api_key, authorization)
         if not token:
             raise HTTPException(status_code=403, detail="Missing API credentials")
-        tenant = cfg.get_tenant_by_key(token)
+        tenant = cfg.authenticate(token)
         if tenant is None:
             raise HTTPException(status_code=403, detail="Invalid API credentials")
 
@@ -534,7 +534,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             tenant=tenant,
             endpoint="/api/v1/guard",
             messages=msgs,
-            model=tenant.default_model,
+            model=tenant.upstream_model,
             temperature=None,
             max_tokens=None,
             metadata=payload.metadata,
