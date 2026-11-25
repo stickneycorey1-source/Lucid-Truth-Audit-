@@ -1,27 +1,37 @@
-services:
-  - type: web
-    name: lucid-truth-audit
-    runtime: docker
-    plan: starter
-    healthCheckPath: /healthz
-    envVars:
-      - key: LTA_TENANTS_JSON
-        sync: false
-      - key: LTA_API_KEY
-        sync: false
-      - key: LTA_DEFAULT_PROVIDER
-        value: "mock"
-      - key: LTA_DEFAULT_TENANT
-        value: "github-actions"
-      - key: LTA_DEFAULT_POLICY
-        value: "general_enterprise"
-      - key: LTA_AUDIT_DB_URL
-        value: "sqlite:////var/data/lta_audit_ledger.db"
-      - key: LTA_CORS_ORIGINS
-        value: ""
-      - key: LTA_RATE_LIMIT_RPM
-        value: "60"
-    disk:
-      name: lucid-audit-data
-      mountPath: /var/data
-      sizeGB: 1
+diff --git a/render.yaml b/render.yaml
+--- a/render.yaml
++++ b/render.yaml
+@@ -3,18 +3,26 @@ services:
+     name: lucid-truth-audit
+     runtime: docker
+     plan: starter
+-    healthCheckPath: /health
++    healthCheckPath: /healthz
+     envVars:
+-      - key: LUCID_TENANT_KEYS
++      - key: LTA_TENANTS_JSON
+         sync: false
+-      - key: LUCID_CORS_ORIGINS
++      - key: LTA_API_KEY
++        sync: false
++      - key: LTA_DEFAULT_PROVIDER
++        value: "mock"
++      - key: LTA_DEFAULT_TENANT
++        value: "github-actions"
++      - key: LTA_DEFAULT_POLICY
++        value: "general_enterprise"
++      - key: LTA_AUDIT_DB_URL
++        value: "sqlite:////var/data/lta_audit_ledger.db"
++      - key: LTA_CORS_ORIGINS
+         value: ""
+-      - key: LUCID_RATE_LIMIT_MAX
++      - key: LTA_RATE_LIMIT_RPM
+         value: "60"
+-      - key: LUCID_RATE_LIMIT_WINDOW_SEC
+-        value: "60"
+-      - key: LUCID_LEDGER_DB_PATH
+-        value: "/var/data/lucid_audit_ledger.db"
+     disk:
+       name: lucid-audit-data
+       mountPath: /var/data
+       sizeGB: 1
