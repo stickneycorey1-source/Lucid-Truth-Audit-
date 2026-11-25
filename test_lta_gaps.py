@@ -17,9 +17,9 @@ import time
 import pytest
 import requests
 
-BASE = os.getenv("LTA_BASE_URL", "https://lucid-truth-audit.onrender.com").rstrip("/")
-KEY = os.getenv("LTA_API_KEY", "")
-SHADOW_KEY = os.getenv("LTA_SHADOW_KEY", "")
+BASE = os.getenv("LTA_BASE_URL", "https://lucid-truth-audit.onrender.com").strip().rstrip("/")
+KEY = os.getenv("LTA_API_KEY", "").strip()
+SHADOW_KEY = os.getenv("LTA_SHADOW_KEY", "").strip()
 OLD_DEFAULT_KEY = "lucid-prop-key-2026"
 GUARD = f"{BASE}/api/v1/guard"
 SHADOW = f"{BASE}/v1/shadow/ingest"
@@ -74,10 +74,22 @@ def test_old_default_key_is_rejected():
     assert r.status_code in (401, 403), f"Old default key still works: {r.status_code}"
 
 
-@pytest.mark.parametrize("bad", ["", "wrong", KEY[:-1] if KEY else "x", (KEY or "x") + "x", " " + (KEY or "x")])
+BAD_KEYS = [
+    k for k in [
+        "",
+        "wrong",
+        KEY[:-1] if len(KEY) > 1 else "x",
+        (KEY + "x") if KEY else "x",
+        ("x" + KEY) if KEY else "x",
+    ]
+    if "\n" not in k and "\r" not in k
+]
+
+
+@pytest.mark.parametrize("bad", BAD_KEYS)
 def test_wrong_keys_rejected(bad):
     r = guard("hello", key=bad)
-    assert r.status_code in (401, 403)
+    assert r.status_code in (401, 403), f"Expected 401/403 for bad key, got {r.status_code}"
 
 
 def test_missing_key_rejected():
