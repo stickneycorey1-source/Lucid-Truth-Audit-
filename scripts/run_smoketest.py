@@ -157,7 +157,7 @@ def main() -> int:
     guard_props = {}
     guard_required = []
 
-    # Warm service before fetching /openapi.json so Render cold start does not time out
+    # Warm Render service before fetching OpenAPI spec to reduce cold-start timeouts
     try:
         requests.get(f"{BASE_URL}/healthz", timeout=TIMEOUT)
     except Exception:
