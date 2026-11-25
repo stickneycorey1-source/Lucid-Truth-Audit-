@@ -1,3 +1,4 @@
+```python
 """Lucid-Truth-Audit Enterprise FastAPI Application (Hardened v2.4.1)."""
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ MAX_BODY_BYTES = int(os.getenv("LTA_MAX_BODY_BYTES", str(256 * 1024)))
 
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
     role: Literal["system", "user", "assistant"]
     content: str = Field(..., min_length=1, max_length=65536)
 
@@ -41,7 +41,6 @@ class ChatMessage(BaseModel):
 
 class OpenAIChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
     model: Optional[str] = None
     messages: List[ChatMessage] = Field(..., min_length=1, max_length=50)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
@@ -51,7 +50,6 @@ class OpenAIChatCompletionRequest(BaseModel):
 
 class LegacyGuardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-
     model_input: str = Field(..., min_length=1, max_length=65536)
     metadata: Optional[Dict[str, Any]] = None
 
@@ -116,6 +114,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "X-Content-Type-Options": "nosniff",
             "X-Frame-Options": "DENY",
         }
+
         content_length = request.headers.get("content-length")
         if content_length and content_length.isdigit() and int(content_length) > MAX_BODY_BYTES:
             return JSONResponse(
@@ -123,6 +122,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 content={"detail": f"Payload Too Large: exceeds {MAX_BODY_BYTES} byte limit."},
                 headers=sec_headers,
             )
+
         if request.method in ("POST", "PUT", "PATCH") and not (
             content_length and content_length.isdigit()
         ):
@@ -164,12 +164,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 status_code=500,
                 detail="Fail-closed configuration error: no tenant API keys configured.",
             )
+
         tenant = cfg.authenticate(raw_key)
         if not tenant:
             raise HTTPException(
                 status_code=403,
                 detail="Forbidden: Invalid or missing API key.",
             )
+
         allowed, remaining = limiter.check(tenant.tenant_id, tenant.rate_limit_rpm)
         if not allowed:
             metrics.observe(
@@ -249,7 +251,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         limit: int = 500,
         _: TenantConfig = Depends(require_admin),
     ) -> Response:
-        body = ledger.export_jsonl(tenant_id=tenant_id, limit=min(max(limit, 1), 5000))
+        body = ledger.export_jsonl(
+            tenant_id=tenant_id,
+            limit=min(max(limit, 1), 5000),
+        )
         return Response(content=body, media_type="application/x-ndjson")
 
     async def _run_pipeline(
@@ -336,7 +341,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         sanitized_messages: List[Dict[str, str]] = []
         all_redactions: List[str] = []
         non_system_contents = [
-            m["content"] for m in messages if m["role"] in ("user", "assistant")
+            m["content"]
+            for m in messages
+            if m["role"] in ("user", "assistant")
         ]
         combined_input_for_digest = "\n".join(m["content"] for m in messages)
 
@@ -432,5 +439,158 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         except UpstreamProviderError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-        out_res = engine.evaluate_output(upstream.content, policy_name=policy_name)
+        out_res = engine.evaluate_output(
+            upstream.content,
+            policy_name=policy_name,
+        )
         latency_ms = (time.perf_counter() - t0) * 1000.0
+
+        if not out_res.allowed:
+            rec = ledger.record(
+                tenant_id=tenant.tenant_id,
+                endpoint=endpoint,
+                policy_pack=policy_name,
+                provider=provider_name,
+                action="BLOCK",
+                http_status=out_res.http_status,
+                vector=out_res.vector,
+                redactions=sorted(set(all_redactions)),
+                raw_payload_for_digest=combined_input_for_digest,
+                latency_ms=latency_ms,
+            )
+            metrics.observe(
+                policy_pack=policy_name,
+                http_status=out_res.http_status,
+                latency_ms=latency_ms,
+                vector=out_res.vector,
+            )
+            raise HTTPException(
+                status_code=out_res.http_status,
+                detail={
+                    "error": out_res.reason,
+                    "vector": out_res.vector,
+                    "policy_pack": policy_name,
+                    "audit_entry_hash": rec.entry_hash,
+                },
+            )
+
+        all_redactions.extend(out_res.redactions)
+        unique_redactions = sorted(set(all_redactions))
+        final_action = "ALLOW_REDACTED" if unique_redactions else "ALLOW"
+
+        rec = ledger.record(
+            tenant_id=tenant.tenant_id,
+            endpoint=endpoint,
+            policy_pack=policy_name,
+            provider=provider_name,
+            action=final_action,
+            http_status=200,
+            vector=None,
+            redactions=unique_redactions,
+            raw_payload_for_digest=combined_input_for_digest,
+            latency_ms=latency_ms,
+        )
+        metrics.observe(
+            policy_pack=policy_name,
+            http_status=200,
+            latency_ms=latency_ms,
+        )
+
+        return {
+            "content": out_res.sanitized_text,
+            "model": upstream.model,
+            "provider": upstream.provider,
+            "prompt_tokens": upstream.prompt_tokens,
+            "completion_tokens": upstream.completion_tokens,
+            "action": final_action,
+            "redactions": unique_redactions,
+            "policy_pack": policy_name,
+            "audit_entry_hash": rec.entry_hash,
+            "audit_seq_id": rec.seq_id,
+            "latency_ms": round(latency_ms, 3),
+        }
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(
+        body: OpenAIChatCompletionRequest,
+        tenant: TenantConfig = Depends(authenticate_tenant),
+        x_lta_policy: Optional[str] = Header(default=None),
+        x_lta_provider: Optional[str] = Header(default=None),
+    ) -> Dict[str, Any]:
+        result = await _run_pipeline(
+            tenant=tenant,
+            endpoint="/v1/chat/completions",
+            messages=[
+                {"role": m.role, "content": m.content}
+                for m in body.messages
+            ],
+            model=body.model or tenant.upstream_model,
+            policy_override=x_lta_policy,
+            provider_override=x_lta_provider,
+            metadata=body.metadata,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+        )
+        return {
+            "id": f"chatcmpl-lta-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": result["model"],
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": result["content"],
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": result["prompt_tokens"],
+                "completion_tokens": result["completion_tokens"],
+                "total_tokens": (
+                    result["prompt_tokens"] + result["completion_tokens"]
+                ),
+            },
+            "lta_audit": {
+                "action": result["action"],
+                "policy_pack": result["policy_pack"],
+                "provider": result["provider"],
+                "redactions": result["redactions"],
+                "seq_id": result["audit_seq_id"],
+                "entry_hash": result["audit_entry_hash"],
+                "latency_ms": result["latency_ms"],
+            },
+        }
+
+    @app.post("/api/v1/guard")
+    async def legacy_guard(
+        body: LegacyGuardRequest,
+        tenant: TenantConfig = Depends(authenticate_tenant),
+        x_lta_policy: Optional[str] = Header(default=None),
+        x_lta_provider: Optional[str] = Header(default=None),
+    ) -> Dict[str, Any]:
+        result = await _run_pipeline(
+            tenant=tenant,
+            endpoint="/api/v1/guard",
+            messages=[{"role": "user", "content": body.model_input}],
+            model=tenant.upstream_model,
+            policy_override=x_lta_policy,
+            provider_override=x_lta_provider,
+            metadata=body.metadata,
+        )
+        return {
+            "status": "success",
+            "action": result["action"],
+            "message": result["content"],
+            "redactions": result["redactions"],
+            "policy_pack": result["policy_pack"],
+            "audit_entry_hash": result["audit_entry_hash"],
+        }
+
+    return app
+
+
+app = create_app()
+```
