@@ -30,6 +30,7 @@ except ImportError:
 from app.ledger import audit_ledger
 from app.evidence_chain import EvidenceChainStore, DuplicateEvidenceError
 from app.schemas.logistics_guard import router as logistics_router
+from app.api.shadow import router as shadow_router
 
 logger = logging.getLogger("lucid_truth_audit")
 
@@ -50,10 +51,11 @@ if _cors_origins:
         allow_origins=_cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["Content-Type", "X-API-Key"],
+        allow_headers=["Content-Type", "X-API-Key", "Authorization"],
     )
 
 app.include_router(logistics_router)
+app.include_router(shadow_router)
 
 
 # --- Security Headers Middleware ---
@@ -421,9 +423,4 @@ async def export_tenant_ledger_csv(
             sanitize_csv_cell(ev["summary"]),
             sanitize_csv_cell(ev["entry_hash"]),
         ])
-    buf.seek(0)
-    return StreamingResponse(
-        iter([buf.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="lucid_audit_{tenant.tenant_id}.csv"'},
-    )
+    buf.seek(0
