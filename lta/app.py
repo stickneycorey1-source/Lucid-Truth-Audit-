@@ -147,6 +147,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     )
     fastapi_app.state.lta_runtime = runtime
     fastapi_app.state.audit_ledger = audit_ledger
+    fastapi_app.state.ledger = audit_ledger
+    fastapi_app.state.rate_limiter = rate_limiter
 
     @fastapi_app.middleware("http")
     async def _ingress_middleware(request: Request, call_next):
