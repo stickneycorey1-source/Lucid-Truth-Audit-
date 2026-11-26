@@ -103,6 +103,19 @@ def _extract_response_text(resp: requests.Response) -> str:
         return resp.text
 
 
+def _resolve_pack_name(engine: PolicyEngine) -> str:
+    raw_packs = engine.list_packs() or []
+    names: List[str] = []
+    for item in raw_packs:
+        if isinstance(item, dict) and isinstance(item.get("name"), str):
+            names.append(item["name"])
+        elif isinstance(item, str):
+            names.append(item)
+    if "fmcsa" in names:
+        return "fmcsa"
+    return names[0] if names else "general_enterprise"
+
+
 @_requires_live_tenant()
 @pytest.mark.parametrize("old_key", OLD_DEFAULT_KEYS)
 def test_old_default_key_is_rejected(old_key: str) -> None:
@@ -260,8 +273,7 @@ def test_tampering_breaks_verification_local(tmp_path: Path, monkeypatch: pytest
 
     base_settings = Settings.from_env()
     engine = PolicyEngine(base_settings.policy_dir)
-    packs = engine.list_packs() or []
-    policy_pack = "fmcsa" if "fmcsa" in packs else (packs[0] if packs else "general_enterprise")
+    policy_pack = _resolve_pack_name(engine)
 
     monkeypatch.setenv("LTA_DEFAULT_PROVIDER", "mock")
     monkeypatch.setenv("LTA_AUDIT_DB_URL", db_url)
