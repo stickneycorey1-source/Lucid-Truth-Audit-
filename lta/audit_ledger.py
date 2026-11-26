@@ -546,4 +546,144 @@ class AuditLedger:
             provenance=prov_dict,
         )
 
-    def verify_ch
+    def verify_chain(self) -> Tuple[bool, int, Optional[int]]:
+        """Verify every SHA-256 chain link and provenance digest in the ledger."""
+        with self._connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
+                "policy_version, policy_sha256, config_fingerprint, provenance_hash, "
+                "provenance_json, provider, action, http_status, vector, "
+                "redactions_json, payload_sha256, latency_ms, prev_hash, entry_hash "
+                "FROM audit_events ORDER BY seq_id ASC"
+            )
+            rows = cur.fetchall()
+
+        expected_prev = GENESIS_HASH
+        for row in rows:
+            (
+                seq_id,
+                ts,
+                tenant_id,
+                endpoint,
+                policy_pack,
+                policy_version,
+                policy_sha256,
+                config_fingerprint,
+                provenance_hash,
+                provenance_json,
+                provider,
+                action,
+                http_status,
+                vector,
+                redactions_json,
+                payload_sha256,
+                latency_ms,
+                prev_hash,
+                entry_hash,
+            ) = row
+            if str(prev_hash) != expected_prev:
+                return False, len(rows), int(seq_id)
+
+            prov_dict = _normalize_provenance_dict(provenance_json)
+            req_id = str(prov_dict.get("request_id") or "")
+            expected_prov_hash = compute_provenance_hash(
+                prev_hash=str(prev_hash),
+                payload_sha256=str(payload_sha256),
+                policy_name=str(policy_pack),
+                policy_version=str(policy_version or "2.4.0"),
+                policy_sha256=str(policy_sha256 or ""),
+                config_fingerprint=str(config_fingerprint or ""),
+                request_id=req_id,
+            )
+            if provenance_hash and str(provenance_hash) != expected_prov_hash:
+                return False, len(rows), int(seq_id)
+
+            recomputed = _compute_entry_hash(
+                prev_hash=str(prev_hash),
+                timestamp_utc=str(ts),
+                tenant_id=str(tenant_id),
+                endpoint=str(endpoint),
+                policy_pack=str(policy_pack),
+                provider=str(provider),
+                action=str(action),
+                http_status=int(http_status),
+                vector=vector,
+                redactions_json=redactions_json,
+                payload_sha256=str(payload_sha256),
+                latency_ms=float(latency_ms),
+                policy_version=str(policy_version or "2.4.0"),
+                policy_sha256=str(policy_sha256 or ""),
+                config_fingerprint=str(config_fingerprint or ""),
+                provenance_hash=str(provenance_hash or ""),
+            )
+            if recomputed != str(entry_hash):
+                return False, len(rows), int(seq_id)
+            expected_prev = str(entry_hash)
+        return True, len(rows), None
+
+    def export_jsonl(self, tenant_id: Optional[str] = None, limit: int = 1000) -> str:
+        """Export audit events with full provenance metadata in JSON Lines format."""
+        placeholder = "%s" if self._is_postgres else "?"
+        with self._connection() as conn:
+            cur = conn.cursor()
+            base_sql = (
+                "SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
+                "policy_version, policy_sha256, config_fingerprint, provenance_hash, "
+                "provenance_json, provider, action, http_status, vector, "
+                "redactions_json, payload_sha256, latency_ms, prev_hash, entry_hash "
+                "FROM audit_events "
+            )
+            if tenant_id:
+                cur.execute(
+                    base_sql
+                    + f"WHERE tenant_id = {placeholder} ORDER BY seq_id DESC LIMIT {placeholder}",
+                    (tenant_id, limit),
+                )
+            else:
+                cur.execute(
+                    base_sql + f"ORDER BY seq_id DESC LIMIT {placeholder}",
+                    (limit,),
+                )
+            rows = cur.fetchall()
+
+        lines: List[str] = []
+        for row in rows:
+            lines.append(
+                json.dumps(
+                    {
+                        "seq_id": row[0],
+                        "timestamp_utc": row[1],
+                        "tenant_id": row[2],
+                        "endpoint": row[3],
+                        "policy_pack": row[4],
+                        "policy_version": row[5],
+                        "policy_sha256": row[6],
+                        "config_fingerprint": row[7],
+                        "provenance_hash": row[8],
+                        "provenance": _normalize_provenance_dict(row[9]),
+                        "provider": row[10],
+                        "action": row[11],
+                        "http_status": row[12],
+                        "vector": row[13] or None,
+                        "redactions": _normalize_redactions(row[14]),
+                        "payload_sha256": row[15],
+                        "latency_ms": row[16],
+                        "prev_hash": row[17],
+                        "entry_hash": row[18],
+                    }
+                )
+            )
+        return "\n".join(lines)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            if self._pool is not None:
+                self._pool.close()
+                self._pool = None
+            elif self._conn is not None:
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
