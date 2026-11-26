@@ -909,8 +909,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             allowed = True
             vector = None
             redactions = []
+
         latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        fallback_seed = f"{actor_id}:/v1/shadow/ingest:{policy_name}:{digest}:{resolved_req_id}"
         provenance_hash = ""
+        entry_hash = ""
+        seq_id: Optional[int] = None
         try:
             recorded = audit_ledger.record(
                 tenant_id=actor_id,
@@ -929,11 +933,24 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 request_id=resolved_req_id,
             )
             provenance_hash = getattr(recorded, "provenance_hash", "")
+            seq_id = getattr(recorded, "seq_id", None)
+            entry_hash = _extract_entry_hash(recorded, fallback_seed)
         except Exception as exc:
             logger.warning("Shadow audit_ledger.record warning: %s", exc)
+            entry_hash = hashlib.sha256(fallback_seed.encode("utf-8")).hexdigest()
+
+        audit_id = (
+            f"lta-shadow-{seq_id}-{entry_hash[:12]}"
+            if seq_id is not None
+            else f"lta-shadow-{entry_hash[:16]}"
+        )
+
         return {
             "accepted": True,
             "zero_retention": True,
+            "audit_id": audit_id,
+            "seq_id": seq_id,
+            "entry_hash": entry_hash,
             "request_id": resolved_req_id,
             "input_sha256": digest,
             "policy_pack": policy_name,
