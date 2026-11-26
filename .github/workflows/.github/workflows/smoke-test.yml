@@ -1,0 +1,36 @@
+name: LTA v2.4.0 Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Target LTA deployment URL"
+        required: true
+        default: "https://lucid-truth-audit.onrender.com"
+        type: string
+
+jobs:
+  smoke-test:
+    name: Run LTA v2.4.0 Smoke Suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip requests
+
+      - name: Run LTA v2.4.0 smoke tests
+        env:
+          LTA_BASE_URL: ${{ inputs.base_url }}
+          LTA_API_KEY: ${{ secrets.LTA_API_KEY }}
+          LTA_SHADOW_KEY: ${{ secrets.LTA_SHADOW_KEY }}
+          LTA_SMOKE_TIMEOUT_S: "60"
+        run: python smoke_test_lta_v240.py
