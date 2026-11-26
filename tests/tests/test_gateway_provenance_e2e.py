@@ -27,7 +27,7 @@ def pilot_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Tu
                 {
                     "tenant_id": "p2_transport_pilot",
                     "api_key": "p2-client-key-2026",
-                    "policy_pack": "fmcsa",
+                    "policy_pack": "general_enterprise",
                     "provider": "mock",
                     "rate_limit_rpm": 120,
                     "role": "client",
@@ -35,7 +35,7 @@ def pilot_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Tu
                 {
                     "tenant_id": "lucid_secops_admin",
                     "api_key": "lta-admin-key-2026",
-                    "policy_pack": "fmcsa",
+                    "policy_pack": "general_enterprise",
                     "provider": "mock",
                     "rate_limit_rpm": 300,
                     "role": "admin",
@@ -61,15 +61,15 @@ def test_chat_and_shadow_emit_verifiable_provenance_and_detect_config_tampering(
             "messages": [
                 {
                     "role": "user",
-                    "content": "Verify HOS compliance for load PO8492014 on I-94.",
+                    "content": "Summarize standard fleet dispatch status for load PO8492014.",
                 }
             ],
         },
     )
-    assert chat_resp.status_code == 200
+    assert chat_resp.status_code == 200, f"Unexpected {chat_resp.status_code}: {chat_resp.text}"
     body = chat_resp.json()
     audit_meta = body["lta_audit"]
-    assert audit_meta["policy_pack"] == "fmcsa"
+    assert audit_meta["policy_pack"] == "general_enterprise"
     assert len(audit_meta["policy_sha256"]) == 64
     assert len(audit_meta["config_fingerprint"]) == 64
     assert len(audit_meta["provenance_hash"]) == 64
