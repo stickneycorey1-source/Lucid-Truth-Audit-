@@ -1,7 +1,8 @@
-"""Provider-agnostic upstream LLM adapters (Hardened v2.4.1 — full Gemini support + scrubbed diagnostics)."""
+"""Provider-agnostic upstream LLM adapters (Hardened v2.4.1 — full Gemini support, transient 5xx retry + scrubbed diagnostics)."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ import httpx
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal", "ollama"}
+_TRANSIENT_HTTP_STATUSES = {502, 503, 504}
 _SECRET_SCRUB_RE = re.compile(
     r"(?:sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{20,}|Bearer\s+[A-Za-z0-9._\-]{16,})"
 )
@@ -98,15 +100,24 @@ async def _post_json(
     payload: Dict[str, Any],
     timeout_s: float,
     http_client: Optional[httpx.AsyncClient] = None,
+    max_retries: int = 1,
 ) -> Dict[str, Any]:
+    """POST JSON to an upstream provider with 1 lightweight retry on transient 502/503/504."""
+
+    async def _send_with_retries(client: httpx.AsyncClient) -> Dict[str, Any]:
+        for attempt in range(max_retries + 1):
+            resp = await client.post(url, headers=headers, json=payload, timeout=timeout_s)
+            if resp.status_code in _TRANSIENT_HTTP_STATUSES and attempt < max_retries:
+                await asyncio.sleep(0.75 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp.json()
+        raise UpstreamProviderError("Upstream request exhausted retries")
+
     if http_client is not None:
-        resp = await http_client.post(url, headers=headers, json=payload, timeout=timeout_s)
-        resp.raise_for_status()
-        return resp.json()
+        return await _send_with_retries(http_client)
     async with httpx.AsyncClient(timeout=timeout_s) as client:
-        resp = await client.post(url, headers=headers, json=payload)
-        resp.raise_for_status()
-        return resp.json()
+        return await _send_with_retries(client)
 
 
 async def call_upstream(
