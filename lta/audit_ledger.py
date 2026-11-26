@@ -1,39 +1,301 @@
-"""Unit tests covering all lines and branches in lta/audit_ledger.py."""
+"""Tamper-evident SHA-256 hash-chained persistent audit ledger (Hardened v2.4).
+
+Supports SQLite out of the box and PostgreSQL via `psycopg_pool.ConnectionPool`
+(with fallback to `psycopg.connect`) using transactional `pg_advisory_xact_lock`,
+automatic `rollback()` on errors, an O(1) `ping()` for `/readyz` probes, and a
+composite `(tenant_id, seq_id DESC)` index for fast SIEM exports.
+"""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
-import sys
-import types
-from pathlib import Path
-from typing import Any, List, Tuple
-
-import pytest
-
-from lta.audit_ledger import AuditLedger, GENESIS_HASH
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Iterator, List, Optional, Tuple
 
 
-class _FakeCursor:
-    def __init__(self, state: dict[str, Any]) -> None:
-        self._state = state
-        self._last_result: Any = None
+GENESIS_HASH = "0" * 64
+PG_CHAIN_LOCK_ID = 728391045
 
-    def execute(self, sql: str, params: Tuple[Any, ...] = ()) -> None:
-        sql_upper = sql.upper().strip()
-        self._state["executed"].append((sql, params))
-        if self._state.get("fail_on_next_execute"):
-            self._state["fail_on_next_execute"] = False
-            raise RuntimeError("simulated DB failure")
 
-        if sql_upper.startswith("SELECT 1"):
-            self._last_result = (1,)
-        elif "ORDER BY SEQ_ID DESC LIMIT 1" in sql_upper:
-            rows = self._state["rows"]
-            self._last_result = (rows[-1]["entry_hash"],) if rows else None
-        elif sql_upper.startswith("INSERT INTO AUDIT_EVENTS"):
-            seq_id = len(self._state["rows"]) + 1
+@dataclass
+class AuditRecord:
+    seq_id: int
+    timestamp_utc: str
+    tenant_id: str
+    endpoint: str
+    policy_pack: str
+    provider: str
+    action: str
+    http_status: int
+    vector: Optional[str]
+    redactions: List[str]
+    payload_sha256: str
+    latency_ms: float
+    prev_hash: str
+    entry_hash: str
+
+
+def _compute_entry_hash(
+    prev_hash: str,
+    timestamp_utc: str,
+    tenant_id: str,
+    endpoint: str,
+    policy_pack: str,
+    provider: str,
+    action: str,
+    http_status: int,
+    vector: Optional[str],
+    redactions_json: str,
+    payload_sha256: str,
+    latency_ms: float,
+) -> str:
+    canonical = json.dumps(
+        {
+            "prev_hash": prev_hash,
+            "timestamp_utc": timestamp_utc,
+            "tenant_id": tenant_id,
+            "endpoint": endpoint,
+            "policy_pack": policy_pack,
+            "provider": provider,
+            "action": action,
+            "http_status": http_status,
+            "vector": vector or "",
+            "redactions": redactions_json,
+            "payload_sha256": payload_sha256,
+            "latency_ms": round(latency_ms, 3),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class AuditLedger:
+    """Append-only cryptographic hash-chained audit log (SQLite or PostgreSQL)."""
+
+    def __init__(self, db_url: str = "sqlite:///./lta_audit_ledger.db") -> None:
+        self.db_url = db_url
+        self._lock = threading.Lock()
+        self._is_postgres = db_url.startswith("postgresql://") or db_url.startswith(
+            "postgres://"
+        )
+        self._pool = None
+        self._conn = None
+
+        if self._is_postgres:
+            try:
+                from psycopg_pool import ConnectionPool  # type: ignore
+
+                self._pool = ConnectionPool(
+                    conninfo=db_url,
+                    min_size=1,
+                    max_size=10,
+                    kwargs={"autocommit": False},
+                    check=ConnectionPool.check_connection,
+                )
+            except ImportError:
+                import psycopg  # type: ignore
+
+                self._conn = psycopg.connect(db_url, autocommit=False)
+        else:
+            path = db_url.replace("sqlite:///", "", 1)
+            self._conn = sqlite3.connect(path, check_same_thread=False)
+
+        self._init_schema()
+
+    @contextmanager
+    def _connection(self) -> Iterator[object]:
+        if self._pool is not None:
+            with self._pool.connection() as conn:
+                try:
+                    yield conn
+                except Exception:
+                    conn.rollback()
+                    raise
+        else:
+            with self._lock:
+                try:
+                    yield self._conn
+                except Exception:
+                    if self._conn is not None:
+                        self._conn.rollback()
+                    raise
+
+    def _init_schema(self) -> None:
+        ddl = (
+            """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                seq_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp_utc TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                policy_pack TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                action TEXT NOT NULL,
+                http_status INTEGER NOT NULL,
+                vector TEXT,
+                redactions_json TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                latency_ms REAL NOT NULL,
+                prev_hash TEXT NOT NULL,
+                entry_hash TEXT NOT NULL
+            )
+            """
+            if not self._is_postgres
+            else """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                seq_id BIGSERIAL PRIMARY KEY,
+                timestamp_utc TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                policy_pack TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                action TEXT NOT NULL,
+                http_status INTEGER NOT NULL,
+                vector TEXT,
+                redactions_json TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                latency_ms DOUBLE PRECISION NOT NULL,
+                prev_hash TEXT NOT NULL,
+                entry_hash TEXT NOT NULL
+            )
+            """
+        )
+        with self._connection() as conn:
+            cur = conn.cursor()
+            cur.execute(ddl)
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_tenant_seq "
+                "ON audit_events (tenant_id, seq_id DESC)"
+            )
+            conn.commit()
+
+    def ping(self) -> bool:
+        """Fast O(1) connectivity check for /readyz without scanning audit_events."""
+        try:
+            with self._connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            return True
+        except Exception:
+            return False
+
+    def record(
+        self,
+        *,
+        tenant_id: str,
+        endpoint: str,
+        policy_pack: str,
+        provider: str,
+        action: str,
+        http_status: int,
+        vector: Optional[str],
+        redactions: List[str],
+        raw_payload_for_digest: str,
+        latency_ms: float,
+    ) -> AuditRecord:
+        """Append a tamper-evident audit event without persisting raw prompt text."""
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        payload_sha256 = hashlib.sha256(
+            raw_payload_for_digest.encode("utf-8")
+        ).hexdigest()
+        redactions_json = json.dumps(redactions)
+        rounded_latency = round(float(latency_ms), 3)
+
+        with self._connection() as conn:
+            cur = conn.cursor()
+            if self._is_postgres:
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (PG_CHAIN_LOCK_ID,))
+            cur.execute(
+                "SELECT entry_hash FROM audit_events ORDER BY seq_id DESC LIMIT 1"
+            )
+            row = cur.fetchone()
+            prev_hash = row[0] if row else GENESIS_HASH
+            entry_hash = _compute_entry_hash(
+                prev_hash=prev_hash,
+                timestamp_utc=ts,
+                tenant_id=tenant_id,
+                endpoint=endpoint,
+                policy_pack=policy_pack,
+                provider=provider,
+                action=action,
+                http_status=http_status,
+                vector=vector,
+                redactions_json=redactions_json,
+                payload_sha256=payload_sha256,
+                latency_ms=rounded_latency,
+            )
+            placeholder = "%s" if self._is_postgres else "?"
+            placeholders = ", ".join([placeholder] * 13)
+            sql = (
+                f"INSERT INTO audit_events "
+                f"(timestamp_utc, tenant_id, endpoint, policy_pack, provider, action, "
+                f"http_status, vector, redactions_json, payload_sha256, latency_ms, "
+                f"prev_hash, entry_hash) VALUES ({placeholders})"
+            )
+            params = (
+                ts,
+                tenant_id,
+                endpoint,
+                policy_pack,
+                provider,
+                action,
+                http_status,
+                vector or "",
+                redactions_json,
+                payload_sha256,
+                rounded_latency,
+                prev_hash,
+                entry_hash,
+            )
+            if self._is_postgres:
+                cur.execute(sql + " RETURNING seq_id", params)
+                seq_id = int(cur.fetchone()[0])
+                conn.commit()
+            else:
+                cur.execute(sql, params)
+                conn.commit()
+                seq_id = int(cur.lastrowid)
+
+        return AuditRecord(
+            seq_id=seq_id,
+            timestamp_utc=ts,
+            tenant_id=tenant_id,
+            endpoint=endpoint,
+            policy_pack=policy_pack,
+            provider=provider,
+            action=action,
+            http_status=http_status,
+            vector=vector or None,
+            redactions=redactions,
+            payload_sha256=payload_sha256,
+            latency_ms=rounded_latency,
+            prev_hash=prev_hash,
+            entry_hash=entry_hash,
+        )
+
+    def verify_chain(self) -> Tuple[bool, int, Optional[int]]:
+        """Verify every SHA-256 link in the ledger."""
+        with self._connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
+                "provider, action, http_status, vector, redactions_json, "
+                "payload_sha256, latency_ms, prev_hash, entry_hash "
+                "FROM audit_events ORDER BY seq_id ASC"
+            )
+            rows = cur.fetchall()
+
+        expected_prev = GENESIS_HASH
+        for row in rows:
             (
+                seq_id,
                 ts,
                 tenant_id,
                 endpoint,
@@ -44,318 +306,82 @@ class _FakeCursor:
                 vector,
                 redactions_json,
                 payload_sha256,
-                rounded_latency,
+                latency_ms,
                 prev_hash,
                 entry_hash,
-            ) = params
-            self._state["rows"].append(
-                {
-                    "seq_id": seq_id,
-                    "timestamp_utc": ts,
-                    "tenant_id": tenant_id,
-                    "endpoint": endpoint,
-                    "policy_pack": policy_pack,
-                    "provider": provider,
-                    "action": action,
-                    "http_status": http_status,
-                    "vector": vector,
-                    "redactions_json": redactions_json,
-                    "payload_sha256": payload_sha256,
-                    "latency_ms": rounded_latency,
-                    "prev_hash": prev_hash,
-                    "entry_hash": entry_hash,
-                }
+            ) = row
+            if prev_hash != expected_prev:
+                return False, len(rows), int(seq_id)
+            recomputed = _compute_entry_hash(
+                prev_hash=prev_hash,
+                timestamp_utc=ts,
+                tenant_id=tenant_id,
+                endpoint=endpoint,
+                policy_pack=policy_pack,
+                provider=provider,
+                action=action,
+                http_status=int(http_status),
+                vector=vector,
+                redactions_json=redactions_json,
+                payload_sha256=payload_sha256,
+                latency_ms=float(latency_ms),
             )
-            self._last_seq_id = seq_id
-            self._last_result = (seq_id,)
-        elif "FROM AUDIT_EVENTS ORDER BY SEQ_ID ASC" in sql_upper:
-            self._last_result = [
-                (
-                    r["seq_id"],
-                    r["timestamp_utc"],
-                    r["tenant_id"],
-                    r["endpoint"],
-                    r["policy_pack"],
-                    r["provider"],
-                    r["action"],
-                    r["http_status"],
-                    r["vector"],
-                    r["redactions_json"],
-                    r["payload_sha256"],
-                    r["latency_ms"],
-                    r["prev_hash"],
-                    r["entry_hash"],
+            if recomputed != entry_hash:
+                return False, len(rows), int(seq_id)
+            expected_prev = entry_hash
+        return True, len(rows), None
+
+    def export_jsonl(self, tenant_id: Optional[str] = None, limit: int = 1000) -> str:
+        """Export audit events in SIEM-ready JSON Lines format (Splunk/Datadog)."""
+        placeholder = "%s" if self._is_postgres else "?"
+        with self._connection() as conn:
+            cur = conn.cursor()
+            if tenant_id:
+                cur.execute(
+                    f"SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
+                    f"provider, action, http_status, vector, redactions_json, "
+                    f"payload_sha256, latency_ms, prev_hash, entry_hash "
+                    f"FROM audit_events WHERE tenant_id = {placeholder} "
+                    f"ORDER BY seq_id DESC LIMIT {placeholder}",
+                    (tenant_id, limit),
                 )
-                for r in self._state["rows"]
-            ]
-        elif "FROM AUDIT_EVENTS WHERE TENANT_ID =" in sql_upper:
-            target_tenant = params[0]
-            limit_val = params[1]
-            filtered = [r for r in reversed(self._state["rows"]) if r["tenant_id"] == target_tenant][:limit_val]
-            self._last_result = [
-                (
-                    r["seq_id"],
-                    r["timestamp_utc"],
-                    r["tenant_id"],
-                    r["endpoint"],
-                    r["policy_pack"],
-                    r["provider"],
-                    r["action"],
-                    r["http_status"],
-                    r["vector"],
-                    r["redactions_json"],
-                    r["payload_sha256"],
-                    r["latency_ms"],
-                    r["prev_hash"],
-                    r["entry_hash"],
+            else:
+                cur.execute(
+                    f"SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
+                    f"provider, action, http_status, vector, redactions_json, "
+                    f"payload_sha256, latency_ms, prev_hash, entry_hash "
+                    f"FROM audit_events ORDER BY seq_id DESC LIMIT {placeholder}",
+                    (limit,),
                 )
-                for r in filtered
-            ]
-        elif "FROM AUDIT_EVENTS ORDER BY SEQ_ID DESC LIMIT" in sql_upper:
-            limit_val = params[0]
-            ordered = list(reversed(self._state["rows"]))[:limit_val]
-            self._last_result = [
-                (
-                    r["seq_id"],
-                    r["timestamp_utc"],
-                    r["tenant_id"],
-                    r["endpoint"],
-                    r["policy_pack"],
-                    r["provider"],
-                    r["action"],
-                    r["http_status"],
-                    r["vector"],
-                    r["redactions_json"],
-                    r["payload_sha256"],
-                    r["latency_ms"],
-                    r["prev_hash"],
-                    r["entry_hash"],
+            rows = cur.fetchall()
+
+        lines: List[str] = []
+        for row in rows:
+            lines.append(
+                json.dumps(
+                    {
+                        "seq_id": row[0],
+                        "timestamp_utc": row[1],
+                        "tenant_id": row[2],
+                        "endpoint": row[3],
+                        "policy_pack": row[4],
+                        "provider": row[5],
+                        "action": row[6],
+                        "http_status": row[7],
+                        "vector": row[8] or None,
+                        "redactions": json.loads(row[9]),
+                        "payload_sha256": row[10],
+                        "latency_ms": row[11],
+                        "prev_hash": row[12],
+                        "entry_hash": row[13],
+                    }
                 )
-                for r in ordered
-            ]
-        else:
-            self._last_result = None
-
-    def fetchone(self) -> Any:
-        return self._last_result
-
-    def fetchall(self) -> List[Any]:
-        return self._last_result or []
-
-
-class _FakeConn:
-    def __init__(self, state: dict[str, Any]) -> None:
-        self._state = state
-        self.closed = False
-
-    def cursor(self) -> _FakeCursor:
-        return _FakeCursor(self._state)
-
-    def commit(self) -> None:
-        self._state["commits"] += 1
-
-    def rollback(self) -> None:
-        self._state["rollbacks"] += 1
+            )
+        return "\n".join(lines)
 
     def close(self) -> None:
-        self.closed = True
-
-
-class _FakePoolCtx:
-    def __init__(self, conn: _FakeConn) -> None:
-        self._conn = conn
-
-    def __enter__(self) -> _FakeConn:
-        return self._conn
-
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        return False
-
-
-class _FakeConnectionPool:
-    last_instance: "_FakeConnectionPool | None" = None
-
-    def __init__(self, conninfo: str, min_size: int = 1, max_size: int = 10, kwargs=None, check=None) -> None:
-        self.conninfo = conninfo
-        self.state: dict[str, Any] = {
-            "rows": [],
-            "executed": [],
-            "commits": 0,
-            "rollbacks": 0,
-            "fail_on_next_execute": False,
-        }
-        self._conn = _FakeConn(self.state)
-        self.closed = False
-        _FakeConnectionPool.last_instance = self
-
-    @staticmethod
-    def check_connection(conn: _FakeConn) -> None:
-        return None
-
-    def connection(self) -> _FakePoolCtx:
-        return _FakePoolCtx(self._conn)
-
-    def close(self) -> None:
-        self.closed = True
-
-
-def test_sqlite_record_verify_tamper_export_and_close(tmp_path: Path):
-    db_file = tmp_path / "ledger_unit.db"
-    ledger = AuditLedger(f"sqlite:///{db_file}")
-
-    assert ledger.ping() is True
-    valid, count, broken_seq = ledger.verify_chain()
-    assert (valid, count, broken_seq) == (True, 0, None)
-
-    secret_prompt = "DoNotPersistRawDispatchText_XYZ123"
-    rec1 = ledger.record(
-        tenant_id="p2_pilot",
-        endpoint="/v1/chat/completions",
-        policy_pack="fmcsa",
-        provider="mock",
-        action="ALLOW_REDACTED",
-        http_status=200,
-        vector=None,
-        redactions=["CDL"],
-        raw_payload_for_digest=secret_prompt,
-        latency_ms=14.256,
-    )
-    assert rec1.seq_id == 1
-    assert rec1.prev_hash == GENESIS_HASH
-    assert len(rec1.entry_hash) == 64
-    assert rec1.latency_ms == 14.256
-
-    rec2 = ledger.record(
-        tenant_id="admin_ops",
-        endpoint="/v1/shadow/ingest",
-        policy_pack="fmcsa",
-        provider="shadow",
-        action="SHADOW_ALLOW",
-        http_status=202,
-        vector="clean",
-        redactions=[],
-        raw_payload_for_digest="BOL #8812 clean",
-        latency_ms=8.1,
-    )
-    assert rec2.seq_id == 2
-    assert rec2.prev_hash == rec1.entry_hash
-
-    valid2, count2, broken2 = ledger.verify_chain()
-    assert (valid2, count2, broken2) == (True, 2, None)
-
-    all_jsonl = ledger.export_jsonl()
-    assert secret_prompt not in all_jsonl
-    lines_all = [json.loads(line) for line in all_jsonl.splitlines()]
-    assert len(lines_all) == 2
-    assert lines_all[0]["seq_id"] == 2  # DESC order
-
-    filtered_jsonl = ledger.export_jsonl(tenant_id="p2_pilot", limit=10)
-    lines_filtered = [json.loads(line) for line in filtered_jsonl.splitlines()]
-    assert len(lines_filtered) == 1
-    assert lines_filtered[0]["tenant_id"] == "p2_pilot"
-
-    # Break entry_hash on seq_id=1
-    conn = sqlite3.connect(str(db_file))
-    conn.execute("UPDATE audit_events SET action = 'TAMPERED' WHERE seq_id = 1")
-    conn.commit()
-    conn.close()
-
-    valid_tamper, total_tamper, broken_id = ledger.verify_chain()
-    assert valid_tamper is False
-    assert total_tamper == 2
-    assert broken_id == 1
-
-    # Break prev_hash on seq_id=2 after restoring seq_id=1's action
-    conn = sqlite3.connect(str(db_file))
-    conn.execute("UPDATE audit_events SET action = 'ALLOW_REDACTED' WHERE seq_id = 1")
-    conn.execute("UPDATE audit_events SET prev_hash = 'deadbeef' WHERE seq_id = 2")
-    conn.commit()
-    conn.close()
-
-    valid_link_break, _, broken_link_id = ledger.verify_chain()
-    assert valid_link_break is False
-    assert broken_link_id == 2
-
-    ledger.close()
-
-
-def test_sqlite_ping_false_and_rollback_on_error(tmp_path: Path):
-    db_file = tmp_path / "ledger_err.db"
-    ledger = AuditLedger(f"sqlite:///{db_file}")
-
-    with pytest.raises(sqlite3.OperationalError):
-        ledger.record(
-            tenant_id="p2_pilot",
-            endpoint="/v1/chat/completions",
-            policy_pack="fmcsa",
-            provider="mock",
-            action="ALLOW",
-            http_status=200,
-            vector=None,
-            redactions=[],
-            raw_payload_for_digest="x",
-            latency_ms=1.0,
-        )
-        # Force SQL error via invalid table state by closing connection before ping/record
-    ledger.close()
-    assert ledger.ping() is False
-
-
-def test_postgres_pool_and_psycopg_fallback(monkeypatch: pytest.MonkeyPatch):
-    pool_mod = types.ModuleType("psycopg_pool")
-    pool_mod.ConnectionPool = _FakeConnectionPool
-    monkeypatch.setitem(sys.modules, "psycopg_pool", pool_mod)
-
-    pg_ledger = AuditLedger("postgresql://user:pass@localhost:5432/lta")
-    assert pg_ledger.ping() is True
-
-    rec = pg_ledger.record(
-        tenant_id="p2_pilot",
-        endpoint="/v1/chat/completions",
-        policy_pack="fmcsa",
-        provider="mock",
-        action="ALLOW",
-        http_status=200,
-        vector=None,
-        redactions=[],
-        raw_payload_for_digest="pg payload",
-        latency_ms=5.0,
-    )
-    assert rec.seq_id == 1
-    assert any("PG_ADVISORY_XACT_LOCK" in sql.upper() for sql, _ in _FakeConnectionPool.last_instance.state["executed"])
-
-    # Trigger rollback path inside _connection
-    _FakeConnectionPool.last_instance.state["fail_on_next_execute"] = True
-    with pytest.raises(RuntimeError, match="simulated DB failure"):
-        pg_ledger.record(
-            tenant_id="p2_pilot",
-            endpoint="/v1/chat/completions",
-            policy_pack="fmcsa",
-            provider="mock",
-            action="ALLOW",
-            http_status=200,
-            vector=None,
-            redactions=[],
-            raw_payload_for_digest="pg fail",
-            latency_ms=5.0,
-        )
-    assert _FakeConnectionPool.last_instance.state["rollbacks"] >= 1
-    pg_ledger.close()
-    assert _FakeConnectionPool.last_instance.closed is True
-
-    # Fallback when psycopg_pool is unavailable -> uses psycopg.connect
-    monkeypatch.delitem(sys.modules, "psycopg_pool", raising=False)
-    fallback_state: dict[str, Any] = {
-        "rows": [],
-        "executed": [],
-        "commits": 0,
-        "rollbacks": 0,
-        "fail_on_next_execute": False,
-    }
-    psycopg_mod = types.ModuleType("psycopg")
-    psycopg_mod.connect = lambda dsn, autocommit=False: _FakeConn(fallback_state)
-    monkeypatch.setitem(sys.modules, "psycopg", psycopg_mod)
-
-    fb_ledger = AuditLedger("postgres://user:pass@localhost:5432/lta_fb")
-    assert fb_ledger.ping() is True
-    fb_ledger.close()
+        if self._pool is not None:
+            self._pool.close()
+        elif self._conn is not None:
+            with self._lock:
+                self._conn.close()
