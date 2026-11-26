@@ -202,15 +202,33 @@ def test_rate_limit_on_bad_keys():
 # ---------- Latency (client round trip) ----------
 
 def test_latency_profile_report_only():
-    times = []
+    client_times_ms = []
+    gateway_times_ms = []
     for _ in range(20):
         t = time.perf_counter()
-        guard("What is the capital of France?")
-        times.append((time.perf_counter() - t) * 1000)
-    med = statistics.median(times)
-    p95 = sorted(times)[int(len(times) * 0.95) - 1]
-    print(f"\nmedian={med:.1f} ms  p95={p95:.1f} ms  max={max(times):.1f} ms (client round trip)")
-    assert med < 1000
+        r = guard("What is the capital of France?")
+        client_times_ms.append((time.perf_counter() - t) * 1000)
+        assert r.status_code == 200, f"Unexpected status during latency profile: {r.status_code} {r.text[:160]}"
+        try:
+            audit_meta = r.json().get("lta_audit")
+            if isinstance(audit_meta, dict) and isinstance(audit_meta.get("latency_ms"), (int, float)):
+                gateway_times_ms.append(float(audit_meta["latency_ms"]))
+        except ValueError:
+            pass
+
+    med = statistics.median(client_times_ms)
+    p95 = sorted(client_times_ms)[int(len(client_times_ms) * 0.95) - 1]
+    max_ms = max(client_times_ms)
+    gw_summary = ""
+    if gateway_times_ms:
+        gw_med = statistics.median(gateway_times_ms)
+        gw_p95 = sorted(gateway_times_ms)[int(len(gateway_times_ms) * 0.95) - 1]
+        gw_summary = f" | gateway_reported median={gw_med:.1f} ms p95={gw_p95:.1f} ms"
+
+    print(
+        f"\nclient_round_trip median={med:.1f} ms  p95={p95:.1f} ms  max={max_ms:.1f} ms{gw_summary}"
+    )
+    assert med < 15000, f"End-to-end upstream LLM median latency too high: {med:.1f} ms"
 
 
 # ---------- Ledger ----------
