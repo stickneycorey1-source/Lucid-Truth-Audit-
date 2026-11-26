@@ -1,444 +1,338 @@
-"""Unit tests for lta/providers.py (v2.4.1) covering all upstream adapters and error paths."""
+"""Provider-agnostic upstream LLM adapters (Hardened v2.4.1 — full Gemini support + scrubbed diagnostics)."""
 
 from __future__ import annotations
 
-import json
-import pytest
+import os
+import re
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
 import httpx
 
-from lta import providers
-from lta.providers import (
-    ProviderResponse,
-    UpstreamProviderError,
-    _fallback_enabled,
-    _post_json,
-    _scrub_secrets,
-    _simulate_mock_response,
-    call_upstream,
-    validate_upstream_url,
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal", "ollama"}
+_SECRET_SCRUB_RE = re.compile(
+    r"(?:sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{20,}|Bearer\s+[A-Za-z0-9._\-]{16,})"
 )
 
 
-# ---------- Helpers & Validation ----------
+def _scrub_secrets(text: str) -> str:
+    return _SECRET_SCRUB_RE.sub("[REDACTED_SECRET]", text)
 
-def test_scrub_secrets_redacts_known_token_patterns():
-    raw = (
-        "openai=sk-1234567890abcdef12 gh=ghp_1234567890abcdefghij12 "
-        "aws=AKIA1234567890ABCDEF gem=AIzaSy1234567890abcdefghij "
-        "hdr=Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+
+@dataclass
+class ProviderResponse:
+    content: str
+    model: str
+    provider: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+class UpstreamProviderError(RuntimeError):
+    """Raised when an upstream LLM provider call fails or is misconfigured."""
+
+
+def validate_upstream_url(url: str) -> str:
+    """Enforce HTTPS on all non-localhost upstream provider endpoints."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https":
+        return url.rstrip("/")
+    if parsed.scheme == "http" and host in _LOCAL_HOSTS:
+        return url.rstrip("/")
+    raise UpstreamProviderError(
+        f"Refusing insecure non-local upstream URL scheme '{parsed.scheme}' for host '{host}'."
     )
-    scrubbed = _scrub_secrets(raw)
-    assert "sk-1234567890abcdef12" not in scrubbed
-    assert "ghp_1234567890abcdefghij12" not in scrubbed
-    assert "AKIA1234567890ABCDEF" not in scrubbed
-    assert "AIzaSy1234567890abcdefghij" not in scrubbed
-    assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" not in scrubbed
-    assert scrubbed.count("[REDACTED_SECRET]") == 5
 
 
-def test_validate_upstream_url_accepts_https_and_local_http():
-    assert validate_upstream_url("https://api.openai.com/v1/") == "https://api.openai.com/v1"
-    assert validate_upstream_url("http://localhost:11434/v1/") == "http://localhost:11434/v1"
-    assert validate_upstream_url("http://127.0.0.1:8080/v1") == "http://127.0.0.1:8080/v1"
-    assert validate_upstream_url("http://ollama:11434/v1") == "http://ollama:11434/v1"
-
-
-@pytest.mark.parametrize("bad_url", [
-    "http://api.openai.com/v1",
-    "ftp://example.com/v1",
-    "https://",
-])
-def test_validate_upstream_url_rejects_insecure_remote_urls(bad_url):
-    with pytest.raises(UpstreamProviderError):
-        validate_upstream_url(bad_url)
-
-
-@pytest.mark.parametrize("env_val,expected", [
-    ("true", True),
-    ("1", True),
-    ("YES", True),
-    ("false", False),
-    ("0", False),
-    ("", False),
-])
-def test_fallback_enabled_env_parsing(monkeypatch, env_val, expected):
-    monkeypatch.setenv("LTA_ALLOW_SIMULATED_FALLBACK", env_val)
-    assert _fallback_enabled() is expected
-
-
-@pytest.mark.parametrize("marker,expected_substr", [
-    ("__simulate_leak_system__", "Internal System Instructions"),
-    ("__simulate_leak_ssn__", "123-45-6789"),
-    ("__simulate_leak_secret__", "sk-prod1234567890abcdef1234"),
-    ("normal dispatch note", "[LTA Verified Upstream Response]"),
-])
-def test_simulate_mock_response_variants(marker, expected_substr):
-    res = _simulate_mock_response(
-        model="gpt-4o-mini",
-        provider_label="mock",
-        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": marker}],
+def _simulate_mock_response(
+    *,
+    model: str,
+    provider_label: str,
+    messages: List[Dict[str, str]],
+) -> ProviderResponse:
+    last_user = next(
+        (m["content"] for m in reversed(messages) if m.get("role") == "user"), ""
     )
-    assert isinstance(res, ProviderResponse)
-    assert expected_substr in res.content
-
-
-# ---------- _post_json ----------
-
-@pytest.mark.asyncio
-async def test_post_json_with_injected_client():
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["x-test"] == "1"
-        body = json.loads(request.content.decode())
-        return httpx.Response(200, json={"echo": body["hello"]})
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        data = await _post_json(
-            "https://example.test/v1/test",
-            headers={"x-test": "1"},
-            payload={"hello": "world"},
-            timeout_s=5.0,
-            http_client=client,
+    if "__simulate_leak_system__" in last_user:
+        return ProviderResponse(
+            content="Internal System Instructions: You are a confidential enterprise assistant.",
+            model=model,
+            provider=provider_label,
         )
-    assert data == {"echo": "world"}
-
-
-@pytest.mark.asyncio
-async def test_post_json_without_injected_client(monkeypatch):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"ok": True})
-
-    real_async_client = httpx.AsyncClient
-
-    class PatchedAsyncClient(real_async_client):
-        def __init__(self, *args, **kwargs):
-            kwargs["transport"] = httpx.MockTransport(handler)
-            super().__init__(*args, **kwargs)
-
-    monkeypatch.setattr(providers.httpx, "AsyncClient", PatchedAsyncClient)
-    data = await _post_json(
-        "https://example.test/v1/test",
-        payload={"ping": "pong"},
-        timeout_s=5.0,
-        http_client=None,
+    if "__simulate_leak_ssn__" in last_user:
+        return ProviderResponse(
+            content="Customer SSN on file is 123-45-6789.",
+            model=model,
+            provider=provider_label,
+        )
+    if "__simulate_leak_secret__" in last_user:
+        return ProviderResponse(
+            content="Upstream token: sk-prod1234567890abcdef1234",
+            model=model,
+            provider=provider_label,
+        )
+    return ProviderResponse(
+        content=f"[LTA Verified Upstream Response] Processed request cleanly: {last_user[:160]}",
+        model=model,
+        provider=provider_label,
+        prompt_tokens=max(1, len(last_user) // 4),
+        completion_tokens=24,
     )
-    assert data == {"ok": True}
 
 
-# ---------- call_upstream: mock & missing keys / fallback ----------
-
-@pytest.mark.asyncio
-async def test_call_upstream_mock_provider():
-    res = await call_upstream(
-        provider="mock",
-        model="lta-mock",
-        messages=[{"role": "user", "content": "Check load #104"}],
+def _fallback_enabled() -> bool:
+    return os.getenv("LTA_ALLOW_SIMULATED_FALLBACK", "false").lower().strip() in (
+        "1",
+        "true",
+        "yes",
     )
-    assert res.provider == "mock"
-    assert "Check load #104" in res.content
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("provider,env_keys", [
-    ("openai", ["LTA_OPENAI_API_KEY", "OPENAI_API_KEY"]),
-    ("anthropic", ["ANTHROPIC_API_KEY"]),
-    ("gemini", ["GEMINI_API_KEY"]),
-])
-async def test_call_upstream_missing_key_raises_or_falls_back(monkeypatch, provider, env_keys):
-    for k in env_keys:
-        monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("LTA_ALLOW_SIMULATED_FALLBACK", "false")
+async def _post_json(
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    payload: Dict[str, Any],
+    timeout_s: float,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> Dict[str, Any]:
+    if http_client is not None:
+        resp = await http_client.post(url, headers=headers, json=payload, timeout=timeout_s)
+        resp.raise_for_status()
+        return resp.json()
+    async with httpx.AsyncClient(timeout=timeout_s) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+        resp.raise_for_status()
+        return resp.json()
 
-    with pytest.raises(UpstreamProviderError, match="Missing"):
-        await call_upstream(
-            provider=provider,
-            model="test-model",
-            messages=[{"role": "user", "content": "hello"}],
+
+async def call_upstream(
+    *,
+    provider: str,
+    model: str,
+    messages: List[Dict[str, str]],
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    timeout_s: float = 30.0,
+    http_client: Optional[httpx.AsyncClient] = None,
+) -> ProviderResponse:
+    """Route sanitized chat messages to the configured upstream AI provider."""
+    provider_key = provider.lower().strip()
+    model = model.strip()
+
+    if provider_key == "mock":
+        return _simulate_mock_response(
+            model=model,
+            provider_label="mock",
+            messages=messages,
         )
 
-    monkeypatch.setenv("LTA_ALLOW_SIMULATED_FALLBACK", "true")
-    res = await call_upstream(
-        provider=provider,
-        model="test-model",
-        messages=[{"role": "user", "content": "hello"}],
-    )
-    assert res.provider == f"{provider}:simulated"
+    try:
+        if provider_key in ("openai", "azure_openai", "vllm", "ollama"):
+            raw_url = os.getenv(
+                f"LTA_{provider_key.upper()}_BASE_URL",
+                "http://localhost:11434/v1"
+                if provider_key == "ollama"
+                else "https://api.openai.com/v1",
+            )
+            base_url = validate_upstream_url(raw_url)
+            api_key = (
+                os.getenv(f"LTA_{provider_key.upper()}_API_KEY")
+                or os.getenv("OPENAI_API_KEY", "")
+            ).strip()
+            if provider_key in ("openai", "azure_openai") and not api_key:
+                if _fallback_enabled():
+                    return _simulate_mock_response(
+                        model=model,
+                        provider_label=f"{provider_key}:simulated",
+                        messages=messages,
+                    )
+                raise UpstreamProviderError(
+                    f"Missing API key for upstream provider '{provider_key}'"
+                )
+            headers = {"Content-Type": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+            payload: Dict[str, Any] = {"model": model, "messages": messages}
+            if temperature is not None:
+                payload["temperature"] = temperature
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
 
-
-# ---------- call_upstream: OpenAI-compatible & Ollama ----------
-
-@pytest.mark.asyncio
-async def test_call_upstream_openai_success(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key-1234567890123456")
-    monkeypatch.setenv("LTA_OPENAI_BASE_URL", "https://api.openai.test/v1")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == "https://api.openai.test/v1/chat/completions"
-        assert request.headers["Authorization"] == "Bearer sk-test-key-1234567890123456"
-        body = json.loads(request.content.decode())
-        assert body["model"] == "gpt-4o-mini"
-        assert body["temperature"] == 0.2
-        assert body["max_tokens"] == 128
-        return httpx.Response(
-            200,
-            json={
-                "model": "gpt-4o-mini",
-                "choices": [{"message": {"content": "Dispatch cleared."}}],
-                "usage": {"prompt_tokens": 11, "completion_tokens": 3},
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        res = await call_upstream(
-            provider="openai",
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": "Status?"}],
-            temperature=0.2,
-            max_tokens=128,
-            http_client=client,
-        )
-    assert res.content == "Dispatch cleared."
-    assert res.provider == "openai"
-    assert res.prompt_tokens == 11
-    assert res.completion_tokens == 3
-
-
-@pytest.mark.asyncio
-async def test_call_upstream_ollama_local_no_key_required(monkeypatch):
-    monkeypatch.setenv("LTA_OLLAMA_BASE_URL", "http://localhost:11434/v1")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert "Authorization" not in request.headers
-        return httpx.Response(
-            200,
-            json={
-                "model": "llama3.2",
-                "choices": [{"message": {"content": "Local response"}}],
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        res = await call_upstream(
-            provider="ollama",
-            model="llama3.2",
-            messages=[{"role": "user", "content": "hi"}],
-            http_client=client,
-        )
-    assert res.content == "Local response"
-    assert res.provider == "ollama"
-
-
-@pytest.mark.asyncio
-async def test_call_upstream_openai_empty_choices_raises(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key-1234567890123456")
-    monkeypatch.setenv("LTA_ALLOW_SIMULATED_FALLBACK", "false")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"choices": []})
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        with pytest.raises(UpstreamProviderError, match="empty choices"):
-            await call_upstream(
-                provider="openai",
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": "hi"}],
-                http_client=client,
+            data = await _post_json(
+                f"{base_url}/chat/completions",
+                headers=headers,
+                payload=payload,
+                timeout_s=timeout_s,
+                http_client=http_client,
+            )
+            choices = data.get("choices") or []
+            if not choices or not isinstance(choices[0], dict):
+                raise UpstreamProviderError(f"Upstream '{provider_key}' returned empty choices")
+            content = (choices[0].get("message") or {}).get("content", "")
+            usage = data.get("usage") or {}
+            return ProviderResponse(
+                content=str(content),
+                model=str(data.get("model", model)),
+                provider=provider_key,
+                prompt_tokens=int(usage.get("prompt_tokens", 0)),
+                completion_tokens=int(usage.get("completion_tokens", 0)),
             )
 
+        if provider_key == "anthropic":
+            api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+            if not api_key:
+                if _fallback_enabled():
+                    return _simulate_mock_response(
+                        model=model,
+                        provider_label="anthropic:simulated",
+                        messages=messages,
+                    )
+                raise UpstreamProviderError("Missing ANTHROPIC_API_KEY")
+            system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+            chat_msgs = [m for m in messages if m.get("role") != "system"]
+            payload = {
+                "model": model,
+                "max_tokens": max_tokens or 1024,
+                "messages": chat_msgs,
+            }
+            if temperature is not None:
+                payload["temperature"] = temperature
+            if system_parts:
+                payload["system"] = "\n".join(system_parts)
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            }
+            data = await _post_json(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                payload=payload,
+                timeout_s=timeout_s,
+                http_client=http_client,
+            )
+            text_blocks = [
+                b.get("text", "")
+                for b in data.get("content", [])
+                if isinstance(b, dict) and b.get("type") == "text"
+            ]
+            usage = data.get("usage") or {}
+            return ProviderResponse(
+                content="".join(text_blocks),
+                model=str(data.get("model", model)),
+                provider="anthropic",
+                prompt_tokens=int(usage.get("input_tokens", 0)),
+                completion_tokens=int(usage.get("output_tokens", 0)),
+            )
 
-# ---------- call_upstream: Anthropic ----------
+        if provider_key == "gemini":
+            api_key = os.getenv("GEMINI_API_KEY", "").strip()
+            if not api_key:
+                if _fallback_enabled():
+                    return _simulate_mock_response(
+                        model=model,
+                        provider_label="gemini:simulated",
+                        messages=messages,
+                    )
+                raise UpstreamProviderError("Missing GEMINI_API_KEY")
+            system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+            contents = [
+                {
+                    "role": "model" if m.get("role") == "assistant" else "user",
+                    "parts": [{"text": m["content"]}],
+                }
+                for m in messages
+                if m.get("role") != "system"
+            ]
+            gem_payload: Dict[str, Any] = {"contents": contents}
+            if system_parts:
+                gem_payload["systemInstruction"] = {
+                    "parts": [{"text": "\n".join(system_parts)}]
+                }
+            gen_cfg: Dict[str, Any] = {}
+            if temperature is not None:
+                gen_cfg["temperature"] = temperature
+            if max_tokens is not None:
+                gen_cfg["maxOutputTokens"] = max_tokens
+            if gen_cfg:
+                gem_payload["generationConfig"] = gen_cfg
 
-@pytest.mark.asyncio
-async def test_call_upstream_anthropic_success(monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key-1234567890123456")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert str(request.url) == "https://api.anthropic.com/v1/messages"
-        assert request.headers["x-api-key"] == "sk-ant-test-key-1234567890123456"
-        assert request.headers["anthropic-version"] == "2023-06-01"
-        body = json.loads(request.content.decode())
-        assert body["system"] == "Be concise"
-        assert body["messages"] == [{"role": "user", "content": "Check HOS"}]
-        return httpx.Response(
-            200,
-            json={
-                "model": "claude-sonnet-4-20250514",
-                "content": [{"type": "text", "text": "HOS within limits."}],
-                "usage": {"input_tokens": 15, "output_tokens": 6},
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        res = await call_upstream(
-            provider="anthropic",
-            model="claude-sonnet-4-20250514",
-            messages=[
-                {"role": "system", "content": "Be concise"},
-                {"role": "user", "content": "Check HOS"},
-            ],
-            http_client=client,
-        )
-    assert res.content == "HOS within limits."
-    assert res.provider == "anthropic"
-    assert res.prompt_tokens == 15
-    assert res.completion_tokens == 6
-
-
-# ---------- call_upstream: Gemini ----------
-
-@pytest.mark.asyncio
-async def test_call_upstream_gemini_success_skips_thought_parts(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "AIzaTestKey12345678901234567890")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["x-goog-api-key"] == "AIzaTestKey12345678901234567890"
-        body = json.loads(request.content.decode())
-        assert body["systemInstruction"]["parts"][0]["text"] == "Safety first"
-        assert body["contents"][0]["role"] == "user"
-        assert body["contents"][1]["role"] == "model"
-        return httpx.Response(
-            200,
-            json={
-                "candidates": [
-                    {
-                        "content": {
-                            "parts": [
-                                {"thought": True, "text": "internal chain of thought"},
-                                {"text": "Final answer: 42"},
-                            ]
-                        },
-                        "finishReason": "STOP",
-                    }
-                ],
-                "usageMetadata": {"promptTokenCount": 20, "candidatesTokenCount": 8},
-            },
-        )
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        res = await call_upstream(
-            provider="gemini",
-            model="gemini-2.5-flash",
-            messages=[
-                {"role": "system", "content": "Safety first"},
-                {"role": "user", "content": "Q1"},
-                {"role": "assistant", "content": "A1"},
-                {"role": "user", "content": "Q2"},
-            ],
-            temperature=0.0,
-            max_tokens=256,
-            http_client=client,
-        )
-    assert res.content == "Final answer: 42"
-    assert res.provider == "gemini"
-    assert res.prompt_tokens == 20
-    assert res.completion_tokens == 8
-
-
-@pytest.mark.asyncio
-async def test_call_upstream_gemini_no_candidates_and_empty_parts(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "AIzaTestKey12345678901234567890")
-    monkeypatch.setenv("LTA_ALLOW_SIMULATED_FALLBACK", "false")
-
-    def no_cand_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json={"candidates": []})
-
-    transport1 = httpx.MockTransport(no_cand_handler)
-    async with httpx.AsyncClient(transport=transport1) as client:
-        with pytest.raises(UpstreamProviderError, match="no candidates"):
-            await call_upstream(
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model}:generateContent"
+            )
+            headers = {
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            }
+            data = await _post_json(
+                url,
+                headers=headers,
+                payload=gem_payload,
+                timeout_s=timeout_s,
+                http_client=http_client,
+            )
+            candidates = data.get("candidates") or []
+            if not candidates or not isinstance(candidates[0], dict):
+                raise UpstreamProviderError(
+                    f"Upstream 'gemini' returned no candidates ({model})"
+                )
+            parts = (candidates[0].get("content") or {}).get("parts") or []
+            if not parts:
+                finish = candidates[0].get("finishReason", "UNKNOWN")
+                raise UpstreamProviderError(
+                    f"Upstream 'gemini' returned empty content (finishReason={finish})"
+                )
+            text = "".join(
+                p.get("text", "")
+                for p in parts
+                if isinstance(p, dict) and not p.get("thought")
+            )
+            usage = data.get("usageMetadata") or {}
+            return ProviderResponse(
+                content=text,
+                model=model,
                 provider="gemini",
-                model="gemini-2.5-flash",
-                messages=[{"role": "user", "content": "hi"}],
-                http_client=client,
+                prompt_tokens=int(usage.get("promptTokenCount", 0)),
+                completion_tokens=int(usage.get("candidatesTokenCount", 0)),
             )
-
-    def empty_parts_handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"candidates": [{"content": {"parts": []}, "finishReason": "SAFETY"}]},
-        )
-
-    transport2 = httpx.MockTransport(empty_parts_handler)
-    async with httpx.AsyncClient(transport=transport2) as client:
-        with pytest.raises(UpstreamProviderError, match="finishReason=SAFETY"):
-            await call_upstream(
-                provider="gemini",
-                model="gemini-2.5-flash",
-                messages=[{"role": "user", "content": "hi"}],
-                http_client=client,
+    except httpx.HTTPStatusError as exc:
+        if _fallback_enabled():
+            return _simulate_mock_response(
+                model=model,
+                provider_label=f"{provider_key}:simulated",
+                messages=messages,
             )
-
-
-# ---------- HTTP & Transport Errors + Secret Scrubbing ----------
-
-@pytest.mark.asyncio
-async def test_call_upstream_http_status_error_scrubs_secrets(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key-1234567890123456")
-    monkeypatch.setenv("LTA_ALLOW_SIMULATED_FALLBACK", "false")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            401,
-            json={"error": {"message": "Invalid key sk-leakedsecret1234567890"}},
-        )
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        with pytest.raises(UpstreamProviderError) as exc_info:
-            await call_upstream(
-                provider="openai",
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": "hi"}],
-                http_client=client,
+        err_msg = ""
+        try:
+            body = exc.response.json()
+            err_msg = body.get("error", {}).get("message", "") if isinstance(body, dict) else ""
+        except Exception:
+            err_msg = exc.response.text[:200]
+        safe_msg = _scrub_secrets(err_msg or "request rejected")
+        raise UpstreamProviderError(
+            f"Upstream '{provider_key}' HTTP {exc.response.status_code} ({model}): {safe_msg}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        if _fallback_enabled():
+            return _simulate_mock_response(
+                model=model,
+                provider_label=f"{provider_key}:simulated",
+                messages=messages,
             )
-    msg = str(exc_info.value)
-    assert "HTTP 401" in msg
-    assert "sk-leakedsecret1234567890" not in msg
-    assert "[REDACTED_SECRET]" in msg
+        safe_exc = _scrub_secrets(str(exc) or "connection or timeout error")
+        raise UpstreamProviderError(
+            f"Upstream '{provider_key}' {type(exc).__name__} ({model}): {safe_exc}"
+        ) from exc
 
-
-@pytest.mark.asyncio
-async def test_call_upstream_http_error_and_fallback(monkeypatch):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key-1234567890123456")
-    monkeypatch.setenv("LTA_ALLOW_SIMULATED_FALLBACK", "false")
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("boom ghp_1234567890abcdefghij12", request=request)
-
-    transport = httpx.MockTransport(handler)
-    async with httpx.AsyncClient(transport=transport) as client:
-        with pytest.raises(UpstreamProviderError) as exc_info:
-            await call_upstream(
-                provider="openai",
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": "hi"}],
-                http_client=client,
-            )
-    assert "ghp_1234567890abcdefghij12" not in str(exc_info.value)
-    assert "[REDACTED_SECRET]" in str(exc_info.value)
-
-    monkeypatch.setenv("LTA_ALLOW_SIMULATED_FALLBACK", "true")
-    async with httpx.AsyncClient(transport=transport) as client:
-        res = await call_upstream(
-            provider="openai",
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": "hi"}],
-            http_client=client,
+    if _fallback_enabled():
+        return _simulate_mock_response(
+            model=model,
+            provider_label=f"{provider_key}:simulated",
+            messages=messages,
         )
-    assert res.provider == "openai:simulated"
-
-
-@pytest.mark.asyncio
-async def test_call_upstream_unsupported_provider(monkeypatch):
-    monkeypatch.setenv("LTA_ALLOW_SIMULATED_FALLBACK", "false")
-    with pytest.raises(UpstreamProviderError, match="Unsupported upstream provider"):
-        await call_upstream(
-            provider="unknown_vendor",
-            model="m1",
-            messages=[{"role": "user", "content": "hi"}],
-        )
+    raise UpstreamProviderError(f"Unsupported upstream provider: '{provider}'")
