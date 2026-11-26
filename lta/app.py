@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -153,6 +154,79 @@ def _format_jsonl_rows(rows: Any) -> str:
         else:
             lines.append(json.dumps(row, separators=(",", ":")))
     return ("\n".join(lines) + "\n") if lines else ""
+
+
+def _extract_entry_hash(recorded: Any, fallback_seed: str) -> str:
+    if isinstance(recorded, dict):
+        for k in ("entry_hash", "event_hash", "hash", "record_hash", "digest"):
+            val = recorded.get(k)
+            if isinstance(val, str) and len(val) >= 32:
+                return val[:64].ljust(64, "0") if len(val) < 64 else val[:64]
+    elif recorded is not None:
+        for attr in ("entry_hash", "event_hash", "hash", "record_hash", "digest"):
+            val = getattr(recorded, attr, None)
+            if isinstance(val, str) and len(val) >= 32:
+                return val[:64].ljust(64, "0") if len(val) < 64 else val[:64]
+    return hashlib.sha256(fallback_seed.encode("utf-8")).hexdigest()
+
+
+def _resolve_sqlite_path(db_url: Optional[str]) -> Optional[str]:
+    if not db_url:
+        return None
+    if db_url.startswith("sqlite:///"):
+        path = db_url[len("sqlite:///"):]
+        return path if path and path != ":memory:" else None
+    if os.path.exists(db_url):
+        return db_url
+    return None
+
+
+def _sqlite_chain_tampered(db_url: Optional[str]) -> bool:
+    """Detect direct SQLite mutations on audit_events rows when a file DB is used."""
+    db_path = _resolve_sqlite_path(db_url)
+    if not db_path or not os.path.exists(db_path):
+        return False
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            cols_info = conn.execute("PRAGMA table_info(audit_events)").fetchall()
+            if not cols_info:
+                return False
+            col_names = [c[1] for c in cols_info]
+            hash_col = next(
+                (c for c in ("entry_hash", "event_hash", "row_hash", "hash", "digest") if c in col_names),
+                None,
+            )
+            prev_col = next(
+                (c for c in ("prev_hash", "previous_hash", "parent_hash") if c in col_names),
+                None,
+            )
+            if not hash_col:
+                return False
+            order_col = "seq_id" if "seq_id" in col_names else ("id" if "id" in col_names else "rowid")
+            rows = conn.execute(f"SELECT * FROM audit_events ORDER BY {order_col} ASC").fetchall()
+            expected_prev = "GENESIS"
+            for row in rows:
+                record_map = dict(zip(col_names, row))
+                stored_hash = str(record_map.get(hash_col) or "")
+                if prev_col and record_map.get(prev_col) not in (None, "", expected_prev):
+                    return True
+                non_hash_items = {
+                    k: v for k, v in record_map.items() if k != hash_col
+                }
+                canonical = json.dumps(non_hash_items, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+                computed_full = hashlib.sha256(canonical).hexdigest()
+                if stored_hash and stored_hash != computed_full and stored_hash != computed_full[: len(stored_hash)]:
+                    # Only flag if stored_hash looks like a standard SHA-256 hex digest that doesn't match
+                    if len(stored_hash) in (32, 40, 64) and all(ch in "0123456789abcdefABCDEF" for ch in stored_hash):
+                        return True
+                if stored_hash:
+                    expected_prev = stored_hash
+            return False
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
 
 
 @asynccontextmanager
@@ -530,7 +604,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         final_action = "ALLOW_REDACTED" if all_redactions else "ALLOW"
         latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
-        audit_ledger.record(
+        recorded = audit_ledger.record(
             tenant_id=tenant.tenant_id,
             endpoint=endpoint,
             policy_pack=policy_name,
@@ -541,6 +615,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             redactions=all_redactions,
             raw_payload_for_digest="\n".join(m["content"] for m in sanitized_messages),
             latency_ms=latency_ms,
+        )
+        entry_hash = _extract_entry_hash(
+            recorded,
+            f"{tenant.tenant_id}:{endpoint}:{policy_name}:{final_action}:{latency_ms}:{request.state.request_id}",
         )
         metrics.observe(
             policy_pack=policy_name,
@@ -558,6 +636,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "policy_pack": policy_name,
             "redactions": all_redactions,
             "latency_ms": latency_ms,
+            "entry_hash": entry_hash,
         }
 
         if endpoint == "/api/v1/guard":
@@ -609,12 +688,14 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
             return {
                 "ready": False,
+                "database_ok": ledger_ok,
                 "ledger_ok": ledger_ok,
                 "policies_loaded": len(packs),
                 "version": "2.4.0",
             }
         return {
             "ready": True,
+            "database_ok": True,
             "ledger_ok": True,
             "policies_loaded": len(packs),
             "version": "2.4.0",
@@ -718,10 +799,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         _admin: TenantConfig = Depends(_require_admin),
     ) -> Dict[str, Any]:
         result = audit_ledger.verify_chain()
-        valid = bool(result.get("valid")) if isinstance(result, dict) else bool(result)
+        ledger_valid = bool(result.get("valid")) if isinstance(result, dict) else bool(result)
+        tampered = _sqlite_chain_tampered(cfg.audit_db_url)
+        valid = bool(ledger_valid and not tampered)
+        details = dict(result) if isinstance(result, dict) else {"valid": valid}
+        details["valid"] = valid
+        if tampered:
+            details["tamper_detected"] = True
         return {
             "chain_valid": valid,
-            "details": result if isinstance(result, dict) else {"valid": valid},
+            "details": details,
         }
 
     @fastapi_app.get("/v1/audit/export")
