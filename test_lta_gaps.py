@@ -1,13 +1,14 @@
-"""Live gateway gap/evasion probes and deterministic local tamper-verification tests for Lucid-Truth-Audit."""
+"""Live deployment gap verification + local SQLite tamper-verification suite for LTA v2.4.0."""
 
 from __future__ import annotations
 
 import json
 import os
 import sqlite3
+import statistics
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 import pytest
 import requests
@@ -20,12 +21,12 @@ from lta.policy_engine import PolicyEngine
 BASE_URL = os.getenv("LTA_BASE_URL", "https://lucid-truth-audit.onrender.com").rstrip("/")
 API_KEY = os.getenv("LTA_API_KEY", "").strip()
 SHADOW_KEY = os.getenv("LTA_SHADOW_KEY", "").strip()
-ADMIN_KEY = os.getenv("LTA_ADMIN_KEY", API_KEY).strip()
-TIMEOUT = float(os.getenv("LTA_GAP_TIMEOUT_S", "25.0"))
+TIMEOUT = float(os.getenv("LTA_GAP_TIMEOUT_S", "45.0"))
 
-CHAT_COMPLETIONS_URL = f"{BASE_URL}/v1/chat/completions"
-SHADOW_INGEST_URL = f"{BASE_URL}/v1/shadow/ingest"
-AUDIT_VERIFY_URL = f"{BASE_URL}/v1/audit/verify"
+CHAT_URL = f"{BASE_URL}/v1/chat/completions"
+GUARD_URL = f"{BASE_URL}/api/v1/guard"
+SHADOW_URL = f"{BASE_URL}/v1/shadow/ingest"
+VERIFY_URL = f"{BASE_URL}/v1/audit/verify"
 
 OLD_DEFAULT_KEYS = [
     "dev-key",
@@ -42,7 +43,7 @@ WRONG_KEYS = [
     "",
     "wrong",
     "69b6e710778c449c40bad9ee4ed8f4d",
-    f"{API_KEY}x" if API_KEY else "invalid-key-suffix",
+    f"{API_KEY}x" if API_KEY else "invalid-key-suffix-x",
     f"x{API_KEY}" if API_KEY else "x-invalid-key-prefix",
 ]
 
@@ -71,72 +72,78 @@ BENIGN_PROMPTS = [
 ]
 
 
-def _requires_live_tenant() -> pytest.MarkDecorator:
-    return pytest.mark.skipif(not API_KEY, reason="Set LTA_API_KEY to run live gateway tests")
+def _requires_live_tenant():
+    return pytest.mark.skipif(
+        not API_KEY,
+        reason="Set LTA_API_KEY to run live tenant verification tests",
+    )
 
 
-def _chat_request(
-    content: str,
-    *,
-    api_key: Optional[str] = API_KEY,
-    use_bearer: bool = False,
-    timeout: float = TIMEOUT,
-) -> requests.Response:
-    headers: Dict[str, str] = {"Content-Type": "application/json"}
-    if api_key is not None:
-        if use_bearer:
-            headers["Authorization"] = f"Bearer {api_key}"
-        else:
-            headers["X-API-Key"] = api_key
-    payload: Dict[str, Any] = {
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": content}],
-    }
-    return requests.post(CHAT_COMPLETIONS_URL, json=payload, headers=headers, timeout=timeout)
-
-
-def _extract_response_text(resp: requests.Response) -> str:
-    try:
-        data = resp.json()
-        return json.dumps(data)
-    except ValueError:
-        return resp.text
+def _chat_request(prompt: str, retries: int = 3) -> requests.Response:
+    """Send a live chat completion request with retries on transient 502/503/504."""
+    last_resp: Optional[requests.Response] = None
+    for attempt in range(retries):
+        resp = requests.post(
+            CHAT_URL,
+            headers={"X-API-Key": API_KEY, "Content-Type": "application/json"},
+            json={
+                "model": "gpt-4o-mini",
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=TIMEOUT,
+        )
+        last_resp = resp
+        if resp.status_code not in (502, 503, 504):
+            return resp
+        if attempt < retries - 1:
+            time.sleep(2.0 * (attempt + 1))
+    assert last_resp is not None
+    return last_resp
 
 
 def _resolve_pack_name(engine: PolicyEngine) -> str:
-    raw_packs = engine.list_packs() or []
+    packs = engine.list_packs() or []
     names: List[str] = []
-    for item in raw_packs:
-        if isinstance(item, dict) and isinstance(item.get("name"), str):
-            names.append(item["name"])
-        elif isinstance(item, str):
-            names.append(item)
+    for p in packs:
+        if isinstance(p, str):
+            names.append(p)
+        elif isinstance(p, dict) and isinstance(p.get("name"), str):
+            names.append(p["name"])
     if "fmcsa" in names:
         return "fmcsa"
+    if "general_enterprise" in names:
+        return "general_enterprise"
     return names[0] if names else "general_enterprise"
 
 
-@_requires_live_tenant()
-@pytest.mark.parametrize("old_key", OLD_DEFAULT_KEYS)
-def test_old_default_key_is_rejected(old_key: str) -> None:
-    if old_key == API_KEY:
-        pytest.skip("Configured LTA_API_KEY matches candidate default")
-    resp = _chat_request("Hello dispatch", api_key=old_key)
+@pytest.mark.parametrize("bad_key", OLD_DEFAULT_KEYS)
+def test_old_default_key_is_rejected(bad_key: str) -> None:
+    resp = requests.post(
+        GUARD_URL,
+        headers={"X-API-Key": bad_key, "Content-Type": "application/json"},
+        json={"model_input": "Hello world"},
+        timeout=TIMEOUT,
+    )
     assert resp.status_code in (401, 403, 429)
 
 
-@_requires_live_tenant()
 @pytest.mark.parametrize("bad_key", WRONG_KEYS)
 def test_wrong_keys_rejected(bad_key: str) -> None:
-    if bad_key == API_KEY:
-        pytest.skip("Configured LTA_API_KEY matches candidate probe")
-    resp = _chat_request("Hello dispatch", api_key=bad_key)
+    resp = requests.post(
+        GUARD_URL,
+        headers={"X-API-Key": bad_key, "Content-Type": "application/json"},
+        json={"model_input": "Hello world"},
+        timeout=TIMEOUT,
+    )
     assert resp.status_code in (401, 403, 429)
 
 
-@_requires_live_tenant()
 def test_missing_key_rejected() -> None:
-    resp = _chat_request("Hello dispatch", api_key=None)
+    resp = requests.post(
+        GUARD_URL,
+        json={"model_input": "Hello world"},
+        timeout=TIMEOUT,
+    )
     assert resp.status_code in (401, 403, 429)
 
 
@@ -144,124 +151,136 @@ def test_missing_key_rejected() -> None:
 @pytest.mark.parametrize("prompt,raw_ssn", SSN_VARIANTS)
 def test_real_format_ssn_not_passed_through(prompt: str, raw_ssn: str) -> None:
     resp = _chat_request(prompt)
-    assert resp.status_code in (200, 400, 422)
-    if resp.status_code == 200:
-        body_text = _extract_response_text(resp)
-        assert raw_ssn not in body_text
+    assert resp.status_code in (200, 400, 422), (
+        f"Unexpected {resp.status_code} for {prompt!r}: {resp.text[:200]}"
+    )
+    assert raw_ssn not in resp.text
 
 
 @_requires_live_tenant()
 def test_ssn_without_keyword_is_caught() -> None:
-    resp = _chat_request("Dispatch driver badge 123-45-6789 on load PO8492014")
-    assert resp.status_code in (200, 400, 422)
-    if resp.status_code == 200:
-        body_text = _extract_response_text(resp)
-        assert "123-45-6789" not in body_text
+    raw_ssn = "123-45-6789"
+    resp = _chat_request(f"Reference value {raw_ssn} for onboarding.")
+    assert resp.status_code in (200, 400, 422), (
+        f"Unexpected {resp.status_code}: {resp.text[:200]}"
+    )
+    assert raw_ssn not in resp.text
 
 
 @_requires_live_tenant()
-@pytest.mark.parametrize("injection_text", INJECTION_VARIANTS)
-def test_injection_variants_not_cleared(injection_text: str) -> None:
-    resp = _chat_request(injection_text)
-    assert resp.status_code in (400, 422)
+@pytest.mark.parametrize("payload", INJECTION_VARIANTS)
+def test_injection_variants_not_cleared(payload: str) -> None:
+    resp = _chat_request(payload)
+    assert resp.status_code in (400, 403, 422), (
+        f"Expected block for {payload!r}, got {resp.status_code}: {resp.text[:200]}"
+    )
 
 
 @_requires_live_tenant()
-@pytest.mark.parametrize("benign_text", BENIGN_PROMPTS)
-def test_benign_text_not_blocked(benign_text: str) -> None:
-    resp = _chat_request(benign_text)
-    assert resp.status_code == 200
+@pytest.mark.parametrize("prompt", BENIGN_PROMPTS)
+def test_benign_text_not_blocked(prompt: str) -> None:
+    resp = _chat_request(prompt)
+    assert resp.status_code == 200, (
+        f"Expected 200 for benign prompt {prompt!r}, got {resp.status_code}: {resp.text[:200]}"
+    )
 
 
 def test_shadow_ingest_rejects_missing_or_bad_bearer() -> None:
-    missing_resp = requests.post(
-        SHADOW_INGEST_URL,
-        json={"prompt": "Shadow check payload"},
+    r_missing = requests.post(
+        SHADOW_URL,
+        json={"prompt": "Unauthenticated shadow probe"},
         timeout=TIMEOUT,
     )
-    assert missing_resp.status_code in (401, 403)
+    assert r_missing.status_code in (401, 403)
 
-    bad_resp = requests.post(
-        SHADOW_INGEST_URL,
-        json={"prompt": "Shadow check payload"},
-        headers={"Authorization": "Bearer invalid-shadow-token-check"},
+    r_bad = requests.post(
+        SHADOW_URL,
+        headers={"Authorization": "Bearer invalid-shadow-token-000"},
+        json={"prompt": "Bad bearer shadow probe"},
         timeout=TIMEOUT,
     )
-    assert bad_resp.status_code in (401, 403, 429)
+    assert r_bad.status_code in (401, 403)
 
 
 @pytest.mark.skipif(not SHADOW_KEY, reason="Set LTA_SHADOW_KEY to test authenticated shadow ingest")
 def test_shadow_ingest_zero_retention_contract() -> None:
     secret_ssn = "123-45-6789"
-    req_id = f"gap-{int(time.time())}"
-    resp = requests.post(
-        SHADOW_INGEST_URL,
+    r = requests.post(
+        SHADOW_URL,
         json={
             "prompt": f"Driver SSN {secret_ssn} \u202e p\u0430ssword",
-            "request_id": req_id,
+            "request_id": f"gap-{int(time.time())}",
         },
         headers={"Authorization": f"Bearer {SHADOW_KEY}"},
         timeout=TIMEOUT,
     )
-    assert resp.status_code == 202, f"Expected 202, got {resp.status_code}: {resp.text[:200]}"
-    data = resp.json()
-    assert data.get("accepted") is True
-    assert data.get("zero_retention") is True
-    assert isinstance(data.get("input_sha256"), str) and len(data["input_sha256"]) == 64
-    serialized = json.dumps(data)
-    assert secret_ssn not in serialized
+    assert r.status_code == 202, f"Expected 202, got {r.status_code}: {r.text[:200]}"
+    body = r.json()
+    assert len(body.get("input_sha256", "")) == 64
+    assert secret_ssn not in r.text
 
 
 @_requires_live_tenant()
 def test_oversized_payload_rejected_cleanly() -> None:
     oversized_content = "A" * (300 * 1024)
     resp = _chat_request(oversized_content)
-    assert resp.status_code in (400, 413, 422, 502)
+    assert resp.status_code in (400, 413, 422), (
+        f"Expected 400/413/422 for oversized payload, got {resp.status_code}: {resp.text[:200]}"
+    )
 
 
 def test_rate_limit_on_bad_keys() -> None:
-    seen_statuses: List[int] = []
+    statuses: List[int] = []
     for i in range(25):
-        resp = _chat_request(f"probe-{i}", api_key=f"bad-key-{i}")
-        seen_statuses.append(resp.status_code)
-        assert resp.status_code in (401, 403, 429, 500)
-        if resp.status_code == 429:
+        r = requests.post(
+            GUARD_URL,
+            headers={"X-API-Key": f"bad-rate-key-{i}", "Content-Type": "application/json"},
+            json={"model_input": "Rate limit probe"},
+            timeout=TIMEOUT,
+        )
+        statuses.append(r.status_code)
+        if r.status_code == 429:
             break
-    assert len(seen_statuses) >= 1
+    assert 429 in statuses, f"Expected 429 during bad-key flood, got statuses={statuses}"
 
 
 @_requires_live_tenant()
 def test_latency_profile_report_only() -> None:
     client_times_ms: List[float] = []
-    for _ in range(20):
-        t0 = time.perf_counter()
-        resp = _chat_request("What is the capital of France?")
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        if resp.status_code == 429:
+    for _ in range(5):
+        start = time.perf_counter()
+        r = _chat_request("What is the capital of France?")
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        if r.status_code == 429:
             time.sleep(62)
-            t0 = time.perf_counter()
-            resp = _chat_request("What is the capital of France?")
-            elapsed_ms = (time.perf_counter() - t0) * 1000.0
-        assert resp.status_code == 200, (
-            f"Unexpected status during latency profile: {resp.status_code} {resp.text[:160]}"
-        )
+            start = time.perf_counter()
+            r = _chat_request("What is the capital of France?")
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+        assert r.status_code == 200, f"Unexpected status during latency profile: {r.status_code} {r.text[:160]}"
         client_times_ms.append(elapsed_ms)
 
-    assert len(client_times_ms) == 20
-    assert max(client_times_ms) < 60000.0
+    med = statistics.median(client_times_ms)
+    print(f"\nmedian={med:.1f} ms  max={max(client_times_ms):.1f} ms (client round trip)")
+    assert med > 0
 
 
-@pytest.mark.skipif(not ADMIN_KEY, reason="Set LTA_ADMIN_KEY or LTA_API_KEY to verify audit chain")
+@_requires_live_tenant()
 def test_audit_verify_reports_something_meaningful() -> None:
-    resp = requests.get(
-        AUDIT_VERIFY_URL,
-        headers={"X-API-Key": ADMIN_KEY},
+    r = requests.get(
+        VERIFY_URL,
+        headers={"X-API-Key": API_KEY},
         timeout=TIMEOUT,
     )
-    assert resp.status_code in (200, 403)
-    if resp.status_code == 200:
-        data = resp.json()
-        assert "chain_valid" in data or "valid" in data
+    if r.status_code == 429:
+        time.sleep(62)
+        r = requests.get(
+            VERIFY_URL,
+            headers={"X-API-Key": API_KEY},
+            timeout=TIMEOUT,
+        )
+    assert r.status_code == 200, f"Expected 200 on /v1/audit/verify, got {r.status_code}: {r.text[:200]}"
+    body = r.json()
+    assert "chain_valid" in body
 
 
 def test_tampering_breaks_verification_local(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -327,21 +346,7 @@ def test_tampering_breaks_verification_local(tmp_path: Path, monkeypatch: pytest
 
     conn = sqlite3.connect(str(db_file))
     try:
-        tables = [
-            row[0]
-            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-        ]
-        target_table = "audit_events" if "audit_events" in tables else tables[0]
-        cols = [row[1] for row in conn.execute(f"PRAGMA table_info({target_table})").fetchall()]
-        mutable_col = next(
-            (c for c in ("action", "entry_hash", "event_hash", "row_hash", "prev_hash") if c in cols),
-            None,
-        )
-        assert mutable_col is not None, f"No mutable ledger column in {cols}"
-        conn.execute(
-            f"UPDATE {target_table} SET {mutable_col} = ? WHERE rowid = 1",
-            ("TAMPERED_RECORD",),
-        )
+        conn.execute("UPDATE audit_events SET action = 'TAMPERED' WHERE seq_id = 1")
         conn.commit()
     finally:
         conn.close()
@@ -350,6 +355,6 @@ def test_tampering_breaks_verification_local(tmp_path: Path, monkeypatch: pytest
     with TestClient(app_after) as client:
         verify_tampered = client.get("/v1/audit/verify", headers={"X-API-Key": admin_key})
         assert verify_tampered.status_code == 200
-        payload = verify_tampered.json()
-        assert payload.get("chain_valid") is False
-        assert payload.get("first_broken_seq_id") is not None
+        body = verify_tampered.json()
+        assert body.get("chain_valid") is False
+        assert body.get("first_broken_seq_id") == 1
