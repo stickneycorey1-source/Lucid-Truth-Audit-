@@ -15,7 +15,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 
 GENESIS_HASH = "0" * 64
@@ -40,6 +40,19 @@ class AuditRecord:
     entry_hash: str
 
 
+def _normalize_redactions(redactions_value: Any) -> List[str]:
+    if isinstance(redactions_value, list):
+        return [str(item) for item in redactions_value]
+    if isinstance(redactions_value, str) and redactions_value.strip():
+        try:
+            parsed = json.loads(redactions_value)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed]
+        except ValueError:
+            pass
+    return []
+
+
 def _compute_entry_hash(
     prev_hash: str,
     timestamp_utc: str,
@@ -50,24 +63,25 @@ def _compute_entry_hash(
     action: str,
     http_status: int,
     vector: Optional[str],
-    redactions_json: str,
+    redactions_json: Any,
     payload_sha256: str,
     latency_ms: float,
 ) -> str:
+    normalized_redactions = _normalize_redactions(redactions_json)
     canonical = json.dumps(
         {
-            "prev_hash": prev_hash,
-            "timestamp_utc": timestamp_utc,
-            "tenant_id": tenant_id,
-            "endpoint": endpoint,
-            "policy_pack": policy_pack,
-            "provider": provider,
-            "action": action,
-            "http_status": http_status,
-            "vector": vector or "",
-            "redactions": redactions_json,
-            "payload_sha256": payload_sha256,
-            "latency_ms": round(latency_ms, 3),
+            "prev_hash": str(prev_hash),
+            "timestamp_utc": str(timestamp_utc),
+            "tenant_id": str(tenant_id),
+            "endpoint": str(endpoint),
+            "policy_pack": str(policy_pack),
+            "provider": str(provider),
+            "action": str(action),
+            "http_status": int(http_status),
+            "vector": str(vector or ""),
+            "redactions": normalized_redactions,
+            "payload_sha256": str(payload_sha256),
+            "latency_ms": round(float(latency_ms), 3),
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -119,11 +133,13 @@ class AuditLedger:
                     raise
         else:
             with self._lock:
+                if self._conn is None:
+                    path = self.db_url.replace("sqlite:///", "", 1)
+                    self._conn = sqlite3.connect(path, check_same_thread=False)
                 try:
                     yield self._conn
                 except Exception:
-                    if self._conn is not None:
-                        self._conn.rollback()
+                    self._conn.rollback()
                     raise
 
     def _init_schema(self) -> None:
@@ -205,8 +221,10 @@ class AuditLedger:
         payload_sha256 = hashlib.sha256(
             raw_payload_for_digest.encode("utf-8")
         ).hexdigest()
-        redactions_json = json.dumps(redactions)
+        normalized_redactions = _normalize_redactions(redactions)
+        redactions_json = json.dumps(normalized_redactions, separators=(",", ":"))
         rounded_latency = round(float(latency_ms), 3)
+        normalized_vector = str(vector or "")
 
         with self._connection() as conn:
             cur = conn.cursor()
@@ -216,7 +234,7 @@ class AuditLedger:
                 "SELECT entry_hash FROM audit_events ORDER BY seq_id DESC LIMIT 1"
             )
             row = cur.fetchone()
-            prev_hash = row[0] if row else GENESIS_HASH
+            prev_hash = str(row[0]) if row and row[0] else GENESIS_HASH
             entry_hash = _compute_entry_hash(
                 prev_hash=prev_hash,
                 timestamp_utc=ts,
@@ -226,8 +244,8 @@ class AuditLedger:
                 provider=provider,
                 action=action,
                 http_status=http_status,
-                vector=vector,
-                redactions_json=redactions_json,
+                vector=normalized_vector,
+                redactions_json=normalized_redactions,
                 payload_sha256=payload_sha256,
                 latency_ms=rounded_latency,
             )
@@ -246,8 +264,8 @@ class AuditLedger:
                 policy_pack,
                 provider,
                 action,
-                http_status,
-                vector or "",
+                int(http_status),
+                normalized_vector,
                 redactions_json,
                 payload_sha256,
                 rounded_latency,
@@ -271,9 +289,9 @@ class AuditLedger:
             policy_pack=policy_pack,
             provider=provider,
             action=action,
-            http_status=http_status,
-            vector=vector or None,
-            redactions=redactions,
+            http_status=int(http_status),
+            vector=normalized_vector or None,
+            redactions=normalized_redactions,
             payload_sha256=payload_sha256,
             latency_ms=rounded_latency,
             prev_hash=prev_hash,
@@ -310,25 +328,25 @@ class AuditLedger:
                 prev_hash,
                 entry_hash,
             ) = row
-            if prev_hash != expected_prev:
+            if str(prev_hash) != expected_prev:
                 return False, len(rows), int(seq_id)
             recomputed = _compute_entry_hash(
-                prev_hash=prev_hash,
-                timestamp_utc=ts,
-                tenant_id=tenant_id,
-                endpoint=endpoint,
-                policy_pack=policy_pack,
-                provider=provider,
-                action=action,
+                prev_hash=str(prev_hash),
+                timestamp_utc=str(ts),
+                tenant_id=str(tenant_id),
+                endpoint=str(endpoint),
+                policy_pack=str(policy_pack),
+                provider=str(provider),
+                action=str(action),
                 http_status=int(http_status),
                 vector=vector,
                 redactions_json=redactions_json,
-                payload_sha256=payload_sha256,
+                payload_sha256=str(payload_sha256),
                 latency_ms=float(latency_ms),
             )
-            if recomputed != entry_hash:
+            if recomputed != str(entry_hash):
                 return False, len(rows), int(seq_id)
-            expected_prev = entry_hash
+            expected_prev = str(entry_hash)
         return True, len(rows), None
 
     def export_jsonl(self, tenant_id: Optional[str] = None, limit: int = 1000) -> str:
@@ -369,7 +387,7 @@ class AuditLedger:
                         "action": row[6],
                         "http_status": row[7],
                         "vector": row[8] or None,
-                        "redactions": json.loads(row[9]),
+                        "redactions": _normalize_redactions(row[9]),
                         "payload_sha256": row[10],
                         "latency_ms": row[11],
                         "prev_hash": row[12],
@@ -384,4 +402,7 @@ class AuditLedger:
             self._pool.close()
         elif self._conn is not None:
             with self._lock:
-                self._conn.close()
+                try:
+                    self._conn.close()
+                finally:
+                    self._conn = None
