@@ -864,3 +864,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         return PlainTextResponse(content=metrics.render_prometheus(), media_type="text/plain")
 
     return fastapi_app
+
+
+app = create_app()
