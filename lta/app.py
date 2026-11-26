@@ -808,23 +808,30 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             vector = eval_res.vector
             redactions = list(eval_res.redactions or [])
         except Exception as exc:
-            logger.warning("Shadow policy evaluation fallback triggered for pack '%s': %s", policy_name, exc)
+            logger.warning(
+                "Shadow policy evaluation fallback triggered for pack '%s': %s",
+                policy_name,
+                exc,
+            )
             allowed = True
             vector = None
             redactions = []
         latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
-        audit_ledger.record(
-            tenant_id=actor_id,
-            endpoint="/v1/shadow/ingest",
-            policy_pack=policy_name,
-            provider="shadow",
-            action="SHADOW_BLOCK" if not allowed else "SHADOW_ALLOW",
-            http_status=202,
-            vector=vector,
-            redactions=redactions,
-            raw_payload_for_digest=body.prompt,
-            latency_ms=latency_ms,
-        )
+        try:
+            audit_ledger.record(
+                tenant_id=actor_id,
+                endpoint="/v1/shadow/ingest",
+                policy_pack=policy_name,
+                provider="shadow",
+                action="SHADOW_BLOCK" if not allowed else "SHADOW_ALLOW",
+                http_status=202,
+                vector=vector,
+                redactions=redactions,
+                raw_payload_for_digest=body.prompt,
+                latency_ms=latency_ms,
+            )
+        except Exception as exc:
+            logger.warning("Shadow audit_ledger.record warning: %s", exc)
         return {
             "accepted": True,
             "zero_retention": True,
