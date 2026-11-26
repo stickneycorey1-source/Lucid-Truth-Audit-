@@ -10,24 +10,37 @@ from lta.rate_limiter import SlidingWindowRateLimiter
 
 def _make_limiter(limit: int = 3, window_s: float = 60.0) -> SlidingWindowRateLimiter:
     sig = inspect.signature(SlidingWindowRateLimiter.__init__)
-    params = [p for name, p in sig.parameters.items() if name != "self"]
-    if len(params) >= 2:
-        try:
-            return SlidingWindowRateLimiter(limit, window_s)
-        except TypeError:
-            pass
-    for kwargs in (
-        {"limit": limit, "window_s": window_s},
-        {"limit": limit, "window_seconds": window_s},
-        {"max_calls": limit, "window_s": window_s},
-        {"max_calls": limit, "window_seconds": window_s},
-        {"rpm": limit, "window_seconds": window_s},
-    ):
+    params = [name for name in sig.parameters if name != "self"]
+    kwargs: dict[str, object] = {}
+
+    # First parameter is typically redis_url / url
+    if params and any(tok in params[0].lower() for tok in ("url", "redis")):
+        kwargs[params[0]] = ""
+
+    for name in params[1:]:
+        low = name.lower()
+        if "window" in low or "period" in low or "ttl" in low:
+            kwargs[name] = window_s
+        elif any(tok in low for tok in ("limit", "max", "rpm", "capacity", "quota")):
+            kwargs[name] = limit
+
+    if kwargs:
         try:
             return SlidingWindowRateLimiter(**kwargs)
         except TypeError:
+            pass
+
+    for fallback_kwargs in (
+        {"redis_url": "", "limit": limit, "window_seconds": window_s},
+        {"url": "", "limit": limit, "window_seconds": window_s},
+        {"redis_url": "", "max_requests": limit, "window_seconds": window_s},
+    ):
+        try:
+            return SlidingWindowRateLimiter(**fallback_kwargs)
+        except TypeError:
             continue
-    return SlidingWindowRateLimiter()
+
+    return SlidingWindowRateLimiter("")
 
 
 def _is_allowed(decision: object) -> bool:
