@@ -946,11 +946,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         )
 
         return {
+            "status": "accepted",
             "accepted": True,
             "zero_retention": True,
             "audit_id": audit_id,
             "seq_id": seq_id,
             "entry_hash": entry_hash,
+            "audit_entry_hash": entry_hash,
             "request_id": resolved_req_id,
             "input_sha256": digest,
             "policy_pack": policy_name,
