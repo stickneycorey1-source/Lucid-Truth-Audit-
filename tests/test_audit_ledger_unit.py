@@ -283,6 +283,12 @@ def test_sqlite_ping_false_and_rollback_on_error(tmp_path: Path):
     db_file = tmp_path / "ledger_err.db"
     ledger = AuditLedger(f"sqlite:///{db_file}")
 
+    # Drop audit_events to trigger OperationalError + rollback inside _connection()
+    raw_conn = sqlite3.connect(str(db_file))
+    raw_conn.execute("DROP TABLE audit_events")
+    raw_conn.commit()
+    raw_conn.close()
+
     with pytest.raises(sqlite3.OperationalError):
         ledger.record(
             tenant_id="p2_pilot",
@@ -296,7 +302,7 @@ def test_sqlite_ping_false_and_rollback_on_error(tmp_path: Path):
             raw_payload_for_digest="x",
             latency_ms=1.0,
         )
-        # Force SQL error via invalid table state by closing connection before ping/record
+
     ledger.close()
     assert ledger.ping() is False
 
@@ -322,7 +328,10 @@ def test_postgres_pool_and_psycopg_fallback(monkeypatch: pytest.MonkeyPatch):
         latency_ms=5.0,
     )
     assert rec.seq_id == 1
-    assert any("PG_ADVISORY_XACT_LOCK" in sql.upper() for sql, _ in _FakeConnectionPool.last_instance.state["executed"])
+    assert any(
+        "PG_ADVISORY_XACT_LOCK" in sql.upper()
+        for sql, _ in _FakeConnectionPool.last_instance.state["executed"]
+    )
 
     # Trigger rollback path inside _connection
     _FakeConnectionPool.last_instance.state["fail_on_next_execute"] = True
