@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -136,6 +137,22 @@ def _apply_security_headers(response: Response, request_id: str) -> None:
 
 def _blocked_detail(vector: str, message: str) -> Dict[str, str]:
     return {"vector": vector, "message": message}
+
+
+def _format_jsonl_rows(rows: Any) -> str:
+    if rows is None:
+        return ""
+    if isinstance(rows, str):
+        return rows.strip() + ("\n" if rows.strip() else "")
+    lines: List[str] = []
+    for row in rows:
+        if isinstance(row, str):
+            item = row.strip()
+            if item:
+                lines.append(item)
+        else:
+            lines.append(json.dumps(row, separators=(",", ":")))
+    return ("\n".join(lines) + "\n") if lines else ""
 
 
 @asynccontextmanager
@@ -536,6 +553,13 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         if rem is not None:
             response.headers["X-RateLimit-Remaining"] = str(max(0, int(rem)))
 
+        lta_audit_meta = {
+            "action": final_action,
+            "policy_pack": policy_name,
+            "redactions": all_redactions,
+            "latency_ms": latency_ms,
+        }
+
         if endpoint == "/api/v1/guard":
             return {
                 "allowed": True,
@@ -544,6 +568,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "redactions": all_redactions,
                 "sanitized_output": final_content,
                 "latency_ms": latency_ms,
+                "lta_audit": lta_audit_meta,
             }
 
         return {
@@ -563,17 +588,18 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "completion_tokens": upstream_resp.completion_tokens,
                 "total_tokens": upstream_resp.prompt_tokens + upstream_resp.completion_tokens,
             },
-            "lta": {
-                "action": final_action,
-                "policy_pack": policy_name,
-                "redactions": all_redactions,
-                "latency_ms": latency_ms,
-            },
+            "lta_audit": lta_audit_meta,
         }
 
     @fastapi_app.get("/healthz")
     async def healthz() -> Dict[str, Any]:
-        return {"status": "ok", "service": "lucid-truth-audit", "version": "2.4.0"}
+        packs = policy_engine.list_packs()
+        return {
+            "status": "ok",
+            "service": "lucid-truth-audit",
+            "version": "2.4.0",
+            "policies_loaded": len(packs),
+        }
 
     @fastapi_app.get("/readyz")
     async def readyz(response: Response) -> Dict[str, Any]:
@@ -704,7 +730,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         _admin: TenantConfig = Depends(_require_admin),
     ) -> PlainTextResponse:
         rows = audit_ledger.export_jsonl(tenant_id=tenant_id)
-        payload = "\n".join(rows) + ("\n" if rows else "")
+        payload = _format_jsonl_rows(rows)
         return PlainTextResponse(content=payload, media_type="application/x-ndjson")
 
     @fastapi_app.get("/metrics")
