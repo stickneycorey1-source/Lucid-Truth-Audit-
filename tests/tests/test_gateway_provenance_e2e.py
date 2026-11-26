@@ -86,6 +86,8 @@ def test_chat_and_shadow_emit_verifiable_provenance_and_detect_config_tampering(
     assert shadow_resp.status_code == 202
     shadow_body = shadow_resp.json()
     assert shadow_body["zero_retention"] is True
+    assert isinstance(shadow_body["audit_id"], str) and len(shadow_body["audit_id"]) > 0
+    assert len(shadow_body["entry_hash"]) == 64
     assert len(shadow_body["policy_sha256"]) == 64
     assert len(shadow_body["config_fingerprint"]) == 64
     assert len(shadow_body["provenance_hash"]) == 64
