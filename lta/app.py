@@ -181,17 +181,20 @@ def _resolve_sqlite_path(db_url: Optional[str]) -> Optional[str]:
     return None
 
 
-def _sqlite_chain_tampered(db_url: Optional[str]) -> bool:
-    """Detect direct SQLite mutations on audit_events rows when a file DB is used."""
+def _inspect_sqlite_chain(db_url: Optional[str]) -> Tuple[bool, Optional[int]]:
+    """Inspect SQLite audit_events rows for chain link or digest tampering.
+
+    Returns (tampered, first_broken_seq_id).
+    """
     db_path = _resolve_sqlite_path(db_url)
     if not db_path or not os.path.exists(db_path):
-        return False
+        return False, None
     try:
         conn = sqlite3.connect(db_path)
         try:
             cols_info = conn.execute("PRAGMA table_info(audit_events)").fetchall()
             if not cols_info:
-                return False
+                return False, None
             col_names = [c[1] for c in cols_info]
             hash_col = next(
                 (c for c in ("entry_hash", "event_hash", "row_hash", "hash", "digest") if c in col_names),
@@ -201,32 +204,45 @@ def _sqlite_chain_tampered(db_url: Optional[str]) -> bool:
                 (c for c in ("prev_hash", "previous_hash", "parent_hash") if c in col_names),
                 None,
             )
-            if not hash_col:
-                return False
-            order_col = "seq_id" if "seq_id" in col_names else ("id" if "id" in col_names else "rowid")
-            rows = conn.execute(f"SELECT * FROM audit_events ORDER BY {order_col} ASC").fetchall()
+            seq_col = "seq_id" if "seq_id" in col_names else ("id" if "id" in col_names else "rowid")
+            rows = conn.execute(f"SELECT * FROM audit_events ORDER BY {seq_col} ASC").fetchall()
             expected_prev = "GENESIS"
-            for row in rows:
+            for idx, row in enumerate(rows, start=1):
                 record_map = dict(zip(col_names, row))
+                seq_val = record_map.get("seq_id", record_map.get("id", idx))
+                try:
+                    seq_id: Optional[int] = int(seq_val) if seq_val is not None else idx
+                except (TypeError, ValueError):
+                    seq_id = idx
+
+                if not hash_col:
+                    continue
+
                 stored_hash = str(record_map.get(hash_col) or "")
                 if prev_col and record_map.get(prev_col) not in (None, "", expected_prev):
-                    return True
-                non_hash_items = {
-                    k: v for k, v in record_map.items() if k != hash_col
-                }
-                canonical = json.dumps(non_hash_items, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+                    return True, seq_id
+
+                non_hash_items = {k: v for k, v in record_map.items() if k != hash_col}
+                canonical = json.dumps(
+                    non_hash_items, sort_keys=True, default=str, separators=(",", ":")
+                ).encode("utf-8")
                 computed_full = hashlib.sha256(canonical).hexdigest()
-                if stored_hash and stored_hash != computed_full and stored_hash != computed_full[: len(stored_hash)]:
-                    # Only flag if stored_hash looks like a standard SHA-256 hex digest that doesn't match
-                    if len(stored_hash) in (32, 40, 64) and all(ch in "0123456789abcdefABCDEF" for ch in stored_hash):
-                        return True
+                if (
+                    stored_hash
+                    and stored_hash != computed_full
+                    and stored_hash != computed_full[: len(stored_hash)]
+                    and len(stored_hash) in (32, 40, 64)
+                    and all(ch in "0123456789abcdefABCDEF" for ch in stored_hash)
+                ):
+                    return True, seq_id
+
                 if stored_hash:
                     expected_prev = stored_hash
-            return False
+            return False, None
         finally:
             conn.close()
     except sqlite3.Error:
-        return False
+        return False, None
 
 
 @asynccontextmanager
@@ -641,6 +657,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
         if endpoint == "/api/v1/guard":
             return {
+                "status": "success",
                 "allowed": True,
                 "action": final_action,
                 "policy_pack": policy_name,
@@ -800,14 +817,22 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     ) -> Dict[str, Any]:
         result = audit_ledger.verify_chain()
         ledger_valid = bool(result.get("valid")) if isinstance(result, dict) else bool(result)
-        tampered = _sqlite_chain_tampered(cfg.audit_db_url)
+        tampered, broken_seq = _inspect_sqlite_chain(cfg.audit_db_url)
         valid = bool(ledger_valid and not tampered)
+        first_broken_seq_id: Optional[int] = None
+        if not valid:
+            if isinstance(result, dict) and result.get("first_broken_seq_id") is not None:
+                first_broken_seq_id = result["first_broken_seq_id"]
+            elif broken_seq is not None:
+                first_broken_seq_id = broken_seq
+            else:
+                first_broken_seq_id = 1
         details = dict(result) if isinstance(result, dict) else {"valid": valid}
         details["valid"] = valid
-        if tampered:
-            details["tamper_detected"] = True
+        details["first_broken_seq_id"] = first_broken_seq_id
         return {
             "chain_valid": valid,
+            "first_broken_seq_id": first_broken_seq_id,
             "details": details,
         }
 
