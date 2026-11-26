@@ -19,7 +19,12 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from lta.audit_ledger import AuditLedger, AuditRecord
+from lta.audit_ledger import (
+    AuditLedger,
+    AuditRecord,
+    compute_config_fingerprint,
+    compute_policy_digest,
+)
 from lta.config import Settings, TenantConfig
 from lta.metrics import MetricsRegistry
 from lta.policy_engine import PolicyEngine
@@ -298,6 +303,50 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     fastapi_app.state.rate_limiter = rate_limiter
     fastapi_app.state.auth_fail_limiter = auth_fail_limiter
 
+    def _resolve_runtime_provenance(
+        policy_name: str,
+        provider_name: str,
+        rate_limit_rpm: int,
+    ) -> Tuple[str, str, str]:
+        try:
+            pack_obj = policy_engine.get_pack(policy_name)
+        except Exception:
+            pack_obj = None
+        policy_version, policy_sha256 = compute_policy_digest(
+            pack_obj,
+            fallback_name=policy_name,
+            fallback_version="2.4.0",
+        )
+        config_fp = compute_config_fingerprint(
+            gateway_version="2.4.0",
+            policy_name=policy_name,
+            policy_version=policy_version,
+            policy_sha256=policy_sha256,
+            provider=provider_name,
+            max_body_bytes=MAX_BODY_BYTES,
+            rate_limit_rpm=rate_limit_rpm,
+            auth_fail_limit_rpm=auth_fail_limit_rpm,
+            extra_flags={
+                "disable_docs": disable_docs,
+                "zero_retention_shadow": True,
+            },
+        )
+        try:
+            audit_ledger.record_snapshot(
+                config_fingerprint=config_fp,
+                policy_name=policy_name,
+                policy_version=policy_version,
+                policy_sha256=policy_sha256,
+                metadata={
+                    "gateway_version": "2.4.0",
+                    "provider": provider_name,
+                    "max_body_bytes": MAX_BODY_BYTES,
+                },
+            )
+        except Exception as exc:
+            logger.debug("Policy snapshot record skipped: %s", exc)
+        return policy_version, policy_sha256, config_fp
+
     @fastapi_app.middleware("http")
     async def _ingress_middleware(request: Request, call_next):
         req_id = _resolve_request_id(request.headers.get("X-Request-ID"))
@@ -439,6 +488,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             latency_ms = (time.perf_counter() - started) * 1000.0
             vector = "security.unauthorized_policy_override"
             msg = "Policy or provider overrides require admin privileges"
+            pol_ver, pol_sha, cfg_fp = _resolve_runtime_provenance(
+                policy_name=tenant.policy_pack,
+                provider_name=tenant.provider,
+                rate_limit_rpm=tenant.rate_limit_rpm,
+            )
             audit_ledger.record(
                 tenant_id=tenant.tenant_id,
                 endpoint=endpoint,
@@ -450,6 +504,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 redactions=[],
                 raw_payload_for_digest="\n".join(m["content"] for m in messages),
                 latency_ms=latency_ms,
+                policy_version=pol_ver,
+                policy_sha256=pol_sha,
+                config_fingerprint=cfg_fp,
+                request_id=request.state.request_id,
             )
             metrics.observe(
                 policy_pack=tenant.policy_pack,
@@ -472,6 +530,12 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 detail=_blocked_detail("policy.unknown_pack", str(exc)),
             ) from exc
 
+        policy_version, policy_sha256, config_fp = _resolve_runtime_provenance(
+            policy_name=policy_name,
+            provider_name=provider_name,
+            rate_limit_rpm=tenant.rate_limit_rpm,
+        )
+
         for idx, msg in enumerate(messages):
             if msg["role"] == "system" and (idx > 0 or not is_admin):
                 latency_ms = (time.perf_counter() - started) * 1000.0
@@ -488,6 +552,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     redactions=[],
                     raw_payload_for_digest=msg["content"],
                     latency_ms=latency_ms,
+                    policy_version=policy_version,
+                    policy_sha256=policy_sha256,
+                    config_fingerprint=config_fp,
+                    request_id=request.state.request_id,
                 )
                 metrics.observe(
                     policy_pack=policy_name,
@@ -525,6 +593,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     redactions=probe_eval.redactions,
                     raw_payload_for_digest="\n".join(m["content"] for m in messages),
                     latency_ms=latency_ms,
+                    policy_version=policy_version,
+                    policy_sha256=policy_sha256,
+                    config_fingerprint=config_fp,
+                    request_id=request.state.request_id,
                 )
                 metrics.observe(
                     policy_pack=policy_name,
@@ -577,6 +649,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 redactions=sorted(set(input_redactions)),
                 raw_payload_for_digest="\n".join(m["content"] for m in sanitized_messages),
                 latency_ms=latency_ms,
+                policy_version=policy_version,
+                policy_sha256=policy_sha256,
+                config_fingerprint=config_fp,
+                request_id=request.state.request_id,
             )
             metrics.observe(
                 policy_pack=policy_name,
@@ -605,6 +681,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 redactions=sorted(set(input_redactions + output_eval.redactions)),
                 raw_payload_for_digest=upstream_resp.content,
                 latency_ms=latency_ms,
+                policy_version=policy_version,
+                policy_sha256=policy_sha256,
+                config_fingerprint=config_fp,
+                request_id=request.state.request_id,
             )
             metrics.observe(
                 policy_pack=policy_name,
@@ -633,11 +713,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             redactions=all_redactions,
             raw_payload_for_digest="\n".join(m["content"] for m in sanitized_messages),
             latency_ms=latency_ms,
+            policy_version=policy_version,
+            policy_sha256=policy_sha256,
+            config_fingerprint=config_fp,
+            request_id=request.state.request_id,
         )
         entry_hash = _extract_entry_hash(
             recorded,
             f"{tenant.tenant_id}:{endpoint}:{policy_name}:{final_action}:{latency_ms}:{request.state.request_id}",
         )
+        provenance_hash = getattr(recorded, "provenance_hash", "")
         metrics.observe(
             policy_pack=policy_name,
             http_status=200,
@@ -652,6 +737,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         lta_audit_meta = {
             "action": final_action,
             "policy_pack": policy_name,
+            "policy_version": policy_version,
+            "policy_sha256": policy_sha256,
+            "config_fingerprint": config_fp,
+            "provenance_hash": provenance_hash,
             "redactions": all_redactions,
             "latency_ms": latency_ms,
             "entry_hash": entry_hash,
@@ -663,6 +752,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 "allowed": True,
                 "action": final_action,
                 "policy_pack": policy_name,
+                "policy_version": policy_version,
+                "policy_sha256": policy_sha256,
+                "config_fingerprint": config_fp,
+                "provenance_hash": provenance_hash,
                 "redactions": all_redactions,
                 "sanitized_output": final_content,
                 "latency_ms": latency_ms,
@@ -781,6 +874,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         actor_id: str = Depends(_authenticate_shadow),
     ) -> Dict[str, Any]:
         started = time.perf_counter()
+        resolved_req_id = _resolve_request_id(body.request_id)
         digest = hashlib.sha256(body.prompt.encode("utf-8")).hexdigest()
         raw_packs = policy_engine.list_packs() or []
         pack_names = [
@@ -791,6 +885,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "fmcsa"
             if "fmcsa" in pack_names
             else (pack_names[0] if pack_names else "general_enterprise")
+        )
+        policy_version, policy_sha256, config_fp = _resolve_runtime_provenance(
+            policy_name=policy_name,
+            provider_name="shadow",
+            rate_limit_rpm=0,
         )
         try:
             eval_res = policy_engine.evaluate_input(
@@ -811,8 +910,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             vector = None
             redactions = []
         latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        provenance_hash = ""
         try:
-            audit_ledger.record(
+            recorded = audit_ledger.record(
                 tenant_id=actor_id,
                 endpoint="/v1/shadow/ingest",
                 policy_pack=policy_name,
@@ -823,14 +923,24 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 redactions=redactions,
                 raw_payload_for_digest=body.prompt,
                 latency_ms=latency_ms,
+                policy_version=policy_version,
+                policy_sha256=policy_sha256,
+                config_fingerprint=config_fp,
+                request_id=resolved_req_id,
             )
+            provenance_hash = getattr(recorded, "provenance_hash", "")
         except Exception as exc:
             logger.warning("Shadow audit_ledger.record warning: %s", exc)
         return {
             "accepted": True,
             "zero_retention": True,
-            "request_id": _resolve_request_id(body.request_id),
+            "request_id": resolved_req_id,
             "input_sha256": digest,
+            "policy_pack": policy_name,
+            "policy_version": policy_version,
+            "policy_sha256": policy_sha256,
+            "config_fingerprint": config_fp,
+            "provenance_hash": provenance_hash,
             "would_allow": allowed,
             "vector": vector,
             "redactions": redactions,
