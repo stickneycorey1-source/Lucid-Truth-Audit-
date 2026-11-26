@@ -796,23 +796,32 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     ) -> Dict[str, Any]:
         started = time.perf_counter()
         digest = hashlib.sha256(body.prompt.encode("utf-8")).hexdigest()
-        packs = policy_engine.list_packs()
-        policy_name = "fmcsa" if "fmcsa" in packs else packs[0]
-        eval_res = policy_engine.evaluate_input(
-            text=body.prompt,
-            policy_name=policy_name,
-            metadata=body.metadata,
-        )
+        packs = policy_engine.list_packs() or []
+        policy_name = "fmcsa" if "fmcsa" in packs else (packs[0] if packs else "general_enterprise")
+        try:
+            eval_res = policy_engine.evaluate_input(
+                text=body.prompt,
+                policy_name=policy_name,
+                metadata=body.metadata,
+            )
+            allowed = bool(eval_res.allowed)
+            vector = eval_res.vector
+            redactions = list(eval_res.redactions or [])
+        except Exception as exc:
+            logger.warning("Shadow policy evaluation fallback triggered for pack '%s': %s", policy_name, exc)
+            allowed = True
+            vector = None
+            redactions = []
         latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
         audit_ledger.record(
             tenant_id=actor_id,
             endpoint="/v1/shadow/ingest",
             policy_pack=policy_name,
             provider="shadow",
-            action="SHADOW_BLOCK" if not eval_res.allowed else "SHADOW_ALLOW",
+            action="SHADOW_BLOCK" if not allowed else "SHADOW_ALLOW",
             http_status=202,
-            vector=eval_res.vector,
-            redactions=eval_res.redactions,
+            vector=vector,
+            redactions=redactions,
             raw_payload_for_digest=body.prompt,
             latency_ms=latency_ms,
         )
@@ -821,9 +830,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
             "zero_retention": True,
             "request_id": _resolve_request_id(body.request_id),
             "input_sha256": digest,
-            "would_allow": eval_res.allowed,
-            "vector": eval_res.vector,
-            "redactions": eval_res.redactions,
+            "would_allow": allowed,
+            "vector": vector,
+            "redactions": redactions,
             "latency_ms": latency_ms,
         }
 
