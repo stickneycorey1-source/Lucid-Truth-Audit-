@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from lta.app import create_app
 from lta.config import Settings
+from lta.policy_engine import PolicyEngine
 
 BASE_URL = os.getenv("LTA_BASE_URL", "https://lucid-truth-audit.onrender.com").rstrip("/")
 API_KEY = os.getenv("LTA_API_KEY", "").strip()
@@ -257,7 +258,11 @@ def test_tampering_breaks_verification_local(tmp_path: Path, monkeypatch: pytest
     client_key = "local-client-key-001"
     admin_key = "local-admin-key-001"
 
-    monkeypatch.setenv("LTA_POLICY_DIR", "./policy_packs")
+    base_settings = Settings.from_env()
+    engine = PolicyEngine(base_settings.policy_dir)
+    packs = engine.list_packs() or []
+    policy_pack = "fmcsa" if "fmcsa" in packs else (packs[0] if packs else "general_enterprise")
+
     monkeypatch.setenv("LTA_DEFAULT_PROVIDER", "mock")
     monkeypatch.setenv("LTA_AUDIT_DB_URL", db_url)
     monkeypatch.setenv(
@@ -267,7 +272,7 @@ def test_tampering_breaks_verification_local(tmp_path: Path, monkeypatch: pytest
                 {
                     "tenant_id": "fleet_pilot_01",
                     "api_key": client_key,
-                    "policy_pack": "fmcsa",
+                    "policy_pack": policy_pack,
                     "provider": "mock",
                     "rate_limit_rpm": 120,
                     "role": "client",
@@ -275,7 +280,7 @@ def test_tampering_breaks_verification_local(tmp_path: Path, monkeypatch: pytest
                 {
                     "tenant_id": "secops_admin",
                     "api_key": admin_key,
-                    "policy_pack": "fmcsa",
+                    "policy_pack": policy_pack,
                     "provider": "mock",
                     "rate_limit_rpm": 300,
                     "role": "admin",
