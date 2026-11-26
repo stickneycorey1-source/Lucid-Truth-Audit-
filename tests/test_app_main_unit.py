@@ -152,11 +152,11 @@ def test_lines_73_97_100_docs_csp_and_validation_handler(monkeypatch: pytest.Mon
         r_auth_422 = client.post(
             "/api/v1/guard",
             headers={"X-API-Key": "valid-pilot-key"},
-            json={"dispatch_id": "BOL-9941", "prompt": ""},
+            json={"dispatch_id": "=BOL-9941", "prompt": ""},
         )
         assert r_auth_422.status_code == 422
         assert any(
-            ev["decision"] == "BLOCKED" and ev["reference_id"] == "BOL-9941"
+            ev["decision"] == "BLOCKED" and ev["reference_id"] == "=BOL-9941"
             for ev in ledger.events
         )
 
@@ -168,12 +168,12 @@ def test_lines_163_218_luhn_redaction_floods_and_validators(monkeypatch: pytest.
     assert mod.luhn_valid("4532015112830366") is True
     assert mod.luhn_valid("4532015112830367") is False
 
-    # Lines 182-192: API_SECRET redaction & 13-19 digit non-Luhn preservation
-    text = "Key AKIAIOSFODNN7EXAMPLE and non-card digits 1111222233334444"
+    # Lines 182-192: API_SECRET redaction & non-Luhn 16-digit tracking ID preservation
+    text = "Key AKIAIOSFODNN7EXAMPLE and non-Luhn digits 1111222233334445"
     redacted, types_found = mod.redact_sensitive_entities(text)
     assert "[REDACTED_SECRET]" in redacted
     assert "API_SECRET" in types_found
-    assert "1111222233334444" in redacted
+    assert "1111222233334445" in redacted
 
     # Line 205: repeating word flood & high-entropy flood
     assert mod.is_anomalous_flood(" ".join(["ping"] * 12)) == "anomaly_repeating_chars"
@@ -188,7 +188,7 @@ def test_lines_163_218_luhn_redaction_floods_and_validators(monkeypatch: pytest.
 
 
 def test_lines_281_368_and_414_432_guard_blocks_turns_and_csv_export(monkeypatch: pytest.MonkeyPatch, tmp_path):
-    mod, _ = _load_fresh_app_main(monkeypatch, tmp_path)
+    mod, ledger = _load_fresh_app_main(monkeypatch, tmp_path)
 
     with TestClient(mod.app) as client:
         # Lines 281-282: social engineering PII pretext -> 422
@@ -205,14 +205,14 @@ def test_lines_281_368_and_414_432_guard_blocks_turns_and_csv_export(monkeypatch
         )
         assert r_flood.status_code == 422
 
-        # Lines 332->331 & 367-368: multi-turn messages with duplicate redaction types & formula-like text
+        # Lines 332->331 & 367-368: multi-turn messages with duplicate redaction types
         r_multi = client.post(
             "/api/v1/guard",
             json={
-                "prompt": "=SUM(1,2) SSN 123-45-6789",
+                "prompt": "SSN 123-45-6789 route check",
                 "messages": [
-                    {"role": "user", "content": "+CMD SSN 123-45-6789"},
-                    {"role": "assistant", "content": "-100 @sheet load ok"},
+                    {"role": "user", "content": "Second SSN 123-45-6789"},
+                    {"role": "assistant", "content": "Load PO8492014 verified"},
                 ],
             },
         )
@@ -222,6 +222,10 @@ def test_lines_281_368_and_414_432_guard_blocks_turns_and_csv_export(monkeypatch
         assert body["redacted_entities"] == ["SSN"]
         assert len(body["sanitized_messages"]) == 2
 
+        # Seed formula-prefixed ledger fields to verify sanitize_csv_cell on CSV export
+        ledger.record_event("p2_pilot", "/api/v1/guard", "=SUM(1,2)", "ALLOWED", 200, [], "+CMD_TEST")
+        ledger.record_event("p2_pilot", "/api/v1/guard", "-100", "ALLOWED", 200, [], "@SHEET_TEST")
+
         # Lines 414-432: CSV export neutralizes leading formula prefixes & sets filename
         r_csv = client.get("/api/v1/audit/export.csv")
         assert r_csv.status_code == 200
@@ -230,6 +234,6 @@ def test_lines_281_368_and_414_432_guard_blocks_turns_and_csv_export(monkeypatch
             "content-disposition", ""
         )
         assert "'=SUM(1,2)" in r_csv.text
-        assert "'+CMD" in r_csv.text
+        assert "'+CMD_TEST" in r_csv.text
         assert "'-100" in r_csv.text
-        assert "'@sheet" in r_csv.text
+        assert "'@SHEET_TEST" in r_csv.text
