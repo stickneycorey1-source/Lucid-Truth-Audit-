@@ -292,10 +292,15 @@ def test_tampering_breaks_verification_local(tmp_path: Path, monkeypatch: pytest
                 headers={"X-API-Key": client_key},
                 json={
                     "model": "gpt-4o-mini",
-                    "messages": [{"role": "user", "content": f"Load check {idx} for PO8492014"}],
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": f"Routine dispatch status check {idx} for I-94 corridor",
+                        }
+                    ],
                 },
             )
-            assert res.status_code == 200
+            assert res.status_code == 200, f"Unexpected {res.status_code}: {res.text}"
 
         verify_clean = client.get("/v1/audit/verify", headers={"X-API-Key": admin_key})
         assert verify_clean.status_code == 200
