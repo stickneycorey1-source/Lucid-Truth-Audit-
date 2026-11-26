@@ -19,7 +19,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Res
 from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from lta.audit_ledger import AuditLedger
+from lta.audit_ledger import AuditLedger, AuditRecord
 from lta.config import Settings, TenantConfig
 from lta.metrics import MetricsRegistry
 from lta.policy_engine import PolicyEngine
@@ -157,6 +157,8 @@ def _format_jsonl_rows(rows: Any) -> str:
 
 
 def _extract_entry_hash(recorded: Any, fallback_seed: str) -> str:
+    if isinstance(recorded, AuditRecord):
+        return recorded.entry_hash
     if isinstance(recorded, dict):
         for k in ("entry_hash", "event_hash", "hash", "record_hash", "digest"):
             val = recorded.get(k)
@@ -182,10 +184,7 @@ def _resolve_sqlite_path(db_url: Optional[str]) -> Optional[str]:
 
 
 def _inspect_sqlite_chain(db_url: Optional[str]) -> Tuple[bool, Optional[int]]:
-    """Inspect SQLite audit_events rows for chain link or digest tampering.
-
-    Returns (tampered, first_broken_seq_id).
-    """
+    """Inspect SQLite audit_events rows for chain link or digest tampering."""
     db_path = _resolve_sqlite_path(db_url)
     if not db_path or not os.path.exists(db_path):
         return False, None
@@ -206,7 +205,7 @@ def _inspect_sqlite_chain(db_url: Optional[str]) -> Tuple[bool, Optional[int]]:
             )
             seq_col = "seq_id" if "seq_id" in col_names else ("id" if "id" in col_names else "rowid")
             rows = conn.execute(f"SELECT * FROM audit_events ORDER BY {seq_col} ASC").fetchall()
-            expected_prev = "GENESIS"
+            expected_prev = "0" * 64
             for idx, row in enumerate(rows, start=1):
                 record_map = dict(zip(col_names, row))
                 seq_val = record_map.get("seq_id", record_map.get("id", idx))
@@ -243,6 +242,23 @@ def _inspect_sqlite_chain(db_url: Optional[str]) -> Tuple[bool, Optional[int]]:
             conn.close()
     except sqlite3.Error:
         return False, None
+
+
+def _unpack_verify_result(raw_result: Any) -> Tuple[bool, Optional[int], Optional[int]]:
+    """Normalize AuditLedger.verify_chain() output across tuple, dict, or bool forms."""
+    if isinstance(raw_result, tuple) and len(raw_result) >= 3:
+        valid = bool(raw_result[0])
+        total = int(raw_result[1]) if raw_result[1] is not None else None
+        broken = int(raw_result[2]) if raw_result[2] is not None else None
+        return valid, total, broken
+    if isinstance(raw_result, dict):
+        valid = bool(raw_result.get("valid", raw_result.get("chain_valid", False)))
+        total_raw = raw_result.get("total_entries", raw_result.get("count"))
+        broken_raw = raw_result.get("first_broken_seq_id", raw_result.get("broken_seq_id"))
+        total = int(total_raw) if total_raw is not None else None
+        broken = int(broken_raw) if broken_raw is not None else None
+        return valid, total, broken
+    return bool(raw_result), None, None
 
 
 @asynccontextmanager
@@ -815,25 +831,21 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     async def verify_audit(
         _admin: TenantConfig = Depends(_require_admin),
     ) -> Dict[str, Any]:
-        result = audit_ledger.verify_chain()
-        ledger_valid = bool(result.get("valid")) if isinstance(result, dict) else bool(result)
-        tampered, broken_seq = _inspect_sqlite_chain(cfg.audit_db_url)
+        ledger_valid, total_entries, broken_seq = _unpack_verify_result(audit_ledger.verify_chain())
+        tampered, sqlite_broken_seq = _inspect_sqlite_chain(cfg.audit_db_url)
         valid = bool(ledger_valid and not tampered)
         first_broken_seq_id: Optional[int] = None
         if not valid:
-            if isinstance(result, dict) and result.get("first_broken_seq_id") is not None:
-                first_broken_seq_id = result["first_broken_seq_id"]
-            elif broken_seq is not None:
-                first_broken_seq_id = broken_seq
-            else:
-                first_broken_seq_id = 1
-        details = dict(result) if isinstance(result, dict) else {"valid": valid}
-        details["valid"] = valid
-        details["first_broken_seq_id"] = first_broken_seq_id
+            first_broken_seq_id = broken_seq if broken_seq is not None else (sqlite_broken_seq or 1)
         return {
             "chain_valid": valid,
+            "total_entries": total_entries,
             "first_broken_seq_id": first_broken_seq_id,
-            "details": details,
+            "details": {
+                "valid": valid,
+                "total_entries": total_entries,
+                "first_broken_seq_id": first_broken_seq_id,
+            },
         }
 
     @fastapi_app.get("/v1/audit/export")
