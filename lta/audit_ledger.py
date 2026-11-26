@@ -95,6 +95,7 @@ class AuditLedger:
     def __init__(self, db_url: str = "sqlite:///./lta_audit_ledger.db") -> None:
         self.db_url = db_url
         self._lock = threading.Lock()
+        self._closed = False
         self._is_postgres = db_url.startswith("postgresql://") or db_url.startswith(
             "postgres://"
         )
@@ -124,6 +125,8 @@ class AuditLedger:
 
     @contextmanager
     def _connection(self) -> Iterator[object]:
+        if self._closed:
+            raise RuntimeError("AuditLedger is closed")
         if self._pool is not None:
             with self._pool.connection() as conn:
                 try:
@@ -133,13 +136,16 @@ class AuditLedger:
                     raise
         else:
             with self._lock:
+                if self._closed:
+                    raise RuntimeError("AuditLedger is closed")
                 if self._conn is None:
                     path = self.db_url.replace("sqlite:///", "", 1)
                     self._conn = sqlite3.connect(path, check_same_thread=False)
                 try:
                     yield self._conn
                 except Exception:
-                    self._conn.rollback()
+                    if self._conn is not None:
+                        self._conn.rollback()
                     raise
 
     def _init_schema(self) -> None:
@@ -193,6 +199,8 @@ class AuditLedger:
 
     def ping(self) -> bool:
         """Fast O(1) connectivity check for /readyz without scanning audit_events."""
+        if self._closed:
+            return False
         try:
             with self._connection() as conn:
                 cur = conn.cursor()
@@ -398,10 +406,12 @@ class AuditLedger:
         return "\n".join(lines)
 
     def close(self) -> None:
-        if self._pool is not None:
-            self._pool.close()
-        elif self._conn is not None:
-            with self._lock:
+        with self._lock:
+            self._closed = True
+            if self._pool is not None:
+                self._pool.close()
+                self._pool = None
+            elif self._conn is not None:
                 try:
                     self._conn.close()
                 finally:
