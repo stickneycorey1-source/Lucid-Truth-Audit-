@@ -1,9 +1,10 @@
-"""Tamper-evident SHA-256 hash-chained persistent audit ledger (Hardened v2.4).
+"""Tamper-evident SHA-256 hash-chained persistent audit ledger with provenance (Hardened v2.4).
 
 Supports SQLite out of the box and PostgreSQL via `psycopg_pool.ConnectionPool`
 (with fallback to `psycopg.connect`) using transactional `pg_advisory_xact_lock`,
-automatic `rollback()` on errors, an O(1) `ping()` for `/readyz` probes, and a
-composite `(tenant_id, seq_id DESC)` index for fast SIEM exports.
+automatic `rollback()` on errors, policy-version & config-fingerprint tracking,
+an O(1) `ping()` for `/readyz` probes, and a composite `(tenant_id, seq_id DESC)`
+index for fast SIEM exports.
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+from lta.provenance import compute_provenance_hash
 
 
 GENESIS_HASH = "0" * 64
@@ -38,6 +41,11 @@ class AuditRecord:
     latency_ms: float
     prev_hash: str
     entry_hash: str
+    policy_version: str = "2.4.0"
+    policy_sha256: str = ""
+    config_fingerprint: str = ""
+    provenance_hash: str = ""
+    provenance: Optional[Dict[str, Any]] = None
 
 
 def _normalize_redactions(redactions_value: Any) -> List[str]:
@@ -53,6 +61,19 @@ def _normalize_redactions(redactions_value: Any) -> List[str]:
     return []
 
 
+def _normalize_provenance_dict(provenance_value: Any) -> Dict[str, Any]:
+    if isinstance(provenance_value, dict):
+        return dict(provenance_value)
+    if isinstance(provenance_value, str) and provenance_value.strip():
+        try:
+            parsed = json.loads(provenance_value)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            pass
+    return {}
+
+
 def _compute_entry_hash(
     prev_hash: str,
     timestamp_utc: str,
@@ -66,8 +87,12 @@ def _compute_entry_hash(
     redactions_json: Any,
     payload_sha256: str,
     latency_ms: float,
+    policy_version: str = "2.4.0",
+    policy_sha256: str = "",
+    config_fingerprint: str = "",
+    provenance_hash: str = "",
 ) -> str:
-    normalized_redactions = _normalize_redactions(redactions_json)
+    normalized_redactions = _normalize_redactions(redactions_value=redactions_json)
     canonical = json.dumps(
         {
             "prev_hash": str(prev_hash),
@@ -75,6 +100,10 @@ def _compute_entry_hash(
             "tenant_id": str(tenant_id),
             "endpoint": str(endpoint),
             "policy_pack": str(policy_pack),
+            "policy_version": str(policy_version or "2.4.0"),
+            "policy_sha256": str(policy_sha256 or ""),
+            "config_fingerprint": str(config_fingerprint or ""),
+            "provenance_hash": str(provenance_hash or ""),
             "provider": str(provider),
             "action": str(action),
             "http_status": int(http_status),
@@ -157,6 +186,11 @@ class AuditLedger:
                 tenant_id TEXT NOT NULL,
                 endpoint TEXT NOT NULL,
                 policy_pack TEXT NOT NULL,
+                policy_version TEXT NOT NULL DEFAULT '2.4.0',
+                policy_sha256 TEXT NOT NULL DEFAULT '',
+                config_fingerprint TEXT NOT NULL DEFAULT '',
+                provenance_hash TEXT NOT NULL DEFAULT '',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
                 provider TEXT NOT NULL,
                 action TEXT NOT NULL,
                 http_status INTEGER NOT NULL,
@@ -176,6 +210,11 @@ class AuditLedger:
                 tenant_id TEXT NOT NULL,
                 endpoint TEXT NOT NULL,
                 policy_pack TEXT NOT NULL,
+                policy_version TEXT NOT NULL DEFAULT '2.4.0',
+                policy_sha256 TEXT NOT NULL DEFAULT '',
+                config_fingerprint TEXT NOT NULL DEFAULT '',
+                provenance_hash TEXT NOT NULL DEFAULT '',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
                 provider TEXT NOT NULL,
                 action TEXT NOT NULL,
                 http_status INTEGER NOT NULL,
@@ -188,9 +227,34 @@ class AuditLedger:
             )
             """
         )
+        snapshots_ddl = (
+            """
+            CREATE TABLE IF NOT EXISTS policy_snapshots (
+                config_fingerprint TEXT PRIMARY KEY,
+                policy_name TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_sha256 TEXT NOT NULL,
+                recorded_at_utc TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL
+            )
+            """
+        )
+        migrations = [
+            "ALTER TABLE audit_events ADD COLUMN policy_version TEXT NOT NULL DEFAULT '2.4.0'",
+            "ALTER TABLE audit_events ADD COLUMN policy_sha256 TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE audit_events ADD COLUMN config_fingerprint TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE audit_events ADD COLUMN provenance_hash TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE audit_events ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '{}'",
+        ]
         with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(ddl)
+            cur.execute(snapshots_ddl)
+            for stmt in migrations:
+                try:
+                    cur.execute(stmt)
+                except Exception:
+                    pass
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_audit_tenant_seq "
                 "ON audit_events (tenant_id, seq_id DESC)"
@@ -210,6 +274,46 @@ class AuditLedger:
         except Exception:
             return False
 
+    def record_snapshot(
+        self,
+        *,
+        config_fingerprint: str,
+        policy_name: str,
+        policy_version: str,
+        policy_sha256: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist a deduplicated policy & gateway configuration snapshot."""
+        if not config_fingerprint:
+            return
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        snap_doc = {
+            "config_fingerprint": config_fingerprint,
+            "policy_name": policy_name,
+            "policy_version": policy_version,
+            "policy_sha256": policy_sha256,
+            "recorded_at_utc": ts,
+            "metadata": metadata or {},
+        }
+        snap_json = json.dumps(snap_doc, sort_keys=True, separators=(",", ":"))
+        with self._connection() as conn:
+            cur = conn.cursor()
+            if self._is_postgres:
+                cur.execute(
+                    "INSERT INTO policy_snapshots "
+                    "(config_fingerprint, policy_name, policy_version, policy_sha256, recorded_at_utc, snapshot_json) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (config_fingerprint) DO NOTHING",
+                    (config_fingerprint, policy_name, policy_version, policy_sha256, ts, snap_json),
+                )
+            else:
+                cur.execute(
+                    "INSERT OR IGNORE INTO policy_snapshots "
+                    "(config_fingerprint, policy_name, policy_version, policy_sha256, recorded_at_utc, snapshot_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (config_fingerprint, policy_name, policy_version, policy_sha256, ts, snap_json),
+                )
+            conn.commit()
+
     def record(
         self,
         *,
@@ -223,8 +327,13 @@ class AuditLedger:
         redactions: List[str],
         raw_payload_for_digest: str,
         latency_ms: float,
+        policy_version: str = "2.4.0",
+        policy_sha256: str = "",
+        config_fingerprint: str = "",
+        request_id: str = "",
+        extra_provenance: Optional[Dict[str, Any]] = None,
     ) -> AuditRecord:
-        """Append a tamper-evident audit event without persisting raw prompt text."""
+        """Append a tamper-evident audit event with policy & config provenance."""
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         payload_sha256 = hashlib.sha256(
             raw_payload_for_digest.encode("utf-8")
@@ -233,6 +342,9 @@ class AuditLedger:
         redactions_json = json.dumps(normalized_redactions, separators=(",", ":"))
         rounded_latency = round(float(latency_ms), 3)
         normalized_vector = str(vector or "")
+        norm_policy_ver = str(policy_version or "2.4.0")
+        norm_policy_sha = str(policy_sha256 or "")
+        norm_cfg_fp = str(config_fingerprint or "")
 
         with self._connection() as conn:
             cur = conn.cursor()
@@ -243,6 +355,30 @@ class AuditLedger:
             )
             row = cur.fetchone()
             prev_hash = str(row[0]) if row and row[0] else GENESIS_HASH
+            prov_hash = compute_provenance_hash(
+                prev_hash=prev_hash,
+                payload_sha256=payload_sha256,
+                policy_name=policy_pack,
+                policy_version=norm_policy_ver,
+                policy_sha256=norm_policy_sha,
+                config_fingerprint=norm_cfg_fp,
+                request_id=request_id,
+            )
+            prov_dict: Dict[str, Any] = {
+                "policy_pack": policy_pack,
+                "policy_version": norm_policy_ver,
+                "policy_sha256": norm_policy_sha,
+                "config_fingerprint": norm_cfg_fp,
+                "payload_sha256": payload_sha256,
+                "prev_hash": prev_hash,
+                "provenance_hash": prov_hash,
+            }
+            if request_id:
+                prov_dict["request_id"] = request_id
+            if extra_provenance:
+                prov_dict.update(extra_provenance)
+            provenance_json = json.dumps(prov_dict, sort_keys=True, separators=(",", ":"))
+
             entry_hash = _compute_entry_hash(
                 prev_hash=prev_hash,
                 timestamp_utc=ts,
@@ -256,20 +392,30 @@ class AuditLedger:
                 redactions_json=normalized_redactions,
                 payload_sha256=payload_sha256,
                 latency_ms=rounded_latency,
+                policy_version=norm_policy_ver,
+                policy_sha256=norm_policy_sha,
+                config_fingerprint=norm_cfg_fp,
+                provenance_hash=prov_hash,
             )
             placeholder = "%s" if self._is_postgres else "?"
-            placeholders = ", ".join([placeholder] * 13)
+            placeholders = ", ".join([placeholder] * 18)
             sql = (
                 f"INSERT INTO audit_events "
-                f"(timestamp_utc, tenant_id, endpoint, policy_pack, provider, action, "
-                f"http_status, vector, redactions_json, payload_sha256, latency_ms, "
-                f"prev_hash, entry_hash) VALUES ({placeholders})"
+                f"(timestamp_utc, tenant_id, endpoint, policy_pack, policy_version, "
+                f"policy_sha256, config_fingerprint, provenance_hash, provenance_json, "
+                f"provider, action, http_status, vector, redactions_json, payload_sha256, "
+                f"latency_ms, prev_hash, entry_hash) VALUES ({placeholders})"
             )
             params = (
                 ts,
                 tenant_id,
                 endpoint,
                 policy_pack,
+                norm_policy_ver,
+                norm_policy_sha,
+                norm_cfg_fp,
+                prov_hash,
+                provenance_json,
                 provider,
                 action,
                 int(http_status),
@@ -304,16 +450,22 @@ class AuditLedger:
             latency_ms=rounded_latency,
             prev_hash=prev_hash,
             entry_hash=entry_hash,
+            policy_version=norm_policy_ver,
+            policy_sha256=norm_policy_sha,
+            config_fingerprint=norm_cfg_fp,
+            provenance_hash=prov_hash,
+            provenance=prov_dict,
         )
 
     def verify_chain(self) -> Tuple[bool, int, Optional[int]]:
-        """Verify every SHA-256 link in the ledger."""
+        """Verify every SHA-256 chain link and provenance digest in the ledger."""
         with self._connection() as conn:
             cur = conn.cursor()
             cur.execute(
                 "SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
-                "provider, action, http_status, vector, redactions_json, "
-                "payload_sha256, latency_ms, prev_hash, entry_hash "
+                "policy_version, policy_sha256, config_fingerprint, provenance_hash, "
+                "provenance_json, provider, action, http_status, vector, "
+                "redactions_json, payload_sha256, latency_ms, prev_hash, entry_hash "
                 "FROM audit_events ORDER BY seq_id ASC"
             )
             rows = cur.fetchall()
@@ -326,6 +478,11 @@ class AuditLedger:
                 tenant_id,
                 endpoint,
                 policy_pack,
+                policy_version,
+                policy_sha256,
+                config_fingerprint,
+                provenance_hash,
+                provenance_json,
                 provider,
                 action,
                 http_status,
@@ -338,6 +495,21 @@ class AuditLedger:
             ) = row
             if str(prev_hash) != expected_prev:
                 return False, len(rows), int(seq_id)
+
+            prov_dict = _normalize_provenance_dict(provenance_json)
+            req_id = str(prov_dict.get("request_id") or "")
+            expected_prov_hash = compute_provenance_hash(
+                prev_hash=str(prev_hash),
+                payload_sha256=str(payload_sha256),
+                policy_name=str(policy_pack),
+                policy_version=str(policy_version or "2.4.0"),
+                policy_sha256=str(policy_sha256 or ""),
+                config_fingerprint=str(config_fingerprint or ""),
+                request_id=req_id,
+            )
+            if provenance_hash and str(provenance_hash) != expected_prov_hash:
+                return False, len(rows), int(seq_id)
+
             recomputed = _compute_entry_hash(
                 prev_hash=str(prev_hash),
                 timestamp_utc=str(ts),
@@ -351,6 +523,10 @@ class AuditLedger:
                 redactions_json=redactions_json,
                 payload_sha256=str(payload_sha256),
                 latency_ms=float(latency_ms),
+                policy_version=str(policy_version or "2.4.0"),
+                policy_sha256=str(policy_sha256 or ""),
+                config_fingerprint=str(config_fingerprint or ""),
+                provenance_hash=str(provenance_hash or ""),
             )
             if recomputed != str(entry_hash):
                 return False, len(rows), int(seq_id)
@@ -358,25 +534,26 @@ class AuditLedger:
         return True, len(rows), None
 
     def export_jsonl(self, tenant_id: Optional[str] = None, limit: int = 1000) -> str:
-        """Export audit events in SIEM-ready JSON Lines format (Splunk/Datadog)."""
+        """Export audit events with full provenance metadata in JSON Lines format."""
         placeholder = "%s" if self._is_postgres else "?"
         with self._connection() as conn:
             cur = conn.cursor()
+            base_sql = (
+                "SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
+                "policy_version, policy_sha256, config_fingerprint, provenance_hash, "
+                "provenance_json, provider, action, http_status, vector, "
+                "redactions_json, payload_sha256, latency_ms, prev_hash, entry_hash "
+                "FROM audit_events "
+            )
             if tenant_id:
                 cur.execute(
-                    f"SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
-                    f"provider, action, http_status, vector, redactions_json, "
-                    f"payload_sha256, latency_ms, prev_hash, entry_hash "
-                    f"FROM audit_events WHERE tenant_id = {placeholder} "
-                    f"ORDER BY seq_id DESC LIMIT {placeholder}",
+                    base_sql
+                    + f"WHERE tenant_id = {placeholder} ORDER BY seq_id DESC LIMIT {placeholder}",
                     (tenant_id, limit),
                 )
             else:
                 cur.execute(
-                    f"SELECT seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
-                    f"provider, action, http_status, vector, redactions_json, "
-                    f"payload_sha256, latency_ms, prev_hash, entry_hash "
-                    f"FROM audit_events ORDER BY seq_id DESC LIMIT {placeholder}",
+                    base_sql + f"ORDER BY seq_id DESC LIMIT {placeholder}",
                     (limit,),
                 )
             rows = cur.fetchall()
@@ -391,15 +568,20 @@ class AuditLedger:
                         "tenant_id": row[2],
                         "endpoint": row[3],
                         "policy_pack": row[4],
-                        "provider": row[5],
-                        "action": row[6],
-                        "http_status": row[7],
-                        "vector": row[8] or None,
-                        "redactions": _normalize_redactions(row[9]),
-                        "payload_sha256": row[10],
-                        "latency_ms": row[11],
-                        "prev_hash": row[12],
-                        "entry_hash": row[13],
+                        "policy_version": row[5],
+                        "policy_sha256": row[6],
+                        "config_fingerprint": row[7],
+                        "provenance_hash": row[8],
+                        "provenance": _normalize_provenance_dict(row[9]),
+                        "provider": row[10],
+                        "action": row[11],
+                        "http_status": row[12],
+                        "vector": row[13] or None,
+                        "redactions": _normalize_redactions(row[14]),
+                        "payload_sha256": row[15],
+                        "latency_ms": row[16],
+                        "prev_hash": row[17],
+                        "entry_hash": row[18],
                     }
                 )
             )
