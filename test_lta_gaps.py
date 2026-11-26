@@ -204,11 +204,20 @@ def test_rate_limit_on_bad_keys():
 def test_latency_profile_report_only():
     client_times_ms = []
     gateway_times_ms = []
+    rate_limited_count = 0
+
     for _ in range(20):
         t = time.perf_counter()
         r = guard("What is the capital of France?")
-        client_times_ms.append((time.perf_counter() - t) * 1000)
+        elapsed_ms = (time.perf_counter() - t) * 1000
+        if r.status_code == 429:
+            rate_limited_count += 1
+            time.sleep(62)
+            t = time.perf_counter()
+            r = guard("What is the capital of France?")
+            elapsed_ms = (time.perf_counter() - t) * 1000
         assert r.status_code == 200, f"Unexpected status during latency profile: {r.status_code} {r.text[:160]}"
+        client_times_ms.append(elapsed_ms)
         try:
             audit_meta = r.json().get("lta_audit")
             if isinstance(audit_meta, dict) and isinstance(audit_meta.get("latency_ms"), (int, float)):
@@ -226,7 +235,8 @@ def test_latency_profile_report_only():
         gw_summary = f" | gateway_reported median={gw_med:.1f} ms p95={gw_p95:.1f} ms"
 
     print(
-        f"\nclient_round_trip median={med:.1f} ms  p95={p95:.1f} ms  max={max_ms:.1f} ms{gw_summary}"
+        f"\nclient_round_trip median={med:.1f} ms  p95={p95:.1f} ms  max={max_ms:.1f} ms"
+        f"  rate_limited_retries={rate_limited_count}{gw_summary}"
     )
     assert med < 15000, f"End-to-end upstream LLM median latency too high: {med:.1f} ms"
 
