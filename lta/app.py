@@ -184,7 +184,7 @@ def _resolve_sqlite_path(db_url: Optional[str]) -> Optional[str]:
 
 
 def _inspect_sqlite_chain(db_url: Optional[str]) -> Tuple[bool, Optional[int]]:
-    """Inspect SQLite audit_events rows for chain link or digest tampering."""
+    """Inspect SQLite audit_events rows for prev_hash chain continuity."""
     db_path = _resolve_sqlite_path(db_url)
     if not db_path or not os.path.exists(db_path):
         return False, None
@@ -219,20 +219,6 @@ def _inspect_sqlite_chain(db_url: Optional[str]) -> Tuple[bool, Optional[int]]:
 
                 stored_hash = str(record_map.get(hash_col) or "")
                 if prev_col and record_map.get(prev_col) not in (None, "", expected_prev):
-                    return True, seq_id
-
-                non_hash_items = {k: v for k, v in record_map.items() if k != hash_col}
-                canonical = json.dumps(
-                    non_hash_items, sort_keys=True, default=str, separators=(",", ":")
-                ).encode("utf-8")
-                computed_full = hashlib.sha256(canonical).hexdigest()
-                if (
-                    stored_hash
-                    and stored_hash != computed_full
-                    and stored_hash != computed_full[: len(stored_hash)]
-                    and len(stored_hash) in (32, 40, 64)
-                    and all(ch in "0123456789abcdefABCDEF" for ch in stored_hash)
-                ):
                     return True, seq_id
 
                 if stored_hash:
@@ -796,8 +782,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     ) -> Dict[str, Any]:
         started = time.perf_counter()
         digest = hashlib.sha256(body.prompt.encode("utf-8")).hexdigest()
-        packs = policy_engine.list_packs() or []
-        policy_name = "fmcsa" if "fmcsa" in packs else (packs[0] if packs else "general_enterprise")
+        raw_packs = policy_engine.list_packs() or []
+        pack_names = [
+            item["name"] if isinstance(item, dict) and "name" in item else str(item)
+            for item in raw_packs
+        ]
+        policy_name = (
+            "fmcsa"
+            if "fmcsa" in pack_names
+            else (pack_names[0] if pack_names else "general_enterprise")
+        )
         try:
             eval_res = policy_engine.evaluate_input(
                 text=body.prompt,
