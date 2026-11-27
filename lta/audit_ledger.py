@@ -258,4 +258,527 @@ class AuditLedger:
 
         self._pg_conn = psycopg.connect(self.db_url)
 
-    def
+    def _init_schema(self) -> None:
+        if self._is_postgres:
+            ddl_events = """
+            CREATE TABLE IF NOT EXISTS audit_events (
+                seq_id BIGSERIAL PRIMARY KEY,
+                timestamp_utc TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                policy_pack TEXT NOT NULL,
+                policy_version TEXT NOT NULL DEFAULT '',
+                policy_sha256 TEXT NOT NULL DEFAULT '',
+                config_fingerprint TEXT NOT NULL DEFAULT '',
+                provenance_hash TEXT NOT NULL DEFAULT '',
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                provenance_json_sha256 TEXT NOT NULL DEFAULT '',
+                provider TEXT NOT NULL,
+                action TEXT NOT NULL,
+                http_status INTEGER NOT NULL,
+                vector TEXT,
+                redactions_json TEXT NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                latency_ms DOUBLE PRECISION NOT NULL,
+                prev_hash TEXT NOT NULL,
+                entry_hash TEXT NOT NULL
+            )
+            """
+            ddl_snapshots = """
+            CREATE TABLE IF NOT EXISTS policy_snapshots (
+                config_fingerprint TEXT PRIMARY KEY,
+                recorded_at_utc TEXT NOT NULL,
+                policy_name TEXT NOT NULL,
+                policy_version TEXT NOT NULL,
+                policy_sha256 TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+            migrations = [
+                "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS policy_version TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS policy_sha256 TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS config_fingerprint TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS provenance_hash TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS provenance_json TEXT NOT NULL DEFAULT '{}'",
+                "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS provenance_json_sha256 TEXT NOT NULL DEFAULT ''",
+            ]
+            with self._pg_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(ddl_events)
+                cur.execute(ddl_snapshots)
+                for stmt in migrations:
+                    try:
+                        cur.execute(stmt)
+                    except Exception:
+                        conn.rollback()
+                conn.commit()
+            return
+
+        assert self._sqlite_conn is not None
+        ddl_events = """
+        CREATE TABLE IF NOT EXISTS audit_events (
+            seq_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp_utc TEXT NOT NULL,
+            tenant_id TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            policy_pack TEXT NOT NULL,
+            policy_version TEXT NOT NULL DEFAULT '',
+            policy_sha256 TEXT NOT NULL DEFAULT '',
+            config_fingerprint TEXT NOT NULL DEFAULT '',
+            provenance_hash TEXT NOT NULL DEFAULT '',
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            provenance_json_sha256 TEXT NOT NULL DEFAULT '',
+            provider TEXT NOT NULL,
+            action TEXT NOT NULL,
+            http_status INTEGER NOT NULL,
+            vector TEXT,
+            redactions_json TEXT NOT NULL,
+            payload_sha256 TEXT NOT NULL,
+            latency_ms REAL NOT NULL,
+            prev_hash TEXT NOT NULL,
+            entry_hash TEXT NOT NULL
+        )
+        """
+        ddl_snapshots = """
+        CREATE TABLE IF NOT EXISTS policy_snapshots (
+            config_fingerprint TEXT PRIMARY KEY,
+            recorded_at_utc TEXT NOT NULL,
+            policy_name TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            policy_sha256 TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """
+        migrations = [
+            "ALTER TABLE audit_events ADD COLUMN policy_version TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE audit_events ADD COLUMN policy_sha256 TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE audit_events ADD COLUMN config_fingerprint TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE audit_events ADD COLUMN provenance_hash TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE audit_events ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE audit_events ADD COLUMN provenance_json_sha256 TEXT NOT NULL DEFAULT ''",
+        ]
+        with self._lock:
+            cur = self._sqlite_conn.cursor()
+            cur.execute(ddl_events)
+            cur.execute(ddl_snapshots)
+            for stmt in migrations:
+                try:
+                    cur.execute(stmt)
+                except sqlite3.OperationalError:
+                    pass
+            self._sqlite_conn.commit()
+
+    def _pg_connection(self) -> Any:
+        if self._pg_pool is not None:
+            return self._pg_pool.connection()
+        if self._pg_conn is not None:
+            return _DirectConnCtx(self._pg_conn)
+        raise RuntimeError("PostgreSQL connection is closed")
+
+    def ping(self) -> bool:
+        if self._closed:
+            return False
+        try:
+            if self._is_postgres:
+                with self._pg_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute("SELECT 1")
+                    row = cur.fetchone()
+                    return bool(row and row[0] == 1)
+            if self._sqlite_conn is None:
+                return False
+            with self._lock:
+                row = self._sqlite_conn.execute("SELECT 1").fetchone()
+                return bool(row and row[0] == 1)
+        except Exception:
+            return False
+
+    def record_snapshot(
+        self,
+        *,
+        config_fingerprint: str,
+        policy_name: str,
+        policy_version: str,
+        policy_sha256: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self._closed:
+            raise RuntimeError("AuditLedger is closed")
+        ts = datetime.now(timezone.utc).isoformat()
+        meta_json = json.dumps(_sanitize_for_digest(metadata or {}), sort_keys=True, separators=(",", ":"))
+        if self._is_postgres:
+            sql = """
+            INSERT INTO policy_snapshots (
+                config_fingerprint, recorded_at_utc, policy_name,
+                policy_version, policy_sha256, metadata_json
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (config_fingerprint) DO NOTHING
+            """
+            with self._lock, self._pg_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, (config_fingerprint, ts, policy_name, policy_version, policy_sha256, meta_json))
+                conn.commit()
+            return
+
+        assert self._sqlite_conn is not None
+        sql = """
+        INSERT OR IGNORE INTO policy_snapshots (
+            config_fingerprint, recorded_at_utc, policy_name,
+            policy_version, policy_sha256, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """
+        with self._lock:
+            self._sqlite_conn.execute(
+                sql, (config_fingerprint, ts, policy_name, policy_version, policy_sha256, meta_json)
+            )
+            self._sqlite_conn.commit()
+
+    def record(
+        self,
+        *,
+        tenant_id: str,
+        endpoint: str,
+        policy_pack: str,
+        provider: str,
+        action: str,
+        http_status: int,
+        vector: Optional[str],
+        redactions: Sequence[str],
+        raw_payload_for_digest: str,
+        latency_ms: float,
+        policy_version: str = "2.4.0",
+        policy_sha256: str = "",
+        config_fingerprint: str = "",
+        request_id: str = "",
+        extra_provenance: Optional[Dict[str, Any]] = None,
+    ) -> AuditRecord:
+        if self._closed:
+            raise RuntimeError("AuditLedger is closed")
+
+        ts = datetime.now(timezone.utc).isoformat()
+        payload_sha256 = hashlib.sha256(raw_payload_for_digest.encode("utf-8")).hexdigest()
+        redactions_json = json.dumps(sorted(str(r) for r in redactions), separators=(",", ":"))
+        rounded_latency = round(float(latency_ms), 3)
+
+        with self._lock:
+            prev_hash = self._get_latest_hash_locked()
+            provenance_hash = compute_provenance_hash(
+                prev_hash=prev_hash,
+                payload_sha256=payload_sha256,
+                policy_name=policy_pack,
+                policy_version=policy_version,
+                policy_sha256=policy_sha256,
+                config_fingerprint=config_fingerprint,
+                request_id=request_id,
+            )
+            prov_dict: Dict[str, Any] = {
+                "policy_pack": str(policy_pack),
+                "policy_version": str(policy_version),
+                "policy_sha256": str(policy_sha256),
+                "config_fingerprint": str(config_fingerprint),
+                "request_id": str(request_id or ""),
+            }
+            if extra_provenance:
+                prov_dict.update(extra_provenance)
+            provenance_json = json.dumps(prov_dict, sort_keys=True, separators=(",", ":"))
+            provenance_json_sha256 = hashlib.sha256(provenance_json.encode("utf-8")).hexdigest()
+
+            entry_hash = _compute_entry_hash(
+                prev_hash=prev_hash,
+                timestamp_utc=ts,
+                tenant_id=tenant_id,
+                endpoint=endpoint,
+                policy_pack=policy_pack,
+                provider=provider,
+                action=action,
+                http_status=http_status,
+                vector=vector,
+                redactions_json=redactions_json,
+                payload_sha256=payload_sha256,
+                latency_ms=rounded_latency,
+                policy_version=policy_version,
+                policy_sha256=policy_sha256,
+                config_fingerprint=config_fingerprint,
+                provenance_hash=provenance_hash,
+                provenance_json_sha256=provenance_json_sha256,
+            )
+
+            params = (
+                ts,
+                tenant_id,
+                endpoint,
+                policy_pack,
+                policy_version,
+                policy_sha256,
+                config_fingerprint,
+                provenance_hash,
+                provenance_json,
+                provenance_json_sha256,
+                provider,
+                action,
+                int(http_status),
+                vector,
+                redactions_json,
+                payload_sha256,
+                rounded_latency,
+                prev_hash,
+                entry_hash,
+            )
+
+            if self._is_postgres:
+                sql = """
+                INSERT INTO audit_events (
+                    timestamp_utc, tenant_id, endpoint, policy_pack,
+                    policy_version, policy_sha256, config_fingerprint,
+                    provenance_hash, provenance_json, provenance_json_sha256,
+                    provider, action, http_status, vector, redactions_json,
+                    payload_sha256, latency_ms, prev_hash, entry_hash
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s
+                ) RETURNING seq_id
+                """
+                with self._pg_connection() as conn:
+                    cur = conn.cursor()
+                    cur.execute(sql, params)
+                    row = cur.fetchone()
+                    seq_id = int(row[0]) if row else 1
+                    conn.commit()
+            else:
+                assert self._sqlite_conn is not None
+                sql = """
+                INSERT INTO audit_events (
+                    timestamp_utc, tenant_id, endpoint, policy_pack,
+                    policy_version, policy_sha256, config_fingerprint,
+                    provenance_hash, provenance_json, provenance_json_sha256,
+                    provider, action, http_status, vector, redactions_json,
+                    payload_sha256, latency_ms, prev_hash, entry_hash
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """
+                try:
+                    cur = self._sqlite_conn.cursor()
+                    cur.execute(sql, params)
+                    seq_id = int(cur.lastrowid or 1)
+                    self._sqlite_conn.commit()
+                except Exception:
+                    self._sqlite_conn.rollback()
+                    raise
+
+        return AuditRecord(
+            seq_id=seq_id,
+            timestamp_utc=ts,
+            tenant_id=tenant_id,
+            endpoint=endpoint,
+            policy_pack=policy_pack,
+            policy_version=policy_version,
+            policy_sha256=policy_sha256,
+            config_fingerprint=config_fingerprint,
+            provenance_hash=provenance_hash,
+            provenance_json=provenance_json,
+            provenance_json_sha256=provenance_json_sha256,
+            provider=provider,
+            action=action,
+            http_status=int(http_status),
+            vector=vector,
+            redactions_json=redactions_json,
+            payload_sha256=payload_sha256,
+            latency_ms=rounded_latency,
+            prev_hash=prev_hash,
+            entry_hash=entry_hash,
+        )
+
+    def _get_latest_hash_locked(self) -> str:
+        sql = "SELECT entry_hash FROM audit_events ORDER BY seq_id DESC LIMIT 1"
+        if self._is_postgres:
+            with self._pg_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(sql)
+                row = cur.fetchone()
+                return str(row[0]) if row and row[0] else GENESIS_HASH
+        assert self._sqlite_conn is not None
+        row = self._sqlite_conn.execute(sql).fetchone()
+        return str(row[0]) if row and row[0] else GENESIS_HASH
+
+    def _fetch_all_rows_locked(self, tenant_id: Optional[str] = None) -> List[Tuple[Any, ...]]:
+        base_cols = (
+            "seq_id, timestamp_utc, tenant_id, endpoint, policy_pack, "
+            "policy_version, policy_sha256, config_fingerprint, "
+            "provenance_hash, provenance_json, provenance_json_sha256, "
+            "provider, action, http_status, vector, redactions_json, "
+            "payload_sha256, latency_ms, prev_hash, entry_hash"
+        )
+        if tenant_id is not None:
+            placeholder = "%s" if self._is_postgres else "?"
+            sql = f"SELECT {base_cols} FROM audit_events WHERE tenant_id = {placeholder} ORDER BY seq_id ASC"
+            params: Tuple[Any, ...] = (tenant_id,)
+        else:
+            sql = f"SELECT {base_cols} FROM audit_events ORDER BY seq_id ASC"
+            params = ()
+
+        if self._is_postgres:
+            with self._pg_connection() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                return list(cur.fetchall())
+        assert self._sqlite_conn is not None
+        return list(self._sqlite_conn.execute(sql, params).fetchall())
+
+    def verify_chain(self) -> Tuple[bool, int, Optional[int]]:
+        """Recompute every SHA-256 link and provenance_json digest from genesis."""
+        with self._lock:
+            rows = self._fetch_all_rows_locked()
+
+        total = len(rows)
+        expected_prev = GENESIS_HASH
+        for row in rows:
+            (
+                seq_id,
+                timestamp_utc,
+                tenant_id,
+                endpoint,
+                policy_pack,
+                policy_version,
+                policy_sha256,
+                config_fingerprint,
+                provenance_hash,
+                provenance_json,
+                provenance_json_sha256,
+                provider,
+                action,
+                http_status,
+                vector,
+                redactions_json,
+                payload_sha256,
+                latency_ms,
+                prev_hash,
+                entry_hash,
+            ) = row
+
+            if not hmac.compare_digest(str(prev_hash), expected_prev):
+                return False, total, int(seq_id)
+
+            stored_prov_sha = str(provenance_json_sha256 or "")
+            if stored_prov_sha:
+                actual_prov_sha = hashlib.sha256(
+                    str(provenance_json or "{}").encode("utf-8")
+                ).hexdigest()
+                if not hmac.compare_digest(actual_prov_sha, stored_prov_sha):
+                    return False, total, int(seq_id)
+
+            recomputed = _compute_entry_hash(
+                prev_hash=str(prev_hash),
+                timestamp_utc=str(timestamp_utc),
+                tenant_id=str(tenant_id),
+                endpoint=str(endpoint),
+                policy_pack=str(policy_pack),
+                provider=str(provider),
+                action=str(action),
+                http_status=int(http_status),
+                vector=vector,
+                redactions_json=str(redactions_json),
+                payload_sha256=str(payload_sha256),
+                latency_ms=float(latency_ms),
+                policy_version=str(policy_version or ""),
+                policy_sha256=str(policy_sha256 or ""),
+                config_fingerprint=str(config_fingerprint or ""),
+                provenance_hash=str(provenance_hash or ""),
+                provenance_json_sha256=stored_prov_sha,
+            )
+            if not hmac.compare_digest(recomputed, str(entry_hash)):
+                return False, total, int(seq_id)
+
+            expected_prev = str(entry_hash)
+
+        return True, total, None
+
+    def export_jsonl(self, tenant_id: Optional[str] = None) -> str:
+        """Export audit events as NDJSON with full cryptographic provenance fields."""
+        with self._lock:
+            rows = self._fetch_all_rows_locked(tenant_id=tenant_id)
+
+        lines: List[str] = []
+        for row in rows:
+            (
+                seq_id,
+                timestamp_utc,
+                r_tenant_id,
+                endpoint,
+                policy_pack,
+                policy_version,
+                policy_sha256,
+                config_fingerprint,
+                provenance_hash,
+                provenance_json,
+                provenance_json_sha256,
+                provider,
+                action,
+                http_status,
+                vector,
+                redactions_json,
+                payload_sha256,
+                latency_ms,
+                prev_hash,
+                entry_hash,
+            ) = row
+            record_dict = {
+                "seq_id": int(seq_id),
+                "timestamp_utc": str(timestamp_utc),
+                "tenant_id": str(r_tenant_id),
+                "endpoint": str(endpoint),
+                "policy_pack": str(policy_pack),
+                "policy_version": str(policy_version or ""),
+                "policy_sha256": str(policy_sha256 or ""),
+                "config_fingerprint": str(config_fingerprint or ""),
+                "provenance_hash": str(provenance_hash or ""),
+                "provenance_json": str(provenance_json or "{}"),
+                "provenance_json_sha256": str(provenance_json_sha256 or ""),
+                "provider": str(provider),
+                "action": str(action),
+                "http_status": int(http_status),
+                "vector": vector,
+                "redactions": _normalize_redactions(str(redactions_json)),
+                "payload_sha256": str(payload_sha256),
+                "latency_ms": float(latency_ms),
+                "prev_hash": str(prev_hash),
+                "entry_hash": str(entry_hash),
+            }
+            lines.append(json.dumps(record_dict, separators=(",", ":")))
+        return ("\n".join(lines) + "\n") if lines else ""
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            if self._sqlite_conn is not None:
+                try:
+                    self._sqlite_conn.close()
+                finally:
+                    self._sqlite_conn = None
+            if self._pg_pool is not None:
+                try:
+                    self._pg_pool.close()
+                finally:
+                    self._pg_pool = None
+            if self._pg_conn is not None:
+                try:
+                    self._pg_conn.close()
+                finally:
+                    self._pg_conn = None
+
+
+class _DirectConnCtx:
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def __enter__(self) -> Any:
+        return self._conn
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if exc_type is not None:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        return False
