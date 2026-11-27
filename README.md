@@ -35,13 +35,13 @@ Unlike GPU-heavy classifier guardrails that introduce unpredictable latency and 
 
 ```mermaid
 flowchart TD
-    Client["Client / Enterprise App"] --> Ingress["Layer 1: StreamingBodyLimitMiddleware\n(Pure ASGI | Content-Length + Chunked 413 Guard)"]
-    Ingress --> AuthRL["Layer 2: Auth & SlidingWindowRateLimiter\n(Per-Tenant RBAC | O(1) OrderedDict LRU + TTL Pruning | Redis/Memory)"]
-    AuthRL --> Norm["Layer 3: Layer-0 Canonicalizer (app/normalizer.py)\n(Unicode Tag U+E0000-U+E007F & VS Strip | Homoglyph/Leet Fold | 2-Pass B64/Hex)"]
-    Norm --> Policy["Layer 4: Pydantic v2 & Policy Engine (lta/policy_engine.py)\n(HIPAA | PCI-DSS 4.0.1 | FMCSA | EU AI Act | Strict extra='forbid')"]
-    Policy -->|Block / Redact| Ledger["Layer 6: SHA-256 Provenance Ledger (lta/audit_ledger.py)\n(Hash-Chained Append-Only | SQLite WAL / PostgreSQL | SIEM Export)"]
+    Client["Client / Enterprise App"] --> Ingress["Layer 1: StreamingBodyLimitMiddleware<br/>Pure ASGI | Content-Length + Chunked 413 Guard"]
+    Ingress --> AuthRL["Layer 2: Auth & SlidingWindowRateLimiter<br/>Per-Tenant RBAC | O(1) LRU + TTL Pruning | Redis/Memory"]
+    AuthRL --> Norm["Layer 3: Layer-0 Canonicalizer<br/>Unicode Tag & VS Strip | Homoglyph Fold | 2-Pass B64/Hex"]
+    Norm --> Policy["Layer 4: Pydantic v2 & Policy Engine<br/>HIPAA | PCI-DSS 4.0.1 | FMCSA | EU AI Act"]
+    Policy -->|Block / Redact| Ledger["Layer 6: SHA-256 Provenance Ledger<br/>Hash-Chained Append-Only | SQLite WAL / PostgreSQL"]
     Policy -->|Allow / Sanitized| Upstream["Upstream LLM Provider / Shadow Ingest"]
-    Upstream --> OutGuard["Layer 5: Output Boundary Guard\n(System Prompt Leak, SSN & Secret Prevention)"]
+    Upstream --> OutGuard["Layer 5: Output Boundary Guard<br/>System Prompt Leak, SSN & Secret Prevention"]
     OutGuard --> Ledger
     OutGuard --> Client
 ```
