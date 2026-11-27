@@ -13,14 +13,16 @@ def test_dockerfile_uses_expected_entrypoint_and_healthcheck():
     assert "uvicorn" in dockerfile
 
 
+
 def test_render_config_has_healthcheck_and_persistent_storage():
     config = yaml.safe_load(
         (ROOT / "render.yaml").read_text(encoding="utf-8")
     )
     service = config["services"][0]
 
-    assert service["healthCheckPath"] == "/health"
+    assert service["healthCheckPath"] == "/healthz"
     assert service["disk"]["mountPath"] == "/var/data"
+
 
 
 def test_compose_config_names_required_services():
