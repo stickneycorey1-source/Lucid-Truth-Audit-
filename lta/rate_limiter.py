@@ -20,11 +20,12 @@ class RateLimitResult:
 class SlidingWindowRateLimiter:
     """Per-key sliding-window rate limiter with bounded memory (LRU + TTL pruning)."""
 
-    def __init__(
+        def __init__(
         self,
         max_requests: int = 60,
         window_seconds: float = 60.0,
         *,
+        redis_url: Optional[str] = None,
         max_keys: int = 10_000,
         prune_interval_seconds: float = 30.0,
         clock: Callable[[], float] = time.monotonic,
@@ -38,6 +39,7 @@ class SlidingWindowRateLimiter:
 
         self.max_requests = int(max_requests)
         self.window_seconds = float(window_seconds)
+        self.redis_url = redis_url
         self.max_keys = int(max_keys)
         self.prune_interval_seconds = float(prune_interval_seconds)
         self._clock = clock
