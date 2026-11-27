@@ -1,13 +1,16 @@
+
 services:
   - type: web
     name: lucid-truth-audit
     runtime: docker
     plan: starter
-    healthCheckPath: /health
+    healthCheckPath: /healthz
     envVars:
       - key: LTA_TENANTS_JSON
         sync: false
       - key: LTA_API_KEY
+        sync: false
+      - key: LTA_SHADOW_KEY
         sync: false
       - key: LTA_DEFAULT_PROVIDER
         value: "mock"
