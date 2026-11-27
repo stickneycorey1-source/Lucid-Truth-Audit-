@@ -1,85 +1,78 @@
-"""Unit tests for lta/rate_limiter.py sliding-window rate limiter."""
+"""Unit tests for SlidingWindowRateLimiter isolation, rollover, reset, and OOM cap."""
 
 from __future__ import annotations
-
-import inspect
-import time
 
 from lta.rate_limiter import SlidingWindowRateLimiter
 
 
-def _make_limiter(window_s: float = 60.0) -> SlidingWindowRateLimiter:
-    sig = inspect.signature(SlidingWindowRateLimiter.__init__)
-    params = [name for name in sig.parameters if name != "self"]
-    kwargs: dict[str, object] = {}
+def test_rate_limiter_blocks_after_limit_and_isolates_tenants() -> None:
+    now = [100.0]
+    limiter = SlidingWindowRateLimiter(
+        max_requests=2,
+        window_seconds=60.0,
+        clock=lambda: now[0],
+    )
 
-    if params and any(tok in params[0].lower() for tok in ("url", "redis")):
-        kwargs[params[0]] = ""
+    r1 = limiter.check("tenant-a")
+    assert r1.allowed is True
+    assert r1.remaining == 1
 
-    for name in params[1:]:
-        low = name.lower()
-        if "window" in low or "period" in low or "ttl" in low:
-            kwargs[name] = window_s
-        elif "fail" in low:
-            kwargs[name] = "memory"
+    r2 = limiter.check("tenant-a")
+    assert r2.allowed is True
+    assert r2.remaining == 0
 
-    if kwargs:
-        try:
-            return SlidingWindowRateLimiter(**kwargs)
-        except TypeError:
-            pass
+    r3 = limiter.check("tenant-a")
+    assert r3.allowed is False
+    assert r3.remaining == 0
+    assert r3.retry_after_seconds > 0
 
-    return SlidingWindowRateLimiter("")
-
-
-def _call_check(limiter: SlidingWindowRateLimiter, key: str, limit_rpm: int) -> bool:
-    sig = inspect.signature(limiter.check)
-    positional = [
-        p for p in sig.parameters.values()
-        if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    if len(positional) >= 2:
-        res = limiter.check(key, limit_rpm)
-    else:
-        res = limiter.check(key)
-
-    if isinstance(res, tuple):
-        return bool(res[0])
-    if hasattr(res, "allowed"):
-        return bool(getattr(res, "allowed"))
-    return bool(res)
+    # Distinct tenant bucket remains unaffected
+    other = limiter.check("tenant-b")
+    assert other.allowed is True
+    assert other.remaining == 1
 
 
-def test_rate_limiter_blocks_after_limit_and_isolates_tenants():
-    limiter = _make_limiter(window_s=60.0)
+def test_rate_limiter_window_rolls_over_and_reset_works() -> None:
+    now = [500.0]
+    limiter = SlidingWindowRateLimiter(
+        max_requests=1,
+        window_seconds=10.0,
+        clock=lambda: now[0],
+    )
 
-    assert _call_check(limiter, "p2_pilot", 3) is True
-    assert _call_check(limiter, "p2_pilot", 3) is True
-    assert _call_check(limiter, "p2_pilot", 3) is True
-    assert _call_check(limiter, "p2_pilot", 3) is False
+    assert limiter.is_allowed("tenant-a") is True
+    assert limiter.is_allowed("tenant-a") is False
 
-    # Distinct tenant bucket remains unthrottled
-    assert _call_check(limiter, "other_tenant", 3) is True
+    # Advance past the sliding window
+    now[0] += 11.0
+    assert limiter.is_allowed("tenant-a") is True
+    assert limiter.is_allowed("tenant-a") is False
 
+    # Reset single key
+    limiter.reset("tenant-a")
+    assert limiter.is_allowed("tenant-a") is True
 
-def test_rate_limiter_window_rolls_over_and_reset_works(monkeypatch):
-    base_now = 1_700_000_000.0
-    current = {"t": base_now}
-    monkeypatch.setattr(time, "time", lambda: current["t"])
-    monkeypatch.setattr(time, "monotonic", lambda: current["t"])
-
-    limiter = _make_limiter(window_s=10.0)
-
-    assert _call_check(limiter, "dispatch_bot", 2) is True
-    assert _call_check(limiter, "dispatch_bot", 2) is True
-    assert _call_check(limiter, "dispatch_bot", 2) is False
-
-    # Advance past the 10-second sliding window
-    current["t"] = base_now + 11.0
-    assert _call_check(limiter, "dispatch_bot", 2) is True
-
-    # Exhaust again and verify reset() clears state
-    assert _call_check(limiter, "dispatch_bot", 2) is True
-    assert _call_check(limiter, "dispatch_bot", 2) is False
+    # Reset all keys
     limiter.reset()
-    assert _call_check(limiter, "dispatch_bot", 2) is True
+    assert limiter.tracked_keys() == 0
+
+
+def test_rate_limiter_caps_tracked_keys_and_prunes_expired() -> None:
+    now = [1000.0]
+    limiter = SlidingWindowRateLimiter(
+        max_requests=5,
+        window_seconds=10.0,
+        max_keys=50,
+        prune_interval_seconds=60.0,
+        clock=lambda: now[0],
+    )
+
+    for i in range(200):
+        assert limiter.is_allowed(f"spoofed-ip-{i}") is True
+
+    assert limiter.tracked_keys() <= 50
+
+    now[0] += 15.0
+    removed = limiter.prune_expired()
+    assert removed > 0
+    assert limiter.tracked_keys() == 0
