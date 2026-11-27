@@ -6,7 +6,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from typing import Callable, Deque, Optional, Tuple
+from typing import Callable, Deque, Iterator, Optional, Tuple, Union
 
 
 @dataclass(frozen=True)
@@ -15,6 +15,11 @@ class RateLimitResult:
     limit: int
     remaining: int
     retry_after_seconds: float
+
+    def __iter__(self) -> Iterator[Union[bool, int, float]]:
+        yield self.allowed
+        yield self.remaining
+        yield self.retry_after_seconds
 
 
 class SlidingWindowRateLimiter:
