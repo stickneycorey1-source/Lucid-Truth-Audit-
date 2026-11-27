@@ -16,10 +16,9 @@ class RateLimitResult:
     remaining: int
     retry_after_seconds: float
 
-    def __iter__(self) -> Iterator[Union[bool, int, float]]:
+    def __iter__(self) -> Iterator[Union[bool, int]]:
         yield self.allowed
         yield self.remaining
-        yield self.retry_after_seconds
 
 
 class SlidingWindowRateLimiter:
