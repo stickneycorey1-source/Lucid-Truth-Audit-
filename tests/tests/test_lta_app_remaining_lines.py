@@ -58,7 +58,7 @@ def test_helper_client_ip_jsonl_hash_and_sqlite_inspection(tmp_path: Path) -> No
 
     rec = AuditRecord(
         seq_id=1,
-        timestamp="2026-11-26T00:00:00Z",
+        timestamp_utc="2026-11-26T00:00:00Z",
         tenant_id="t1",
         endpoint="/v1/chat/completions",
         policy_pack="general_enterprise",
@@ -68,6 +68,7 @@ def test_helper_client_ip_jsonl_hash_and_sqlite_inspection(tmp_path: Path) -> No
         vector=None,
         redactions=[],
         payload_sha256="a" * 64,
+        latency_ms=1.5,
         prev_hash="0" * 64,
         entry_hash="b" * 64,
     )
@@ -162,6 +163,24 @@ def test_pipeline_redaction_output_guard_and_upstream_error(
     )
     app = lta_app_mod.create_app(cfg)
     raw_ssn = "123-45-6789"
+    mode = {"behavior": "default"}
+
+    async def _controlled_upstream(**kwargs: Any) -> ProviderResponse:
+        if mode["behavior"] == "leak":
+            return ProviderResponse(
+                content=f"Leaked SSN {raw_ssn} and sk-live-secret-1234567890abcdef",
+                model=kwargs.get("model", "gpt-4o-mini"),
+                provider="mock",
+            )
+        if mode["behavior"] == "error":
+            raise UpstreamProviderError("upstream down")
+        return ProviderResponse(
+            content="[LTA Verified Upstream Response] Clean response",
+            model=kwargs.get("model", "gpt-4o-mini"),
+            provider="mock",
+        )
+
+    monkeypatch.setattr(lta_app_mod, "call_upstream", _controlled_upstream)
 
     with TestClient(app) as client:
         r_redact = client.post(
@@ -175,15 +194,7 @@ def test_pipeline_redaction_output_guard_and_upstream_error(
         assert r_redact.status_code in (200, 400, 422)
         assert raw_ssn not in r_redact.text
 
-    async def _leaking_reply(**kwargs: Any) -> ProviderResponse:
-        return ProviderResponse(
-            content=f"Leaked SSN {raw_ssn} and sk-live-secret-1234567890abcdef",
-            model=kwargs.get("model", "gpt-4o-mini"),
-            provider="mock",
-        )
-
-    monkeypatch.setattr(lta_app_mod, "call_upstream", _leaking_reply)
-    with TestClient(app) as client:
+        mode["behavior"] = "leak"
         r_leak = client.post(
             "/v1/chat/completions",
             headers={"X-API-Key": "ops-key"},
@@ -192,11 +203,7 @@ def test_pipeline_redaction_output_guard_and_upstream_error(
         assert r_leak.status_code in (200, 400, 403, 422, 502)
         assert raw_ssn not in r_leak.text
 
-    async def _boom_reply(**kwargs: Any) -> ProviderResponse:
-        raise UpstreamProviderError("upstream down")
-
-    monkeypatch.setattr(lta_app_mod, "call_upstream", _boom_reply)
-    with TestClient(app) as client:
+        mode["behavior"] = "error"
         r_err = client.post(
             "/v1/chat/completions",
             headers={"X-API-Key": "ops-key"},
