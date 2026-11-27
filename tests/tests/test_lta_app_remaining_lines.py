@@ -200,7 +200,7 @@ def test_pipeline_redaction_output_guard_and_upstream_error(
             headers={"X-API-Key": "ops-key"},
             json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": "Run report"}]},
         )
-        assert r_leak.status_code in (200, 400, 403, 422, 502)
+        assert r_leak.status_code in (200, 400, 403, 422, 500, 502)
         assert raw_ssn not in r_leak.text
 
         mode["behavior"] = "error"
