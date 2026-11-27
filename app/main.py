@@ -60,6 +60,103 @@ app.include_router(shadow_router)
 
 # --- Security Headers Middleware ---
 
+class RequestBodyLimitMiddleware:
+    """Enforce a bounded HTTP request body before passing it to FastAPI."""
+
+    def __init__(self, app, max_body_bytes: int):
+        self.app = app
+        self.max_body_bytes = max(1, int(max_body_bytes))
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            key.lower(): value
+            for key, value in scope.get("headers", [])
+        }
+
+        content_length = headers.get(b"content-length")
+        if content_length is not None:
+            try:
+                if int(content_length) > self.max_body_bytes:
+                    await self._reject(scope, receive, send)
+                    return
+            except (TypeError, ValueError):
+                # An invalid or missing length is not trusted.
+                # The streamed body is still checked below.
+                pass
+
+        body = bytearray()
+
+        while True:
+            message = await receive()
+
+            if message["type"] == "http.disconnect":
+                return
+
+            if message["type"] != "http.request":
+                continue
+
+            chunk = message.get("body", b"")
+
+            # Check before appending, so the middleware never stores
+            # an oversized accumulated request body.
+            if len(body) + len(chunk) > self.max_body_bytes:
+                await self._reject(scope, receive, send)
+                return
+
+            body.extend(chunk)
+
+            if not message.get("more_body", False):
+                break
+
+        replayed = False
+
+        async def replay_receive():
+            nonlocal replayed
+
+            if not replayed:
+                replayed = True
+                return {
+                    "type": "http.request",
+                    "body": bytes(body),
+                    "more_body": False,
+                }
+
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
+
+    async def _reject(self, scope, receive, send):
+        request_id = next(
+            (
+                value.decode("latin-1")
+                for key, value in scope.get("headers", [])
+                if key.lower() == b"x-request-id"
+            ),
+            str(uuid.uuid4()),
+        )
+
+        response = JSONResponse(
+            status_code=413,
+            content={
+                "detail": {
+                    "vector": "ingress.body_too_large",
+                    "message": "Request body exceeds maximum allowed size",
+                }
+            },
+            headers={
+                "X-Request-ID": request_id,
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "X-Frame-Options": "DENY",
+            },
+        )
+
+        await response(scope, receive, send)
+
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
