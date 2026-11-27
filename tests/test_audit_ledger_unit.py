@@ -7,7 +7,7 @@ import sqlite3
 import sys
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import pytest
 
@@ -43,6 +43,7 @@ class _FakeCursor:
                 config_fingerprint,
                 provenance_hash,
                 provenance_json,
+                provenance_json_sha256,
                 provider,
                 action,
                 http_status,
@@ -65,6 +66,7 @@ class _FakeCursor:
                     "config_fingerprint": config_fingerprint,
                     "provenance_hash": provenance_hash,
                     "provenance_json": provenance_json,
+                    "provenance_json_sha256": provenance_json_sha256,
                     "provider": provider,
                     "action": action,
                     "http_status": http_status,
@@ -77,31 +79,6 @@ class _FakeCursor:
                 }
             )
             self._last_result = (seq_id,)
-        elif "FROM AUDIT_EVENTS ORDER BY SEQ_ID ASC" in sql_upper:
-            self._last_result = [
-                (
-                    r["seq_id"],
-                    r["timestamp_utc"],
-                    r["tenant_id"],
-                    r["endpoint"],
-                    r["policy_pack"],
-                    r["policy_version"],
-                    r["policy_sha256"],
-                    r["config_fingerprint"],
-                    r["provenance_hash"],
-                    r["provenance_json"],
-                    r["provider"],
-                    r["action"],
-                    r["http_status"],
-                    r["vector"],
-                    r["redactions_json"],
-                    r["payload_sha256"],
-                    r["latency_ms"],
-                    r["prev_hash"],
-                    r["entry_hash"],
-                )
-                for r in self._state["rows"]
-            ]
         elif "FROM AUDIT_EVENTS" in sql_upper:
             self._last_result = [
                 (
@@ -115,6 +92,7 @@ class _FakeCursor:
                     r["config_fingerprint"],
                     r["provenance_hash"],
                     r["provenance_json"],
+                    r["provenance_json_sha256"],
                     r["provider"],
                     r["action"],
                     r["http_status"],
@@ -223,6 +201,7 @@ def test_sqlite_record_verify_tamper_export_and_close(tmp_path: Path) -> None:
     )
     assert r1.seq_id == 1
     assert r1.prev_hash == GENESIS_HASH
+    assert len(r1.provenance_json_sha256) == 64
 
     r2 = ledger.record(
         tenant_id="other_tenant",
@@ -243,27 +222,23 @@ def test_sqlite_record_verify_tamper_export_and_close(tmp_path: Path) -> None:
     assert r2.prev_hash == r1.entry_hash
 
     valid, total, broken = ledger.verify_chain()
-    assert valid is True
-    assert total == 2
-    assert broken is None
+    assert (valid, total, broken) == (True, 2, None)
 
     exported_p2 = ledger.export_jsonl(tenant_id="p2_pilot")
     lines = [json.loads(line) for line in exported_p2.splitlines() if line.strip()]
     assert len(lines) == 1
     assert lines[0]["tenant_id"] == "p2_pilot"
-    assert lines[0]["policy_version"] == "2.4.0"
+    assert lines[0]["provenance_json_sha256"] == r1.provenance_json_sha256
 
+    # Tampering with provenance_json must break verification at seq_id 1
     conn = sqlite3.connect(str(db_file))
     try:
-        conn.execute("UPDATE audit_events SET action = 'TAMPERED' WHERE seq_id = 1")
+        conn.execute("UPDATE audit_events SET provenance_json = '{\"forged\":true}' WHERE seq_id = 1")
         conn.commit()
     finally:
         conn.close()
 
-    valid_after, total_after, broken_after = ledger.verify_chain()
-    assert valid_after is False
-    assert total_after == 2
-    assert broken_after == 1
+    assert ledger.verify_chain() == (False, 2, 1)
 
     ledger.close()
     assert ledger.ping() is False
@@ -317,11 +292,7 @@ def test_postgres_pool_and_psycopg_fallback(monkeypatch: pytest.MonkeyPatch) -> 
         latency_ms=5.0,
     )
     assert rec.seq_id == 1
-
-    valid, total, broken = pg_ledger.verify_chain()
-    assert valid is True
-    assert total == 1
-    assert broken is None
+    assert pg_ledger.verify_chain() == (True, 1, None)
 
     pg_ledger.close()
     assert pg_ledger.ping() is False
