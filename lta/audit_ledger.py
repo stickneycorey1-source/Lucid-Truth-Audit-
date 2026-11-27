@@ -24,21 +24,30 @@ class AuditRecord:
     tenant_id: str
     endpoint: str
     policy_pack: str
-    policy_version: str
-    policy_sha256: str
-    config_fingerprint: str
-    provenance_hash: str
-    provenance_json: str
-    provenance_json_sha256: str
     provider: str
     action: str
     http_status: int
     vector: Optional[str]
-    redactions_json: str
     payload_sha256: str
     latency_ms: float
     prev_hash: str
     entry_hash: str
+    redactions_json: str = "[]"
+    redactions: Optional[List[str]] = None
+    policy_version: str = ""
+    policy_sha256: str = ""
+    config_fingerprint: str = ""
+    provenance_hash: str = ""
+    provenance_json: str = "{}"
+    provenance_json_sha256: str = ""
+
+    def __post_init__(self) -> None:
+        if self.redactions is not None and self.redactions_json == "[]":
+            self.redactions_json = json.dumps(
+                sorted(str(r) for r in self.redactions), separators=(",", ":")
+            )
+        elif self.redactions is None:
+            self.redactions = _normalize_redactions(self.redactions_json)
 
 
 def _sanitize_for_digest(obj: Any) -> Any:
