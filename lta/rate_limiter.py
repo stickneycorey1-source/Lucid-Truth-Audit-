@@ -20,7 +20,7 @@ class RateLimitResult:
 class SlidingWindowRateLimiter:
     """Per-key sliding-window rate limiter with bounded memory (LRU + TTL pruning)."""
 
-        def __init__(
+    def __init__(
         self,
         max_requests: int = 60,
         window_seconds: float = 60.0,
@@ -67,7 +67,6 @@ class SlidingWindowRateLimiter:
     def _enforce_key_cap_locked(self, now: float) -> None:
         if len(self._buckets) < self.max_keys:
             return
-        # First sweep expired buckets before evicting active LRU entries
         self._prune_expired_locked(now)
         while len(self._buckets) >= self.max_keys:
             self._buckets.popitem(last=False)
