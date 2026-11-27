@@ -1004,5 +1004,78 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     return fastapi_app
 
+class _PayloadTooLargeError(Exception):
+    """Internal signal raised when a streaming request body exceeds MAX_BODY_BYTES."""
 
+
+class StreamingBodyLimitMiddleware:
+    """Pure ASGI middleware enforcing MAX_BODY_BYTES on both Content-Length and chunked streams."""
+
+    def __init__(self, app: Any, max_body_bytes: int = MAX_BODY_BYTES) -> None:
+        self.app = app
+        self.max_body_bytes = int(max_body_bytes)
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # 1. Fast-path check on Content-Length (ignore malformed values; let streaming guard catch them)
+        for raw_name, raw_val in scope.get("headers") or ():
+            if raw_name.lower() == b"content-length":
+                try:
+                    if int(raw_val.decode("ascii").strip()) > self.max_body_bytes:
+                        await self._send_413(send)
+                        return
+                except (ValueError, UnicodeDecodeError):
+                    pass
+                break
+
+        # 2. Streaming byte counter for Transfer-Encoding: chunked or omitted Content-Length
+        received_bytes = 0
+        response_started = False
+
+        async def limited_receive() -> Dict[str, Any]:
+            nonlocal received_bytes
+            message = await receive()
+            if message.get("type") == "http.request":
+                body = message.get("body", b"")
+                received_bytes += len(body)
+                if received_bytes > self.max_body_bytes:
+                    raise _PayloadTooLargeError()
+            return message
+
+        async def tracked_send(message: Dict[str, Any]) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _PayloadTooLargeError:
+            if not response_started:
+                await self._send_413(send)
+
+    async def _send_413(self, send: Any) -> None:
+        payload = json.dumps(
+            {
+                "detail": f"Request body exceeds maximum allowed size of {self.max_body_bytes} bytes.",
+                "error": "payload_too_large",
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(payload)).encode("ascii")),
+                    (b"cache-control", b"no-store"),
+                    (b"x-content-type-options", b"nosniff"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": payload, "more_body": False})
 app = create_app()
