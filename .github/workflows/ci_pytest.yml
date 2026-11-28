@@ -41,8 +41,7 @@ jobs:
           LUCID_LEDGER_DB_PATH: ":memory:"
         run: |
           mkdir -p reports
-          shopt -s nullglob
-          test_files=(
+          candidates=(
             tests/test_main_hardening.py
             tests/test_normalizer_hardening.py
             tests/test_ledger_hardening.py
@@ -50,6 +49,10 @@ jobs:
             tests/test_shadow_hardening.py
             tests/test_logistics_guard_hardening.py
           )
+          test_files=()
+          for f in "${candidates[@]}"; do
+            [ -f "$f" ] && test_files+=("$f")
+          done
           if [ ${#test_files[@]} -eq 0 ]; then
             pytest --cov=app --cov-branch --cov-report=term-missing --cov-report=xml:coverage-${{ matrix.python-version }}.xml -vv
           else
