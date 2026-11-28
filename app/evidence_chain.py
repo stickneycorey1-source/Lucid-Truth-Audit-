@@ -1,5 +1,6 @@
 from contextlib import closing
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -22,39 +23,48 @@ class EvidenceChainStore:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        parent = os.path.dirname(os.path.abspath(self.db_path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
+        if self.db_path != ":memory:":
+            parent = os.path.dirname(os.path.abspath(self.db_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
         conn = sqlite3.connect(
             self.db_path, timeout=15.0, isolation_level=None
         )
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         return conn
 
     def _init_db(self) -> None:
         with closing(self._connect()) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS evidence_records (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    evidence_id TEXT NOT NULL,
-                    tenant_id TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    prev_hash TEXT NOT NULL,
-                    entry_hash TEXT NOT NULL,
-                    UNIQUE(tenant_id, evidence_id)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS evidence_records (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        evidence_id TEXT NOT NULL,
+                        tenant_id TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        prev_hash TEXT NOT NULL,
+                        entry_hash TEXT NOT NULL,
+                        UNIQUE(tenant_id, evidence_id)
+                    )
+                    """
                 )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_evidence_tenant
-                ON evidence_records(tenant_id, id DESC)
-                """
-            )
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_evidence_tenant
+                    ON evidence_records(tenant_id, id DESC)
+                    """
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
 
     @staticmethod
     def _canonical_json(value: Dict[str, Any]) -> str:
@@ -62,6 +72,7 @@ class EvidenceChainStore:
             value,
             sort_keys=True,
             ensure_ascii=False,
+            allow_nan=False,
             separators=(",", ":"),
         )
 
@@ -86,9 +97,14 @@ class EvidenceChainStore:
         return hashlib.sha256(encoded).hexdigest()
 
     def add(
-        self, tenant_id: str, payload: Dict[str, Any]
+        self,
+        tenant_id: str,
+        payload: Dict[str, Any],
+        evidence_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        evidence_id = str(uuid.uuid4())
+        if not tenant_id or not tenant_id.strip():
+            raise ValueError("tenant_id must be a non-empty string")
+        resolved_evidence_id = (evidence_id or "").strip() or str(uuid.uuid4())
         created_at = datetime.now(timezone.utc).isoformat()
         payload_json = self._canonical_json(payload)
 
@@ -107,7 +123,7 @@ class EvidenceChainStore:
                 ).fetchone()
                 prev_hash = previous["entry_hash"] if previous else "GENESIS"
                 entry_hash = self._hash_record(
-                    evidence_id,
+                    resolved_evidence_id,
                     tenant_id,
                     created_at,
                     payload_json,
@@ -121,7 +137,7 @@ class EvidenceChainStore:
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        evidence_id,
+                        resolved_evidence_id,
                         tenant_id,
                         created_at,
                         payload_json,
@@ -131,15 +147,17 @@ class EvidenceChainStore:
                 )
                 conn.execute("COMMIT")
             except sqlite3.IntegrityError as exc:
-                conn.execute("ROLLBACK")
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
                 raise DuplicateEvidenceError(str(exc)) from exc
             except Exception:
-                conn.execute("ROLLBACK")
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
                 raise
 
         return {
             "record_number": cur.lastrowid,
-            "evidence_id": evidence_id,
+            "evidence_id": resolved_evidence_id,
             "tenant_id": tenant_id,
             "created_at": created_at,
             "payload": payload,
@@ -150,7 +168,7 @@ class EvidenceChainStore:
     def list_records(
         self, tenant_id: str, limit: int = 100
     ) -> List[Dict[str, Any]]:
-        limit = max(1, min(limit, 500))
+        limit = max(1, min(int(limit), 500))
         with closing(self._connect()) as conn:
             rows = conn.execute(
                 """
@@ -191,7 +209,7 @@ class EvidenceChainStore:
 
         expected_prev = "GENESIS"
         for row in rows:
-            if row["prev_hash"] != expected_prev:
+            if not hmac.compare_digest(row["prev_hash"], expected_prev):
                 return {
                     "chain_valid": False,
                     "checked_records": len(rows),
@@ -205,7 +223,7 @@ class EvidenceChainStore:
                 row["payload_json"],
                 row["prev_hash"],
             )
-            if actual != row["entry_hash"]:
+            if not hmac.compare_digest(actual, row["entry_hash"]):
                 return {
                     "chain_valid": False,
                     "checked_records": len(rows),
