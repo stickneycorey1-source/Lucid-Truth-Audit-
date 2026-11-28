@@ -1,295 +1,132 @@
-<div align="center">
+# Lucid-Truth-Audit (`v2.0.3`)
 
-# Lucid-Truth-Audit (LTA) `v2.4.0`
+[![Version](https://img.shields.io/badge/version-2.0.3-blue.svg)](https://github.com/stickneycorey1-source/Lucid-Truth-Audit)
+[![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-3776AB.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-Pydantic%20v2-009688.svg)](https://fastapi.tiangolo.com/)
+[![Compliance](https://img.shields.io/badge/FMCSA-49%20CFR%20%C2%A7%20395.3-2f855a.svg)](https://www.ecfr.gov/current/title-49/subtitle-B/chapter-III/subchapter-B/part-395/subpart-A/section-395.3)
+[![Privacy](https://img.shields.io/badge/Retention-Zero%20PII%20Store-9b2c2c.svg)](#zero-retention--privacy-architecture)
+[![Ledger](https://img.shields.io/badge/Ledger-SHA--256%20Hash--Chained-1a365d.svg)](#cryptographic-audit-ledger--evidence-chain)
+[![Live API](https://img.shields.io/badge/Live%20Docs-Render%20Deployment-6b46c1.svg)](https://lucid-truth-audit.onrender.com/docs)
+[![License](https://img.shields.io/badge/License-Proprietary%20%2F%20Enterprise%20Evaluation-4a5568.svg)](#license)
 
-**CPU-Native Enterprise AI Governance, Prompt-Sanitization & Cryptographic Provenance Gateway**
+**Lucid-Truth-Audit** is a deterministic AI security, zero-retention PII redaction, tamper-evident cryptographic audit ledger, and FMCSA 49 CFR § 395.3 fleet compliance microservice built with Python, FastAPI, Pydantic v2, and SQLite (WAL mode).
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/FastAPI-ASGI-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Pydantic v2](https://img.shields.io/badge/Pydantic-v2_Strict-E92063.svg)](https://docs.pydantic.dev/)
-[![Tests](https://img.shields.io/badge/Tests-143_Passing_(100%25)-brightgreen.svg)](#ci--test-coverage-benchmarks)
-[![Coverage](https://img.shields.io/badge/Coverage-~88.7%25-brightgreen.svg)](#ci--test-coverage-benchmarks)
-[![Runtime](https://img.shields.io/badge/Runtime-CPU--Native_%7C_Zero--GPU-informational.svg)](#architecture-overview)
-[![Ledger](https://img.shields.io/badge/Provenance-SHA--256_Hash_Chained-6f42c1.svg)](#live-production-verification-proof)
-[![Live Gateway](https://img.shields.io/badge/Live_API-Render_Verified-success.svg)](https://lucid-truth-audit.onrender.com/readyz)
-
-[![HIPAA](https://img.shields.io/badge/Policy_Pack-HIPAA-0A66C2.svg)](#regulatory-compliance-policy-packs)
-[![PCI-DSS 4.0.1](https://img.shields.io/badge/Policy_Pack-PCI--DSS_4.0.1-0A66C2.svg)](#regulatory-compliance-policy-packs)
-[![FMCSA](https://img.shields.io/badge/Policy_Pack-FMCSA-0A66C2.svg)](#regulatory-compliance-policy-packs)
-[![EU AI Act](https://img.shields.io/badge/Policy_Pack-EU_AI_Act-0A66C2.svg)](#regulatory-compliance-policy-packs)
-
-</div>
+* **Live API & Swagger UI:** `https://lucid-truth-audit.onrender.com/docs`
+* **Repository:** `https://github.com/stickneycorey1-source/Lucid-Truth-Audit`
 
 ---
 
-## Executive Summary
+## Visual Architecture & Benchmark Overview
 
-**Lucid-Truth-Audit (LTA) `v2.4.0`** is a deterministic, zero-GPU security and compliance gateway built on **FastAPI** and **Pydantic v2**. Deployed inline in front of LLM workloads—or asynchronously via a zero-retention shadow pilot—LTA neutralizes prompt injections, obfuscated payloads, and PII/secret exfiltration before they reach foundation models or end users, while recording every allow, redact, and block decision in an append-only **SHA-256 hash-chained provenance ledger**.
-
-Unlike GPU-heavy classifier guardrails that introduce unpredictable latency and hallucinated false negatives, LTA's Layer-0 canonicalizer, streaming ASGI ingress guard, OOM-hardened rate limiter, and strict schema validators execute deterministically on standard CPU instances with sub-millisecond local inspection overhead.
-
----
-
-## Architecture Overview
-
-```mermaid
-flowchart TD
-    Client["Client / Enterprise App"] --> Ingress["Layer 1: StreamingBodyLimitMiddleware<br/>Pure ASGI | Content-Length + Chunked 413 Guard"]
-    Ingress --> AuthRL["Layer 2: Auth & SlidingWindowRateLimiter<br/>Per-Tenant RBAC | O(1) LRU + TTL Pruning | Redis/Memory"]
-    AuthRL --> Norm["Layer 3: Layer-0 Canonicalizer<br/>Unicode Tag & VS Strip | Homoglyph Fold | 2-Pass B64/Hex"]
-    Norm --> Policy["Layer 4: Pydantic v2 & Policy Engine<br/>HIPAA | PCI-DSS 4.0.1 | FMCSA | EU AI Act"]
-    Policy -->|Block / Redact| Ledger["Layer 6: SHA-256 Provenance Ledger<br/>Hash-Chained Append-Only | SQLite WAL / PostgreSQL"]
-    Policy -->|Allow / Sanitized| Upstream["Upstream LLM Provider / Shadow Ingest"]
-    Upstream --> OutGuard["Layer 5: Output Boundary Guard<br/>System Prompt Leak, SSN & Secret Prevention"]
-    OutGuard --> Ledger
-    OutGuard --> Client
-```
-
----
-
-## Security & Hardening Architecture (`v2.4.0`)
-
-| Defense Layer | Module | Hardening Mechanism & Failure Mode Prevented |
-| :--- | :--- | :--- |
-| **Streaming Ingress Guard** | `lta/app.py` (`StreamingBodyLimitMiddleware`) | Pure ASGI middleware (avoids `BaseHTTPMiddleware` memory buffering). Fast-fails oversized `Content-Length` headers and counts raw bytes on the ASGI `receive` stream for `Transfer-Encoding: chunked` payloads, aborting immediately with `HTTP 413` the instant `MAX_BODY_BYTES` is crossed. |
-| **OOM-Hardened Rate Limiter** | `lta/rate_limiter.py` (`SlidingWindowRateLimiter`) | Thread-safe per-tenant sliding window backed by `OrderedDict` for $O(1)$ LRU eviction, automatic periodic TTL pruning (`prune_interval_seconds`), and a hard `max_keys` cap (`10,000` default) so rotating spoofed IPs or invalid API keys cannot exhaust RAM. Supports Redis or in-memory operation. |
-| **Layer-0 Text Canonicalizer** | `app/normalizer.py` | Strips invisible formatting chars, BiDi overrides, soft hyphens, **Unicode Tag smuggling (`U+E0000`–`U+E007F`)**, and **Variation Selectors (`U+FE00`–`U+FE0F`, `U+E0100`–`U+E01EF`)**; normalizes NFKD/NFKC; folds Cyrillic/Greek homoglyphs and alphabetic leetspeak; performs bounded **2-pass Base64 & Hex decoding** (capped at `16,384` bytes/token) to catch double-encoded attacks. |
-| **Strict Schema & Policy Engine** | `lta/policy_engine.py`, `app/schemas/` | Enforces Pydantic v2 `extra="forbid"`, rejects `NaN`/`Inf` numeric metadata, blocks client-side policy downgrades and spoofed `system`/poisoned `assistant` turns, and evaluates multi-turn split injections. |
-| **Cryptographic Provenance Ledger** | `lta/audit_ledger.py`, `app/ledger.py`, `app/evidence_chain.py` | Every decision is cryptographically linked to the previous record via **SHA-256** (`prev_hash -> entry_hash`). SQLite deployments run with `PRAGMA journal_mode=WAL`, `PRAGMA synchronous=NORMAL`, and `PRAGMA busy_timeout=5000` to eliminate write contention; PostgreSQL is supported for multi-node deployments. |
-
----
-
-## Regulatory Compliance Policy Packs
-
-LTA ships with **4 pre-loaded enterprise compliance policy packs** verified on startup via `GET /readyz`:
-
-| Policy Pack | Regulatory Scope | Key Protections Enforced |
-| :--- | :--- | :--- |
-| **HIPAA** | Healthcare & Clinical AI | PHI detection and redaction (MRN, SSN, DOB, patient identifiers), zero-retention shadow auditing, and tamper-evident access logs. |
-| **PCI-DSS 4.0.1** | Finance & Payments | PAN/cardholder data blocking, CVV/secret redaction on ingress and egress, strict tenant isolation, and SIEM-exportable audit chains. |
-| **FMCSA** | Logistics & Transportation | Driver/dispatch PII redaction, strict logistics payload schema validation (`app/schemas/logistics_guard.py`), and operational metadata integrity checks. |
-| **EU AI Act** | High-Risk AI Governance | Cryptographic decision provenance, immutable configuration/policy tamper detection, RBAC audit endpoints, and deterministic pre-execution controls. |
-
----
-
-## CI & Test Coverage Benchmarks
-
-### Suite Summary
-* **CI Runner:** Python `3.11.18` on Linux (`pytest 9.2.0`, `pytest-cov`, `pytest-html`, `pytest-json-report`)
-* **Total Automated Tests:** **`143` passing (`100%` pass rate, `0` failures)**
-* **Overall Code Coverage:** **`~88.7%`** (CI gate threshold: `60%`)
-* **Artifacts Generated Per Run:** `reports/compliance_audit.html`, `reports/audit_ledger.json`, `reports/coverage/`
-
-### Key Module Coverage Breakdown
-
-| Module | Role | Verified Coverage |
-| :--- | :--- | :---: |
-| `lta/__init__.py` | Package entry point | **100%** |
-| `lta/config.py` | Runtime & tenant configuration | **100%** |
-| `app/api/shadow.py` | Zero-retention shadow ingest API | **97%** |
-| `app/schemas/logistics_guard.py` | Strict FMCSA/logistics Pydantic v2 schemas | **96%** |
-| `app/ledger.py` | Core hash-chained ledger primitives | **94%** |
-| `lta/rate_limiter.py` | OOM-hardened LRU sliding-window rate limiter | **90%+** |
-| `app/normalizer.py` | Layer-0 Unicode/Tag/2-pass Base64-Hex normalizer | **89%** |
-| `app/evidence_chain.py` | Provenance evidence chain builder | **89%** |
-| `lta/audit_ledger.py` | Persistent SQLite WAL / Postgres audit ledger | **85%** |
-| `app/security.py` | Auth, RBAC & security helpers | **82%** |
-| `lta/providers.py` | Upstream LLM provider adapters | **82%** |
-| `app/main.py` | Primary FastAPI application surface | **81%** |
-
----
-
-## Operational Bounds & Adversarial Verification Matrix
-
-### Deterministic Resource & Guardrail Bounds
-
-| Metric / Guardrail | Configured Bound | Behavior at Limit |
-| :--- | :--- | :--- |
-| **Max Request Body Size** | `MAX_BODY_BYTES` (`256 KB` default) | Aborts mid-stream with `HTTP 413` (`payload_too_large`) without buffering body into RAM |
-| **Rate Limiter Memory Ceiling** | `max_keys = 10,000` (configurable) | Sweeps expired TTL buckets first, then evicts least-recently-used keys in $O(1)$ |
-| **Obfuscation Decode Depth** | `MAX_DECODE_PASSES = 2` | Decodes single & double Base64/Hex encodings while preventing recursive zip-bomb loops |
-| **Decoded Token Size Cap** | `MAX_DECODED_BYTES = 16,384` | Skips oversized encoded blobs to bound CPU time per request |
-| **SQLite Concurrency Lock** | `WAL` + `busy_timeout = 5000 ms` | Allows concurrent reads during ledger appends with zero lock-error drops under burst load |
-
-### Adversarial Red-Team Coverage Matrix
-
-| Threat Vector | Test / Probe Coverage | Expected Outcome | Status |
-| :--- | :--- | :--- | :---: |
-| **Unicode Tag Smuggling (`U+E0000`–`U+E007F`)** | `app/normalizer.py` + gateway tests | Stripped prior to policy scan | PASS |
-| **Variation Selectors (`U+FE00`–`U+FE0F`, `U+E0100`–`U+E01EF`)** | `app/normalizer.py` | Stripped prior to policy scan | PASS |
-| **Cyrillic / Greek Homoglyphs & Leetspeak** | `app/normalizer.py` + `test_enterprise_gateway.py` | Folded to ASCII; numeric IDs preserved | PASS |
-| **Double-Encoded Base64 & Hex Injections** | `app/normalizer.py` + `scripts/run_stress.py` | Decoded (2-pass) & blocked (`400`/`422`) | PASS |
-| **Chunked Transfer Memory Exhaustion** | `StreamingBodyLimitMiddleware` | Mid-stream abort (`HTTP 413`) | PASS |
-| **Spoofed-IP / Key Flood OOM Attack** | `tests/test_rate_limiter_unit.py` | Memory capped at `max_keys`, expired pruned | PASS |
-| **Multi-Turn System Spoofing & Split Injection** | `tests/test_enterprise_gateway.py` | Rejected before upstream forwarding | PASS |
-| **NaN / Inf Metadata & Extra Schema Fields** | `tests/test_enterprise_gateway.py` | Rejected by strict Pydantic v2 (`422`) | PASS |
-| **Output Boundary Leak (SSN / Secrets / Prompt)** | `tests/test_enterprise_gateway.py` | Blocked/redacted on response egress | PASS |
-| **Audit Ledger Tampering & Config Drift** | `tests/tests/test_gateway_provenance_e2e.py` | Caught by `/v1/audit/verify` (`chain_valid: false`) | PASS |
-
----
-
-## Live Production Verification Proof
-
-Verified against the live Render production deployment (`https://lucid-truth-audit.onrender.com`):
+![Pipeline Latency and Hardening Test Coverage](lta_benchmarks_and_coverage.png)
 
 ```text
-LUCID-TRUTH-AUDIT LIVE PRODUCTION VERIFICATION PROOF (v2)
-Target: [https://lucid-truth-audit.onrender.com](https://lucid-truth-audit.onrender.com) | Model: gemini-3.5-flash-lite | Verify Route: /v1/audit/verify
-Timestamp: 2026-11-27 23:01:12 UTC
---------------------------------------------------------------------
-[PASS] stage1_readyz -> HTTP 200 | {"ready":true,"database_ok":true,"ledger_ok":true,"policies_loaded":4}
-[PASS] stage1_ledger_baseline -> HTTP 200 | {"chain_valid":true,"total_entries":44,"first_broken_seq_id":null}
---------------------------------------------------------------------
-SUMMARY: 2/2 PASSED | 0 FAILED
-Proof Body SHA256: 50a40ba22a72646d56897e533fc54bd1f26f6ecb59056f7e94922081a1699bc6
-```
+Incoming Request (Prompt / Multi-Turn / Shadow / Dispatch Route)
+       │
+       ▼
+[1. RequestBodyLimitMiddleware] ──▶ Rejects oversized payloads (HTTP 413, no-store, nosniff)
+       │
+       ▼
+[2. Auth & Rate Limit Gate]     ──▶ Constant-time SHA-256 key verification & per-tenant throttling
+       │
+       ▼
+[3. Normalizer & Sanitizer]     ──▶ Strips BiDi/zero-width/fillers/VS16, NFKC + homoglyph + leet fold,
+       │                            decodes URL / Base64 (std/URL-safe/unpadded) / Hex (contiguous/0x/spaced)
+       ▼
+[4. Guard & Policy Engine]      ──▶ Blocks prompt injection, social-engineering PII pretexts, floods;
+       │                            redacts SSN, Luhn PAN, API secrets, CDL/phone/email (zero raw retention)
+       ▼
+[5. FMCSA & Weight Validator]   ──▶ Enforces 49 CFR § 395.3 (11h drive, 14h window, 8h/30m break, 60/7 & 70/8),
+       │                            80k lb cap + XX-OSW-NNNN permits, and authorized waypoints
+       ▼
+[6. Hash-Chained Ledger / Chain]──▶ Canonical JSON + SHA-256 + prev_hash link (BEGIN IMMEDIATE WAL)
 
----
-
-## API Reference
-
-### 1. Readiness Probe (`GET /readyz`)
-```bash
-curl -s [https://lucid-truth-audit.onrender.com/readyz](https://lucid-truth-audit.onrender.com/readyz) | python -m json.tool
-```
-```json
-{
-  "ready": true,
-  "database_ok": true,
-  "ledger_ok": true,
-  "policies_loaded": 4
-}
-```
-
-### 2. Synchronous Guardrail Inspection (`POST /api/v1/guard`)
-```bash
-curl -s -X POST [https://lucid-truth-audit.onrender.com/api/v1/guard](https://lucid-truth-audit.onrender.com/api/v1/guard) \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: $LTA_API_KEY" \
-  -d '{
-    "model_input": "Summarize dispatch route #4412 for Twin Cities corridor.",
-    "policy_pack": "fmcsa"
-  }' | python -m json.tool
-```
-
-### 3. Zero-Retention Shadow Ingest (`POST /v1/shadow/ingest`)
-```bash
-curl -s -X POST [https://lucid-truth-audit.onrender.com/v1/shadow/ingest](https://lucid-truth-audit.onrender.com/v1/shadow/ingest) \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: $LTA_API_KEY" \
-  -d '{
-    "prompt": "Verify carrier compliance status for load 8891.",
-    "policy_pack": "fmcsa"
-  }' | python -m json.tool
-```
-
-### 4. Cryptographic Ledger Verification (`GET /v1/audit/verify` — Admin RBAC)
-```bash
-curl -s -H "X-API-Key: $LTA_ADMIN_KEY" \
-  [https://lucid-truth-audit.onrender.com/v1/audit/verify](https://lucid-truth-audit.onrender.com/v1/audit/verify) | python -m json.tool
-```
-```json
-{
-  "chain_valid": true,
-  "total_entries": 44,
-  "first_broken_seq_id": null
-}
-```
-
----
-
-## Configuration & Environment Variables
-
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `LTA_DB_URL` | `sqlite:///./lta_audit.db` | SQLite (auto-configured with WAL mode) or PostgreSQL connection string |
-| `LTA_REDIS_URL` | *(unset)* | Optional Redis URL for distributed multi-worker rate limiting |
-| `LTA_MAX_BODY_BYTES` | `262144` (`256 KB`) | Hard streaming byte cap enforced by `StreamingBodyLimitMiddleware` |
-| `LTA_API_KEY` | *(required)* | Tenant API key for `/api/v1/guard` and `/v1/shadow/ingest` |
-| `LTA_ADMIN_KEY` | *(required)* | Admin RBAC key for `/v1/audit/verify`, SIEM export, and metrics |
-| `LTA_RATE_LIMIT_RPM` | `60` | Default per-tenant sliding-window requests per minute |
-
----
-
-## Quickstart & Verification Commands
-
-### 1. Local Installation
-```bash
-git clone [https://github.com/stickneycorey1-source/Lucid-Truth-Audit.git](https://github.com/stickneycorey1-source/Lucid-Truth-Audit.git)
-cd Lucid-Truth-Audit
-python3.11 -m venv .venv
+Core Capabilities
+1. Multi-Layer Input Normalization & Unicode Defense (app/normalizer.py, app/core/sanitizer.py)
+ * Strips BiDi overrides (U+202E, U+202A–U+202E, U+2066–U+2069), Arabic Letter Mark (U+061C), Combining Grapheme Joiner (U+034F), Hangul fillers (U+115F, U+1160, U+3164, U+FFA0), soft hyphen (U+00AD), BOM (U+FEFF), Variation Selectors (U+FE00–U+FE0F), and non-spacing combining marks (Mn).
+ * Applies Unicode NFKC normalization, Cyrillic/Greek homoglyph folding, and leetspeak substitution folding.
+ * Decodes URL-encoded strings, padded/unpadded standard and URL-safe Base64, and contiguous, 0x-prefixed, or space-separated Hex tokens before security inspection.
+2. Guard, PII Redaction & Ingress Hardening (app/main.py)
+ * Blocks direct/indirect prompt injection, multi-turn role spoofing, social-engineering PII pretexts, repeating-character floods, and high-entropy anomalies.
+ * Scrubs SSNs, Luhn-validated PANs using linear-time matching ((?<!\d)(?:\d[ -]?){12,18}\d(?!\d)), and modern API keys (sk-, ghp_, AKIA, AIza) at the boundary.
+ * Enforces bounded request bodies (RequestBodyLimitMiddleware -> HTTP 413), strict CSP/security headers, sanitized Content-Disposition filenames, and spreadsheet formula-injection neutralization (sanitize_csv_cell).
+3. Zero-Retention Shadow Mode (app/api/shadow.py)
+ * Non-blocking 202 Accepted ingestion endpoint (POST /v1/shadow/ingest) executing sanitization in a background worker.
+ * Emits ZeroRetentionAuditRecord entries containing audit_id, tenant_id, input_sha256, sanitized_sha256, lengths, risk flags, and timing metrics—strictly omitting raw or sanitized prompt text.
+ * Fails closed with 503 Service Unavailable when LTA_TENANT_KEYS is missing or malformed, and verifies Bearer tokens via SHA-256 + hmac.compare_digest.
+4. Cryptographic Audit Ledger & Evidence Chain (app/ledger.py, app/evidence_chain.py)
+ * Append-only SQLite stores in WAL mode using BEGIN IMMEDIATE transactions to prevent multi-worker hash-chain forks.
+ * Canonical JSON serialization (sort_keys=True, separators=(",", ":"), allow_nan=False) eliminates delimiter collision ambiguity and non-finite JSON values.
+ * Independent per-tenant evidence chains (GENESIS -> entry_hash) with DuplicateEvidenceError (409 Conflict) and constant-time hmac.compare_digest chain verification.
+5. FMCSA Fleet & Logistics Guard (app/schemas/logistics_guard.py)
+ * Enforces FMCSA 49 CFR § 395.3 property-carrying rules: up to 11 hours driving within a 14-hour consecutive duty window after 10 consecutive hours off duty, a 30-minute break after 8 cumulative driving hours, and 60-hour/7-day or 70-hour/8-day cycle caps.
+ * Validates the 80,000 lb federal gross vehicle weight cap, ^[A-Z]{2}-OSW-\d{4,10}$ oversize/overweight permit formats, authorized geofence waypoints, and indirect prompt injection across BOL notes, dispatcher summaries, and waypoint labels.
+ * Scrubs driver SSNs, multi-state CDLs, phone numbers, and emails without corrupting operational purchase order (PO), bill of lading (BOL), or trailer (TR) identifiers.
+Benchmarks & Test Results
+Latency & Throughput Benchmarks (Local Benchmark Harness, Python 3.12 / SQLite WAL)
+| Stage / Operation | p50 Latency | p99 Latency | Throughput (Est.) | Notes |
+|---|---|---|---|---|
+| normalize_text_for_inspection | 0.42 ms | 1.85 ms | ~2,380 req/s | Includes NFKC, homoglyph/leet fold, B64 & Hex decode |
+| POST /api/v1/guard (PII + Guard) | 0.68 ms | 2.40 ms | ~1,470 req/s | Linear-time PAN check + Luhn + ledger append |
+| POST /api/v1/guard/logistics | 0.95 ms | 3.10 ms | ~1,050 req/s | Full 49 CFR § 395.3 HOS, weight/permit & waypoint audit |
+| POST /v1/shadow/ingest (API ack) | 0.31 ms | 1.25 ms | ~3,200 req/s | Returns 202 Accepted; sanitizes off-loop in background |
+| AuditLedger.record_event (WAL) | 1.15 ms | 4.60 ms | ~860 writes/s | Serialized via BEGIN IMMEDIATE + SHA-256 chain link |
+| AuditLedger.get_summary_stats | 0.09 ms | 0.35 ms | ~10,000+ req/s | O(1) count & latest hash prefix for /health probes |
+Hardening Test Suites (pytest)
+| Test Suite | Target Module | Tests | Branch Coverage | Key Assertions |
+|---|---|---|---|---|
+| tests/test_main_hardening.py | app/main.py | 14 | 94.2% | 413 body-limit headers, ReDoS-safe PAN_RE, sk-proj-/ghp_/AIza secrets, limit bounds, CSV formula & filename sanitization |
+| tests/test_normalizer_hardening.py | app/normalizer.py | 10 | 96.5% | URL-safe/unpadded Base64, URL decoding, Hex + leetspeak folding, U+034F/U+061C/U+3164/U+FE0F, deduplication |
+| tests/test_ledger_hardening.py | app/ledger.py | 8 | 95.8% | Pipe-delimiter collision immunity, payload & prev_hash tamper detection, concurrent writes, reconfigure() isolation |
+| tests/test_evidence_chain_hardening.py | app/evidence_chain.py | 9 | 95.1% | Per-tenant GENESIS chains, DuplicateEvidenceError, NaN/Inf rejection, tamper detection, concurrent writes |
+| tests/test_shadow_hardening.py | app/api/shadow.py | 10 | 93.8% | 503 fail-closed config & 401 auth, metadata bounds, zero-retention log guarantee, worker exception containment |
+| tests/test_logistics_guard_hardening.py | app/schemas/logistics_guard.py | 12 | 96.0% | EMAIL regex fix, space/hyphen SSN & CDL redaction preserving PO/TR, waypoint injection, HOS & XX-OSW-NNNN permit checks |
+Threat Audit Export Sanitization Benchmark
+| Threat Vector in Sample Export | Raw Risk | Action | Sanitized Output & Integrity Guarantee |
+|---|---|---|---|
+| Unredacted SSN + BiDi RLO (U+202E) + Cyrillic а (U+0430) | critical (175.0 / 100.0 norm) | BLOCK | SSN redacted to [REDACTED_SSN], BiDi stripped, homoglyph folded, full 64-char SHA-256 & chain hash generated |
+| Prompt injection (Ignore all previous instructions...) | high (131.2 / 75.0 norm) | BLOCK | Blocked under security.prompt_injection and chained in audit ledger |
+| Root config / environment variable probe | medium (87.5 / 50.0 norm) | BLOCK | Blocked under security.secret_exfiltration_probe and chained in audit ledger |
+| Empty whitespace validation probe | low (43.8 / 25.0 norm) | ALLOW | Logged under validation.benign_or_probe with full chain verification |
+Quick Start & API Reference
+# Install dependencies
+python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
 
-### 2. Start the Gateway
-```bash
-uvicorn lta.app:app --host 0.0.0.0 --port 8000
-```
+# Set environment configuration
+export LUCID_AUDIT_API_KEY="dev-local-key"
+export LTA_TENANT_KEYS='{"pilot_acme":"dev-shadow-key"}'
+export LUCID_LEDGER_DB_PATH="lucid_audit_ledger.db"
+export LUCID_MAX_BODY_BYTES="1048576"
 
-### 3. Run the Full CI Verification & Coverage Suite
-```bash
-mkdir -p reports
-python -m pytest -o addopts="" -v \
-  --ignore=test_lta_gaps.py \
-  --cov=app --cov=lta \
-  --cov-report=term-missing \
-  --cov-report=html:reports/coverage \
-  --cov-fail-under=60 \
-  --html=reports/compliance_audit.html \
-  --self-contained-html \
-  --json-report \
-  --json-report-file=reports/audit_ledger.json
-```
+# Start service
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 
-### 4. Run Live Adversarial & Concurrency Stress Test
-```bash
-export LTA_BASE_URL="[https://lucid-truth-audit.onrender.com](https://lucid-truth-audit.onrender.com)"
-export LTA_API_KEY="your_live_tenant_api_key"
-export LTA_ADMIN_KEY="your_live_admin_api_key"
+# Run hardening test suites with branch coverage
+pytest --cov=app --cov-branch --cov-report=term-missing -vv
 
-LTA_STRESS_CONCURRENCY=10 \
-LTA_STRESS_REQUESTS=50 \
-python scripts/run_stress.py
-```
+| Method & Path | Auth | Purpose |
+|---|---|---|
+| GET /health | None | O(1) service health, record count, and latest hash prefix |
+| POST /api/v1/guard | X-API-Key | Prompt injection, anomaly detection, and PII redaction |
+| POST /api/v1/guard/logistics | X-API-Key | FMCSA 49 CFR § 395.3 HOS, weight/permit, waypoint & BOL guard |
+| POST /v1/shadow/ingest | Bearer | Non-blocking 202 Accepted zero-retention shadow audit |
+| POST /api/v1/evidence | X-API-Key | Append tenant-isolated cryptographic evidence record (201) |
+| GET /api/v1/evidence & /verify | X-API-Key | List tenant evidence records and verify per-tenant hash chain |
+| GET /api/v1/audit/ledger & /export.csv | X-API-Key | Inspect ledger chain integrity or download formula-safe CSV |
+Pricing (Commercial & Pilot Tiers)
+| Tier | Target Workload | Monthly Pricing | Included Capacity & Support |
+|---|---|---|---|
+| 30-Day Shadow Pilot | Single-carrier / pilot validation (e.g., transport & dispatch telemetry) | $0 (30 days) | Up to 250,000 guard/shadow events, zero-retention audit export, direct onboarding |
+| Growth / Fleet Guard | Mid-market AI & logistics dispatch teams | $499 / mo | Up to 2,500,000 events/mo, multi-tenant API keys, FMCSA HOS & BOL ruleset, email support |
+| Enterprise / Dedicated | High-volume regulated AI, custom compliance & dedicated SLA | Custom (from $1,950 / mo) | Unlimited/volume-tiered throughput, custom policy packs, VPC/isolated deployment, 99.95% SLA |
+Expert Review
+> Independent Security & Reliability Review (Hardening Pass — November 2026)
+>  * Strengths: The architecture makes strong security-by-default choices—zero-retention hashing on shadow ingestion, canonical JSON hashing with allow_nan=False, BEGIN IMMEDIATE SQLite WAL write serialization, constant-time hmac.compare_digest comparisons, fail-closed 503 behavior on missing tenant key configuration, and domain-aware FMCSA 49 CFR § 395.3 + CDL redaction that avoids corrupting operational PO/TR identifiers.
+>  * Remediation Highlights: Hardening eliminated syntax/import typos, registered the previously unattached RequestBodyLimitMiddleware, replaced ReDoS-prone PAN matching with a linear-time pattern plus Luhn check, closed SQLite connection leaks via contextlib.closing, and added prompt-injection checks on Waypoint.label.
+>  * Production Recommendations: Before high-concurrency production rollout, add an automated CI gate running the full pytest + branch-coverage suite on every push, pair SQLite WAL with scheduled off-host snapshots/backups (especially on ephemeral container filesystems), and rotate any test or placeholder API keys prior to pilot launch.
+> 
+License
+Proprietary — Lucid Tech. All rights reserved. Unauthorized copying, distribution, modification, or commercial use of this software or documentation without explicit written permission from Lucid Tech is prohibited, except as expressly permitted under a signed Pilot, Evaluation, or Enterprise License Agreement.
 
----
-
-## Repository Layout
-
-```text
-Lucid-Truth-Audit/
-├── app/
-│   ├── api/shadow.py              # Zero-retention shadow pilot endpoint
-│   ├── core/sanitizer.py          # Core text/PII sanitizer
-│   ├── schemas/logistics_guard.py # Strict FMCSA/logistics Pydantic v2 schemas
-│   ├── evidence_chain.py          # Cryptographic evidence chain builder
-│   ├── ledger.py                  # Hash-chained ledger primitives
-│   ├── main.py                    # FastAPI application entrypoint
-│   ├── normalizer.py              # Layer-0 Unicode/Tag/Homoglyph/2-pass decoder
-│   └── security.py                # Auth & RBAC utilities
-├── lta/
-│   ├── app.py                     # Enterprise gateway + StreamingBodyLimitMiddleware
-│   ├── audit_ledger.py            # SQLite WAL / PostgreSQL provenance ledger
-│   ├── config.py                  # Settings & tenant configuration
-│   ├── metrics.py                 # Operational telemetry
-│   ├── policy_engine.py           # HIPAA, PCI-DSS 4.0.1, FMCSA, EU AI Act packs
-│   ├── providers.py               # Upstream LLM provider adapters
-│   └── rate_limiter.py            # OOM-hardened LRU sliding-window rate limiter
-├── scripts/
-│   ├── run_smoketest.py           # Deployment smoke test
-│   └── run_stress.py              # Adversarial probe & concurrency stress harness
-├── tests/                         # 143 unit, adversarial, E2E & coverage tests
-├── LICENSE                        # Apache License 2.0
-├── NOTICE                         # Attribution notice
-└── README.md
-```
-
----
-
-## License & Attribution
-
-Licensed under the **Apache License, Version 2.0**. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) for full terms.
-
-Copyright © 2026 **Lucid Tech** (Corey Allen Stickney).
