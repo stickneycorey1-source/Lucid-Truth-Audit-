@@ -1,0 +1,200 @@
+"""Unit tests covering hardening changes in app/ledger.py."""
+
+from __future__ import annotations
+
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+from app.ledger import AuditLedger
+
+
+# ---------------------------------------------------------------------------
+# 1. Empty ledger stats & chain verification
+# ---------------------------------------------------------------------------
+
+
+def test_empty_ledger_stats_and_verify(tmp_path: Path) -> None:
+    ledger = AuditLedger(str(tmp_path / "empty.db"))
+
+    assert ledger.get_summary_stats() == {
+        "ledger_records": 0,
+        "latest_hash_prefix": "GENESIS",
+    }
+    assert ledger.verify_chain() == {
+        "chain_valid": True,
+        "checked_records": 0,
+        "broken_at_id": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 2. Recording, summary truncation, tenant isolation, and limit clamping
+# ---------------------------------------------------------------------------
+
+
+def test_record_list_tenant_isolation_and_truncation(tmp_path: Path) -> None:
+    ledger = AuditLedger(str(tmp_path / "events.db"))
+
+    r1 = ledger.record_event(
+        tenant_id="acme",
+        endpoint="/api/v1/guard",
+        reference_id="PROMPT",
+        decision="REDACTED",
+        http_status=200,
+        redacted_types=["SSN", "API_SECRET"],
+        summary="x" * 400,
+    )
+    r2 = ledger.record_event(
+        tenant_id="beta",
+        endpoint="/api/v1/guard",
+        reference_id="PROMPT",
+        decision="ALLOWED",
+        http_status=200,
+        redacted_types=[],
+        summary="clean",
+    )
+
+    assert len(r1["summary"]) == 300
+    assert r1["redacted_types"] == ["API_SECRET", "SSN"]  # sorted
+
+    acme_events = ledger.list_events("acme", limit=10)
+    assert len(acme_events) == 1
+    assert acme_events[0]["id"] == r1["id"]
+
+    # Limit clamping: <= 0 clamps to 1
+    assert len(ledger.list_events("beta", limit=0)) == 1
+    assert ledger.list_events("beta", limit=0)[0]["id"] == r2["id"]
+
+    stats = ledger.get_summary_stats()
+    assert stats["ledger_records"] == 2
+    assert stats["latest_hash_prefix"] == r2["entry_hash"][:12]
+    assert ledger.verify_chain() == {
+        "chain_valid": True,
+        "checked_records": 2,
+        "broken_at_id": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 3. Pipe-delimiter collision immunity (canonical JSON hashing)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_hash_is_immune_to_pipe_delimiter_collisions() -> None:
+    h1 = AuditLedger._compute_hash(
+        timestamp_utc="2026-11-27T00:00:00Z",
+        tenant_id="acme",
+        endpoint="/api/v1/guard",
+        reference_id="REF|A",
+        decision="ALLOWED",
+        http_status=200,
+        redacted_types_json="[]",
+        summary="B",
+        prev_hash="GENESIS",
+    )
+    h2 = AuditLedger._compute_hash(
+        timestamp_utc="2026-11-27T00:00:00Z",
+        tenant_id="acme",
+        endpoint="/api/v1/guard",
+        reference_id="REF",
+        decision="A|ALLOWED",
+        http_status=200,
+        redacted_types_json="[]",
+        summary="B",
+        prev_hash="GENESIS",
+    )
+    assert h1 != h2
+
+
+# ---------------------------------------------------------------------------
+# 4. Tamper detection (payload mutation & prev_hash chain break)
+# ---------------------------------------------------------------------------
+
+
+def test_verify_chain_detects_payload_tampering(tmp_path: Path) -> None:
+    db_path = tmp_path / "tamper_payload.db"
+    ledger = AuditLedger(str(db_path))
+
+    ledger.record_event("acme", "/api/v1/guard", "P1", "ALLOWED", 200, [], "first")
+    r2 = ledger.record_event("acme", "/api/v1/guard", "P2", "BLOCKED", 422, [], "second")
+    ledger.record_event("acme", "/api/v1/guard", "P3", "ALLOWED", 200, [], "third")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("UPDATE audit_events SET summary = 'tampered' WHERE id = ?", (r2["id"],))
+        conn.commit()
+
+    result = ledger.verify_chain()
+    assert result == {
+        "chain_valid": False,
+        "checked_records": 3,
+        "broken_at_id": r2["id"],
+    }
+
+
+def test_verify_chain_detects_broken_prev_hash_link(tmp_path: Path) -> None:
+    db_path = tmp_path / "tamper_link.db"
+    ledger = AuditLedger(str(db_path))
+
+    ledger.record_event("acme", "/api/v1/guard", "P1", "ALLOWED", 200, [], "first")
+    r2 = ledger.record_event("acme", "/api/v1/guard", "P2", "ALLOWED", 200, [], "second")
+
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute("UPDATE audit_events SET prev_hash = 'forged' WHERE id = ?", (r2["id"],))
+        conn.commit()
+
+    result = ledger.verify_chain()
+    assert result == {
+        "chain_valid": False,
+        "checked_records": 2,
+        "broken_at_id": r2["id"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. Concurrent multi-threaded writes preserve chain integrity
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_writes_preserve_hash_chain(tmp_path: Path) -> None:
+    ledger = AuditLedger(str(tmp_path / "concurrent.db"))
+    total_writes = 24
+
+    def _write(i: int) -> None:
+        ledger.record_event(
+            tenant_id=f"tenant-{i % 3}",
+            endpoint="/api/v1/guard",
+            reference_id=f"REQ-{i}",
+            decision="ALLOWED",
+            http_status=200,
+            redacted_types=[],
+            summary=f"event {i}",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_write, range(total_writes)))
+
+    assert ledger.get_summary_stats()["ledger_records"] == total_writes
+    assert ledger.verify_chain() == {
+        "chain_valid": True,
+        "checked_records": total_writes,
+        "broken_at_id": None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 6. reconfigure() isolates storage cleanly
+# ---------------------------------------------------------------------------
+
+
+def test_reconfigure_switches_database_cleanly(tmp_path: Path) -> None:
+    db1 = tmp_path / "db1.db"
+    db2 = tmp_path / "db2.db"
+
+    ledger = AuditLedger(str(db1))
+    ledger.record_event("acme", "/api/v1/guard", "P1", "ALLOWED", 200, [], "in db1")
+    assert ledger.get_summary_stats()["ledger_records"] == 1
+
+    ledger.reconfigure(str(db2))
+    assert ledger.get_summary_stats()["ledger_records"] == 0
+    assert ledger.list_events("acme") == []
