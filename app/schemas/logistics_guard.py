@@ -1,11 +1,12 @@
 import re
-from typing import List, Optional, Literal
-from fastapi import APIRouter, Depends, status
-from pydantic import BaseModel, Field, ConfigDict, field_validator, model_validator
+from typing import List, Literal, Optional
 
+from fastapi import APIRouter, Depends, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.ledger import audit_ledger
 from app.normalizer import normalize_text_for_inspection
 from app.security import TenantContext, authenticate_and_limit
-from app.ledger import audit_ledger
 
 router = APIRouter(prefix="/api/v1/guard", tags=["Logistics Guard"])
 
@@ -21,7 +22,7 @@ INJECTION_PATTERNS = [
 # Requires explicit CDL / DL / Driver License context so PO8492014 & TR9988776 stay untouched,
 # while catching MN (MN8492014), TX (12345678), IL (S123-4567-8901), KS (K00-12-3456), FL, CA, etc.
 PII_PATTERNS = {
-    "SSN": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    "SSN": re.compile(r"(?<!\d)\d{3}[-\s]\d{2}[-\s]\d{4}(?!\d)"),
     "CDL": re.compile(
         r"\b(?:CDL|commercial\s+driver(?:'s)?\s+license|driver(?:'s)?\s+license|DL)"
         r"(?:\s*(?:no\.?|num(?:ber)?|#|:|-))?\s*"
@@ -29,7 +30,7 @@ PII_PATTERNS = {
         re.IGNORECASE,
     ),
     "PHONE": re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
-    "EMAIL": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"),
+    "EMAIL": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
 }
 
 OVERSIZE_PERMIT_RE = re.compile(r"^[A-Z]{2}-OSW-\d{4,10}$")
@@ -52,11 +53,23 @@ def detect_logistics_injection(text: str) -> bool:
 
 
 class Waypoint(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     label: str = Field(..., min_length=1, max_length=100)
     latitude: float = Field(..., ge=-90.0, le=90.0)
     longitude: float = Field(..., ge=-180.0, le=180.0)
     is_authorized_facility: bool = Field(default=True)
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, v: str) -> str:
+        stripped = v.strip()
+        if not stripped:
+            raise ValueError("Waypoint label must not be blank.")
+        if detect_logistics_injection(stripped):
+            raise ValueError(
+                "SECURITY_VIOLATION: Indirect prompt injection detected in waypoint label."
+            )
+        return stripped
 
     @field_validator("is_authorized_facility")
     @classmethod
@@ -67,7 +80,7 @@ class Waypoint(BaseModel):
 
 
 class DispatchRoutePayload(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     dispatch_id: str = Field(..., min_length=4, max_length=64)
     driver_alias: str = Field(..., min_length=2, max_length=50)
@@ -94,6 +107,14 @@ class DispatchRoutePayload(BaseModel):
 
     waypoints: List[Waypoint] = Field(..., min_length=2, max_length=25)
 
+    @field_validator("dispatch_id", "driver_alias", "vehicle_vin_hash")
+    @classmethod
+    def identifiers_not_blank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Identifier fields must not be blank or whitespace-only.")
+        return stripped
+
     @field_validator("bill_of_lading_notes", "dispatcher_summary")
     @classmethod
     def scan_indirect_prompt_injection(cls, value: str) -> str:
@@ -108,6 +129,11 @@ class DispatchRoutePayload(BaseModel):
         if self.planned_drive_hours > self.on_duty_window_hours:
             raise ValueError("HOS_VIOLATION: Planned drive hours cannot exceed total on-duty window.")
 
+        if self.continuous_drive_before_break_hours > self.planned_drive_hours:
+            raise ValueError(
+                "HOS_VIOLATION: Continuous drive hours before break cannot exceed planned drive hours."
+            )
+
         cycle_cap = 60.0 if self.cycle_type == "60_7" else 70.0
         if self.cycle_hours_used_before_shift > cycle_cap:
             raise ValueError(
@@ -118,11 +144,18 @@ class DispatchRoutePayload(BaseModel):
                 f"HOS_CYCLE_VIOLATION: Shift exceeds {cycle_cap:.0f}-hour FMCSA {self.cycle_type} duty cycle."
             )
 
-        if self.gross_vehicle_weight_lbs > 80000:
-            if not self.oversize_permit_id or not OVERSIZE_PERMIT_RE.match(self.oversize_permit_id):
+        if self.oversize_permit_id is not None:
+            permit = self.oversize_permit_id.strip()
+            if not OVERSIZE_PERMIT_RE.match(permit):
                 raise ValueError(
-                    "WEIGHT_VIOLATION: Gross weight exceeds 80,000 lbs federal cap without a valid oversize_permit_id (XX-OSW-NNNN)."
+                    "WEIGHT_VIOLATION: Invalid oversize_permit_id format (expected XX-OSW-NNNN)."
                 )
+            self.oversize_permit_id = permit
+
+        if self.gross_vehicle_weight_lbs > 80000 and not self.oversize_permit_id:
+            raise ValueError(
+                "WEIGHT_VIOLATION: Gross weight exceeds 80,000 lbs federal cap without a valid oversize_permit_id (XX-OSW-NNNN)."
+            )
         return self
 
 
