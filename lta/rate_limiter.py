@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+import math
 import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Iterator, Optional, Tuple, Union
+
+logger = logging.getLogger("lta.rate_limiter")
 
 
 @dataclass(frozen=True)
@@ -36,10 +40,12 @@ class SlidingWindowRateLimiter:
     ) -> None:
         if max_requests < 1:
             raise ValueError("max_requests must be >= 1")
-        if window_seconds <= 0:
-            raise ValueError("window_seconds must be > 0")
+        if not math.isfinite(window_seconds) or window_seconds <= 0:
+            raise ValueError("window_seconds must be a finite number > 0")
         if max_keys < 1:
             raise ValueError("max_keys must be >= 1")
+        if not math.isfinite(prune_interval_seconds) or prune_interval_seconds <= 0:
+            raise ValueError("prune_interval_seconds must be a finite number > 0")
 
         self.max_requests = int(max_requests)
         self.window_seconds = float(window_seconds)
@@ -47,6 +53,12 @@ class SlidingWindowRateLimiter:
         self.max_keys = int(max_keys)
         self.prune_interval_seconds = float(prune_interval_seconds)
         self._clock = clock
+
+        if self.redis_url:
+            logger.warning(
+                "SlidingWindowRateLimiter received redis_url, but distributed Redis "
+                "backend is not enabled; enforcing limits in local process memory."
+            )
 
         self._lock = threading.Lock()
         self._buckets: "OrderedDict[str, Deque[float]]" = OrderedDict()
@@ -83,10 +95,10 @@ class SlidingWindowRateLimiter:
                 allowed=False, limit=0, remaining=0, retry_after_seconds=self.window_seconds
             )
 
-        now = self._clock()
-        cutoff = now - self.window_seconds
-
         with self._lock:
+            now = self._clock()
+            cutoff = now - self.window_seconds
+
             if (now - self._last_prune) >= self.prune_interval_seconds:
                 self._prune_expired_locked(now)
 
@@ -100,8 +112,8 @@ class SlidingWindowRateLimiter:
                 self._evict_expired_from_bucket(bucket, cutoff)
 
             if len(bucket) >= effective_limit:
-                oldest = bucket[0]
-                retry_after = max(0.0, (oldest + self.window_seconds) - now)
+                blocking_ts = bucket[len(bucket) - effective_limit]
+                retry_after = max(0.0, (blocking_ts + self.window_seconds) - now)
                 return RateLimitResult(
                     allowed=False,
                     limit=effective_limit,
