@@ -1,0 +1,71 @@
+name: CI — Pytest & Branch Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install pytest pytest-cov httpx
+
+      - name: Run hardening & full test suite with branch coverage
+        env:
+          LUCID_AUDIT_API_KEY: "ci-ephemeral-guard-key"
+          LTA_TENANT_KEYS: '{"ci_tenant":"ci-ephemeral-shadow-key"}'
+          LUCID_LEDGER_DB_PATH: ":memory:"
+        run: |
+          pytest \
+            tests/test_main_hardening.py \
+            tests/test_normalizer_hardening.py \
+            tests/test_ledger_hardening.py \
+            tests/test_evidence_chain_hardening.py \
+            tests/test_shadow_hardening.py \
+            tests/test_logistics_guard_hardening.py \
+            --cov=app \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage-${{ matrix.python-version }}.xml \
+            -vv
+
+      - name: Upload coverage XML artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml-py${{ matrix.python-version }}
+          path: coverage-${{ matrix.python-version }}.xml
+          retention-days: 7
+
+  tests:
+    name: tests
+    if: ${{ always() }}
+    needs: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify matrix test status
+        run: test "${{ needs.pytest.result }}" = "success"
