@@ -1,14 +1,14 @@
-"""YAML Policy-Pack Engine for Lucid-Truth-Audit Enterprise (Hardened v2.4).
+"""YAML Policy-Pack Engine for Lucid-Truth-Audit Enterprise (Hardened v2.4.1).
 
 Handles:
 1. Unicode NFKD diacritic stripping, NFKC normalization, zero-width stripping,
    Cyrillic + Greek homoglyph folding, whitespace collapsing, and punctuation-stripped scan
-2. Bounded recursive decoding (depth=2) for URL, Base64, and Hex payloads (including punct-stripped)
+2. Bounded recursive decoding (depth=2) for URL, Base64 (standard + URL-safe/unpadded), and Hex payloads
 3. Prompt injection & social-engineering pretext blocking (hardened benign-allow & exfil verb guard)
 4. Flooding / high-entropy gibberish defense
-5. PII / PHI / PCI detection and deterministic redaction (including Luhn PAN check)
-6. Industry-specific domain guardrails with strict finite-numeric validation (blocks NaN/Inf/str)
-7. Symmetric output-boundary leak prevention on both raw and canonicalized outputs
+5. PII / PHI / PCI detection and deterministic redaction (ReDoS-safe Luhn PAN check, modern API keys)
+6. Industry-specific domain guardrails with strict finite-numeric validation (blocks NaN/Inf/str/bool)
+7. Symmetric output-boundary leak prevention on raw, canonicalized, and punctuation-stripped outputs
 """
 
 from __future__ import annotations
@@ -81,16 +81,16 @@ HOMOGLYPH_MAP = str.maketrans(
 )
 
 BASE64_CANDIDATE_RE = re.compile(
-    r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{20,}={0,2}(?![A-Za-z0-9+/=])"
+    r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{20,}={0,2}(?![A-Za-z0-9+/_=-])"
 )
 HEX_CANDIDATE_RE = re.compile(r"\b(?:0x)?[0-9a-fA-F]{24,}\b")
 
 SSN_RE = re.compile(r"(?<!\d)(?:\d{3}[-\s]\d{2}[-\s]\d{4}|\d{9})(?!\d)")
 EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
 PHONE_RE = re.compile(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
-PAN_CANDIDATE_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+PAN_CANDIDATE_RE = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 API_SECRET_RE = re.compile(
-    r"\b(?:sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{30,})\b"
+    r"\b(?:sk-[A-Za-z0-9_\-]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{20,})\b"
 )
 MRN_RE = re.compile(r"\bMRN[-:\s]?\d{6,10}\b", re.IGNORECASE)
 CDL_RE = re.compile(r"\bCDL[-:\s]?[A-Z]{2}[-:\s]?\d{5,9}\b", re.IGNORECASE)
@@ -139,6 +139,21 @@ def _punct_stripped(normalized_text: str) -> str:
     return WHITESPACE_RE.sub(" ", PUNCT_STRIP_RE.sub("", normalized_text)).strip()
 
 
+def _decode_base64_candidate(candidate: str) -> Optional[str]:
+    """Decode standard or URL-safe Base64 (with or without padding) into UTF-8 text."""
+    normalized = candidate.replace("-", "+").replace("_", "/")
+    rem = len(normalized) % 4
+    if rem == 1:
+        return None
+    if rem:
+        normalized += "=" * (4 - rem)
+    try:
+        raw_bytes = base64.b64decode(normalized, validate=True)
+        return raw_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return None
+
+
 def extract_decoded_segments(text: str, max_depth: int = 2) -> List[str]:
     """Bounded recursive decoding of URL-encoded, Base64, and Hex payloads."""
     decoded_surfaces: List[str] = []
@@ -164,16 +179,11 @@ def extract_decoded_segments(text: str, max_depth: int = 2) -> List[str]:
                     next_frontier.append(url_dec)
 
             for match in BASE64_CANDIDATE_RE.findall(item):
-                try:
-                    raw = base64.b64decode(match, validate=True).decode(
-                        "utf-8", errors="ignore"
-                    )
-                    if raw and len(raw) >= 8 and raw not in seen:
-                        seen.add(raw)
-                        _add_surface(raw)
-                        next_frontier.append(raw)
-                except Exception:
-                    pass
+                raw = _decode_base64_candidate(match)
+                if raw and len(raw) >= 8 and raw not in seen:
+                    seen.add(raw)
+                    _add_surface(raw)
+                    next_frontier.append(raw)
 
             for match in HEX_CANDIDATE_RE.findall(item):
                 hex_str = match[2:] if match.lower().startswith("0x") else match
@@ -253,6 +263,8 @@ class PolicyEngine:
         for path in sorted(self.policy_dir.glob("*.yaml")):
             with path.open("r", encoding="utf-8") as fh:
                 spec = yaml.safe_load(fh)
+            if not isinstance(spec, dict) or not spec.get("name"):
+                continue
             pack = PolicyPack(spec)
             self.packs[pack.name] = pack
 
@@ -497,12 +509,14 @@ class PolicyEngine:
         )
 
     def evaluate_output(self, text: str, policy_name: str) -> EvaluationResult:
-        """Inspect upstream LLM output on both raw and canonicalized surfaces."""
+        """Inspect upstream LLM output on raw, canonicalized, and punctuation-stripped surfaces."""
         pack = self.get_pack(policy_name)
         normalized = canonicalize(text)
+        punct_clean = _punct_stripped(normalized)
+        output_surfaces = (normalized, punct_clean)
 
         for phrase in pack.output_block_phrases:
-            if phrase in normalized:
+            if any(phrase in surface for surface in output_surfaces):
                 return EvaluationResult(
                     allowed=False,
                     action="BLOCK",
@@ -513,7 +527,8 @@ class PolicyEngine:
                     compliance_tags=pack.compliance_frameworks,
                 )
 
-        sanitized, redactions = self._redact_pii(text, pack.pii_redaction)
+        output_scan_types = list(set(pack.pii_redaction) | set(pack.block_on_pii_output))
+        sanitized, redactions = self._redact_pii(text, output_scan_types)
         if any(item in pack.block_on_pii_output for item in redactions):
             is_secret = any(item in {"API_SECRET", "BANK_ACCOUNT"} for item in redactions)
             vector = (
