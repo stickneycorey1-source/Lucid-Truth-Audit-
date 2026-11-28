@@ -128,3 +128,41 @@ Target: https://lucid-truth-audit.onrender.com · Latest SHA-256 Reference: 5c30
 | 8 | Audit Verify | /v1/audit/verify | 200 | 243.8 ms | PASS | OK |
 | 9 | Shadow Ingest | /v1/shadow/ingest | 202 | 119.7 ms | PASS | audit_id=lta-shadow-4-f57c3ceaa215 |
 
+## Environment Variables & Configuration Reference
+
+- **Guard & Shadow Authentication:**
+  - `LUCID_AUDIT_API_KEY`: API key required for `/api/v1/guard` and `/v1/audit/verify` requests (`X-API-Key`).
+  - `LTA_TENANT_KEYS`: JSON mapping of tenant identifiers to shadow bearer credentials for `/v1/shadow/ingest`.
+  - `LTA_API_KEY` & `LTA_SHADOW_KEY`: GitHub Actions secrets and smoke-test runner environment variables used against live deployments.
+- **Ledger & Runtime Configuration:**
+  - `LUCID_LEDGER_DB_PATH`: Path to the SQLite ledger database (`:memory:` for isolated test runs or a persistent file path for local/production deployments).
+  - `LTA_BASE_URL`: Target service base URL for `scripts/run_smoketest.py` (defaults to `https://lucid-truth-audit.onrender.com`).
+  - `LTA_TIMEOUT_SECONDS`: Per-request HTTP timeout in seconds for live smoke checks (defaults to `15`; increase to `30`–`45` when waking a sleeping Render instance).
+  - `LTA_REPORT_PATH`: Output path for the HTML smoke report (`lta_smoketest_report.html`).
+  - `LTA_GUARD_FIELD`: Optional override for the guard request payload field name (`model_input` by default, with fallback probing across `prompt`, `text`, `content`, `input`, and `messages`).
+
+---
+
+## Repository Structure
+
+```text
+Lucid-Truth-Audit-/
+├── .github/
+│   └── workflows/
+│       ├── ci_pytest.yml              # Pytest + branch coverage matrix (Python 3.11 & 3.12)
+│       └── smoketest.yml              # Manual workflow_dispatch live Render smoke test
+├── app/
+│   └── evidence_chain.py              # Tenant-isolated SQLite WAL SHA-256 hash-chain ledger
+├── lta/
+│   └── app.py                         # FastAPI enterprise audit & guard gateway
+├── scripts/
+│   └── run_smoketest.py               # Live smoke test runner + Chart.js HTML report generator
+└── tests/
+    ├── test_main_hardening.py         # Gateway & API hardening tests
+    ├── test_normalizer_hardening.py   # Deterministic normalization & Unicode hardening tests
+    ├── test_ledger_hardening.py       # Ledger persistence & integrity tests
+    ├── test_evidence_chain_hardening.py # Hash-chain, concurrency & tamper-detection tests
+    ├── test_shadow_hardening.py       # Shadow ingest, BiDi & homoglyph hardening tests
+    └── test_logistics_guard_hardening.py # Logistics / domain guardrail hardening tests
+
+
