@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from lta.audit_ledger import (
@@ -128,17 +128,15 @@ def _client_ip(request: Request) -> str:
     return "unknown"
 
 
-def _resolve_request_id(raw_id: Optional[str]) -> str:
+def _resolve_request_id(
+    raw_id: Optional[str],
+    fallback: Optional[str] = None,
+) -> str:
     if raw_id and _REQUEST_ID_RE.match(raw_id.strip()):
         return raw_id.strip()
+    if fallback and _REQUEST_ID_RE.match(fallback.strip()):
+        return fallback.strip()
     return str(uuid.uuid4())
-
-
-def _apply_security_headers(response: Response, request_id: str) -> None:
-    response.headers["X-Request-ID"] = request_id
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
 
 
 def _blocked_detail(vector: str, message: str) -> Dict[str, str]:
@@ -650,58 +648,49 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 )
                 raise HTTPException(status_code=400, detail=_blocked_detail(vector, reason))
 
-        non_system_turns = [m["content"] for m in messages if m["role"] != "system"]
-        scan_targets: List[Tuple[str, Optional[Dict[str, Any]]]] = [
-            (m["content"], metadata if m["role"] == "user" else None) for m in messages
-        ]
-        if len(non_system_turns) > 1:
-            scan_targets.append(("\n".join(non_system_turns), metadata))
-
-        for target_text, target_meta in scan_targets:
-            probe_eval = policy_engine.evaluate_input(
-                text=target_text,
-                policy_name=policy_name,
-                metadata=target_meta,
+        def _reject_input(eval_res: Any) -> None:
+            latency_ms = (time.perf_counter() - started) * 1000.0
+            vector = eval_res.vector or "policy.input_blocked"
+            reason = eval_res.reason or "Request blocked by security policy"
+            audit_ledger.record(
+                tenant_id=tenant.tenant_id,
+                endpoint=endpoint,
+                policy_pack=policy_name,
+                provider=provider_name,
+                action="BLOCK",
+                http_status=eval_res.http_status,
+                vector=vector,
+                redactions=eval_res.redactions,
+                raw_payload_for_digest="\n".join(m["content"] for m in messages),
+                latency_ms=latency_ms,
+                policy_version=policy_version,
+                policy_sha256=policy_sha256,
+                config_fingerprint=config_fp,
+                request_id=request.state.request_id,
             )
-            if not probe_eval.allowed:
-                latency_ms = (time.perf_counter() - started) * 1000.0
-                vector = probe_eval.vector or "policy.input_blocked"
-                reason = probe_eval.reason or "Request blocked by security policy"
-                audit_ledger.record(
-                    tenant_id=tenant.tenant_id,
-                    endpoint=endpoint,
-                    policy_pack=policy_name,
-                    provider=provider_name,
-                    action="BLOCK",
-                    http_status=probe_eval.http_status,
-                    vector=vector,
-                    redactions=probe_eval.redactions,
-                    raw_payload_for_digest="\n".join(m["content"] for m in messages),
-                    latency_ms=latency_ms,
-                    policy_version=policy_version,
-                    policy_sha256=policy_sha256,
-                    config_fingerprint=config_fp,
-                    request_id=request.state.request_id,
-                )
-                metrics.observe(
-                    policy_pack=policy_name,
-                    http_status=probe_eval.http_status,
-                    latency_ms=latency_ms,
-                    vector=vector,
-                )
-                raise HTTPException(
-                    status_code=probe_eval.http_status,
-                    detail=_blocked_detail(vector, reason),
-                )
+            metrics.observe(
+                policy_pack=policy_name,
+                http_status=eval_res.http_status,
+                latency_ms=latency_ms,
+                vector=vector,
+            )
+            raise HTTPException(
+                status_code=eval_res.http_status,
+                detail=_blocked_detail(vector, reason),
+            )
 
         sanitized_messages: List[Dict[str, str]] = []
         input_redactions: List[str] = []
+        non_system_turns: List[str] = []
+
         for msg in messages:
             turn_eval = policy_engine.evaluate_input(
                 text=msg["content"],
                 policy_name=policy_name,
                 metadata=metadata if msg["role"] == "user" else None,
             )
+            if not turn_eval.allowed:
+                _reject_input(turn_eval)
             sanitized_messages.append(
                 {
                     "role": msg["role"],
@@ -709,6 +698,17 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                 }
             )
             input_redactions.extend(turn_eval.redactions)
+            if msg["role"] != "system":
+                non_system_turns.append(msg["content"])
+
+        if len(non_system_turns) > 1:
+            combined_eval = policy_engine.evaluate_input(
+                text="\n".join(non_system_turns),
+                policy_name=policy_name,
+                metadata=metadata,
+            )
+            if not combined_eval.allowed:
+                _reject_input(combined_eval)
 
         try:
             upstream_resp = await call_upstream(
@@ -959,7 +959,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         actor_id: str = Depends(_authenticate_shadow),
     ) -> Dict[str, Any]:
         started = time.perf_counter()
-        resolved_req_id = _resolve_request_id(body.request_id)
+        resolved_req_id = _resolve_request_id(
+            body.request_id,
+            fallback=getattr(request.state, "request_id", None),
+        )
         digest = hashlib.sha256(body.prompt.encode("utf-8")).hexdigest()
         raw_packs = policy_engine.list_packs() or []
         pack_names = [
