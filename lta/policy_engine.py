@@ -426,63 +426,73 @@ class PolicyEngine:
                     compliance_tags=pack.compliance_frameworks,
                 )
 
-        if metadata:
-            for rule in pack.numeric_limits:
-                field_name = rule["field"]
-                if field_name in metadata and metadata[field_name] is not None:
-                    raw_val = metadata[field_name]
-                    if isinstance(raw_val, bool):
-                        return EvaluationResult(
-                            allowed=False,
-                            action="BLOCK",
-                            http_status=422,
-                            vector="domain.invalid_numeric_metadata",
-                            reason=f"Field '{field_name}' must be a finite number, not boolean",
-                            policy_pack=pack.name,
-                            compliance_tags=pack.compliance_frameworks,
-                        )
-                    try:
-                        val = float(raw_val)
-                    except (TypeError, ValueError):
-                        return EvaluationResult(
-                            allowed=False,
-                            action="BLOCK",
-                            http_status=422,
-                            vector="domain.invalid_numeric_metadata",
-                            reason=f"Field '{field_name}' must be a valid finite number",
-                            policy_pack=pack.name,
-                            compliance_tags=pack.compliance_frameworks,
-                        )
-                    if not math.isfinite(val):
-                        return EvaluationResult(
-                            allowed=False,
-                            action="BLOCK",
-                            http_status=422,
-                            vector="domain.invalid_numeric_metadata",
-                            reason=f"Field '{field_name}' must be finite (NaN/Inf rejected)",
-                            policy_pack=pack.name,
-                            compliance_tags=pack.compliance_frameworks,
-                        )
-                    if "max" in rule and val > float(rule["max"]):
-                        return EvaluationResult(
-                            allowed=False,
-                            action="BLOCK",
-                            http_status=422,
-                            vector=f"domain.{rule['name']}",
-                            reason=f"Field '{field_name}' ({val}) exceeds limit ({rule['max']})",
-                            policy_pack=pack.name,
-                            compliance_tags=pack.compliance_frameworks,
-                        )
-                    if "min" in rule and val < float(rule["min"]):
-                        return EvaluationResult(
-                            allowed=False,
-                            action="BLOCK",
-                            http_status=422,
-                            vector=f"domain.{rule['name']}",
-                            reason=f"Field '{field_name}' ({val}) below minimum ({rule['min']})",
-                            policy_pack=pack.name,
-                            compliance_tags=pack.compliance_frameworks,
-                        )
+        metadata = metadata or {}
+        for rule in pack.numeric_limits:
+            field_name = rule["field"]
+            if field_name not in metadata or metadata[field_name] is None:
+                return EvaluationResult(
+                    allowed=False,
+                    action="BLOCK",
+                    http_status=422,
+                    vector="domain.missing_numeric_metadata",
+                    reason=f"Required numeric field '{field_name}' is missing",
+                    policy_pack=pack.name,
+                    compliance_tags=pack.compliance_frameworks,
+                )
+
+            raw_val = metadata[field_name]
+            if isinstance(raw_val, bool):
+                return EvaluationResult(
+                    allowed=False,
+                    action="BLOCK",
+                    http_status=422,
+                    vector="domain.invalid_numeric_metadata",
+                    reason=f"Field '{field_name}' must be a finite number, not boolean",
+                    policy_pack=pack.name,
+                    compliance_tags=pack.compliance_frameworks,
+                )
+            try:
+                val = float(raw_val)
+            except (TypeError, ValueError):
+                return EvaluationResult(
+                    allowed=False,
+                    action="BLOCK",
+                    http_status=422,
+                    vector="domain.invalid_numeric_metadata",
+                    reason=f"Field '{field_name}' must be a valid finite number",
+                    policy_pack=pack.name,
+                    compliance_tags=pack.compliance_frameworks,
+                )
+            if not math.isfinite(val):
+                return EvaluationResult(
+                    allowed=False,
+                    action="BLOCK",
+                    http_status=422,
+                    vector="domain.invalid_numeric_metadata",
+                    reason=f"Field '{field_name}' must be finite (NaN/Inf rejected)",
+                    policy_pack=pack.name,
+                    compliance_tags=pack.compliance_frameworks,
+                )
+            if "max" in rule and val > float(rule["max"]):
+                return EvaluationResult(
+                    allowed=False,
+                    action="BLOCK",
+                    http_status=422,
+                    vector=f"domain.{rule['name']}",
+                    reason=f"Field '{field_name}' ({val}) exceeds limit ({rule['max']})",
+                    policy_pack=pack.name,
+                    compliance_tags=pack.compliance_frameworks,
+                )
+            if "min" in rule and val < float(rule["min"]):
+                return EvaluationResult(
+                    allowed=False,
+                    action="BLOCK",
+                    http_status=422,
+                    vector=f"domain.{rule['name']}",
+                    reason=f"Field '{field_name}' ({val}) below minimum ({rule['min']})",
+                    policy_pack=pack.name,
+                    compliance_tags=pack.compliance_frameworks,
+                )
 
         sanitized, redactions = self._redact_pii(text, pack.pii_redaction)
         action = "ALLOW_REDACTED" if redactions else "ALLOW"
