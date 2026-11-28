@@ -1,4 +1,4 @@
-"""Provider-agnostic upstream LLM adapters (Hardened v2.4.1 — full Gemini support, transient 5xx retry + scrubbed diagnostics)."""
+"""Provider-agnostic upstream LLM adapters (Hardened v2.4.2 — strict model validation, JSON/null guards, full key scrubbing)."""
 
 from __future__ import annotations
 
@@ -14,8 +14,9 @@ import httpx
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "host.docker.internal", "ollama"}
 _TRANSIENT_HTTP_STATUSES = {502, 503, 504}
+_GEMINI_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 _SECRET_SCRUB_RE = re.compile(
-    r"(?:sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{20,}|Bearer\s+[A-Za-z0-9._\-]{16,})"
+    r"(?:sk-[A-Za-z0-9_\-]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{20,}|Bearer\s+[A-Za-z0-9._\-]{16,})"
 )
 
 
@@ -111,7 +112,17 @@ async def _post_json(
                 await asyncio.sleep(0.75 * (attempt + 1))
                 continue
             resp.raise_for_status()
-            return resp.json()
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                raise UpstreamProviderError(
+                    f"Upstream returned invalid JSON (HTTP {resp.status_code})"
+                ) from exc
+            if not isinstance(data, dict):
+                raise UpstreamProviderError(
+                    f"Upstream returned non-object JSON payload ({type(data).__name__})"
+                )
+            return data
         raise UpstreamProviderError("Upstream request exhausted retries")
 
     if http_client is not None:
@@ -187,10 +198,10 @@ async def call_upstream(
             usage = data.get("usage") or {}
             return ProviderResponse(
                 content=str(content),
-                model=str(data.get("model", model)),
+                model=str(data.get("model") or model),
                 provider=provider_key,
-                prompt_tokens=int(usage.get("prompt_tokens", 0)),
-                completion_tokens=int(usage.get("completion_tokens", 0)),
+                prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                completion_tokens=int(usage.get("completion_tokens") or 0),
             )
 
         if provider_key == "anthropic":
@@ -226,21 +237,26 @@ async def call_upstream(
                 timeout_s=timeout_s,
                 http_client=http_client,
             )
+            blocks = data.get("content") or []
+            if not isinstance(blocks, list):
+                raise UpstreamProviderError("Upstream 'anthropic' returned malformed content")
             text_blocks = [
                 b.get("text", "")
-                for b in data.get("content", [])
+                for b in blocks
                 if isinstance(b, dict) and b.get("type") == "text"
             ]
             usage = data.get("usage") or {}
             return ProviderResponse(
                 content="".join(text_blocks),
-                model=str(data.get("model", model)),
+                model=str(data.get("model") or model),
                 provider="anthropic",
-                prompt_tokens=int(usage.get("input_tokens", 0)),
-                completion_tokens=int(usage.get("output_tokens", 0)),
+                prompt_tokens=int(usage.get("input_tokens") or 0),
+                completion_tokens=int(usage.get("output_tokens") or 0),
             )
 
         if provider_key == "gemini":
+            if not _GEMINI_MODEL_RE.match(model):
+                raise UpstreamProviderError(f"Invalid Gemini model identifier: '{model}'")
             api_key = os.getenv("GEMINI_API_KEY", "").strip()
             if not api_key:
                 if _fallback_enabled():
@@ -308,8 +324,8 @@ async def call_upstream(
                 content=text,
                 model=model,
                 provider="gemini",
-                prompt_tokens=int(usage.get("promptTokenCount", 0)),
-                completion_tokens=int(usage.get("candidatesTokenCount", 0)),
+                prompt_tokens=int(usage.get("promptTokenCount") or 0),
+                completion_tokens=int(usage.get("candidatesTokenCount") or 0),
             )
     except httpx.HTTPStatusError as exc:
         if _fallback_enabled():
@@ -321,7 +337,12 @@ async def call_upstream(
         err_msg = ""
         try:
             body = exc.response.json()
-            err_msg = body.get("error", {}).get("message", "") if isinstance(body, dict) else ""
+            if isinstance(body, dict):
+                err_obj = body.get("error")
+                if isinstance(err_obj, dict):
+                    err_msg = str(err_obj.get("message") or "")
+                elif isinstance(err_obj, str):
+                    err_msg = err_obj
         except Exception:
             err_msg = exc.response.text[:200]
         safe_msg = _scrub_secrets(err_msg or "request rejected")
