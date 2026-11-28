@@ -1,17 +1,25 @@
-import re
 import base64
+import re
 import unicodedata
 from typing import List
+from urllib.parse import unquote
 
-# Invisible formatting chars including zero-width spaces, directional marks, BOM, and soft hyphens (U+00AD)
-INVISIBLE_RE = re.compile(r"[\u00ad\u034f\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]")
+# Invisible formatting & smuggling chars: soft hyphen, CGJ, ALM, Hangul fillers,
+# zero-width/BiDi controls, BOM, and Variation Selectors 1-16
+INVISIBLE_RE = re.compile(
+    r"[\u00ad\u034f\u061c\u115f\u1160\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\u3164\ufe00-\ufe0f\ufeff\uffa0]"
+)
 
 # Common Cyrillic and Greek homoglyphs mapped to ASCII
 HOMOGLYPH_MAP = str.maketrans({
+    # Cyrillic
     "а": "a", "А": "A", "е": "e", "Е": "E", "і": "i", "І": "I",
-    "о": "o", "О": "O", "р": "p", "Р": "P", "с": "c", "С": "C",
-    "у": "y", "У": "Y", "х": "x", "Х": "X", "ѕ": "s", "Ѕ": "S",
-    "α": "a", "ε": "e", "ο": "o", "ρ": "p", "χ": "x",
+    "ј": "j", "о": "o", "О": "O", "р": "p", "Р": "P", "с": "c",
+    "С": "C", "у": "y", "У": "Y", "х": "x", "Х": "X", "ѕ": "s", "Ѕ": "S",
+    # Greek
+    "α": "a", "Α": "A", "ε": "e", "Ε": "E", "ι": "i", "Ι": "I",
+    "κ": "k", "Κ": "K", "ν": "v", "ο": "o", "Ο": "O", "ρ": "p",
+    "Ρ": "P", "τ": "t", "Τ": "T", "υ": "u", "χ": "x", "Χ": "X",
 })
 
 LEET_MAP = str.maketrans({
@@ -44,15 +52,19 @@ def _try_decode_b64(token: str) -> str:
     # Reject pure lowercase words that resemble base64
     if token.isalpha() and token.islower():
         return ""
-    padded = token + ("=" * ((4 - len(token) % 4) % 4))
-    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
-        try:
-            raw = decoder(padded.encode("ascii"))
-            decoded = raw.decode("utf-8", errors="strict")
-            if _is_mostly_printable(decoded) and any(ch.isalpha() for ch in decoded):
-                return decoded
-        except Exception:
-            continue
+    normalized = token.replace("-", "+").replace("_", "/")
+    rem = len(normalized) % 4
+    if rem == 1:
+        return ""
+    if rem:
+        normalized += "=" * (4 - rem)
+    try:
+        raw = base64.b64decode(normalized.encode("ascii"), validate=True)
+        decoded = raw.decode("utf-8", errors="strict")
+        if _is_mostly_printable(decoded) and any(ch.isalpha() for ch in decoded):
+            return decoded
+    except Exception:
+        return ""
     return ""
 
 
@@ -70,36 +82,47 @@ def _try_decode_hex(token: str) -> str:
 
 def normalize_text_for_inspection(text: str) -> str:
     """
-    Normalizes zero-width characters, soft hyphens, combining diacritics, NFKC forms,
-    Cyrillic/Greek homoglyphs, leetspeak substitutions, and decodes standard, unpadded,
-    or URL-safe Base64 as well as contiguous/0x/spaced Hex tokens embedded in prose.
+    Normalizes zero-width characters, soft hyphens, invisible smuggling chars,
+    combining diacritics, NFKC forms, Cyrillic/Greek homoglyphs, leetspeak substitutions,
+    and decodes URL-encoded, standard/unpadded/URL-safe Base64, and contiguous/0x/spaced Hex.
     """
     if not text:
         return ""
-    normalized = _strip_invisibles_and_diacritics(text)
-    candidates: List[str] = [normalized]
 
-    leet_folded = normalized.translate(LEET_MAP)
-    if leet_folded != normalized:
-        candidates.append(leet_folded)
+    candidates: List[str] = []
+    seen: set[str] = set()
+
+    def _add_candidate(raw_val: str) -> None:
+        norm = _strip_invisibles_and_diacritics(raw_val)
+        if norm and norm not in seen:
+            seen.add(norm)
+            candidates.append(norm)
+        leet = norm.translate(LEET_MAP)
+        if leet and leet not in seen:
+            seen.add(leet)
+            candidates.append(leet)
+
+    _add_candidate(text)
+    normalized = candidates[0] if candidates else ""
+
+    if "%" in normalized:
+        url_decoded = unquote(normalized)
+        if url_decoded != normalized:
+            _add_candidate(url_decoded)
 
     for match in EMBEDDED_B64_RE.findall(normalized):
         decoded = _try_decode_b64(match)
         if decoded:
-            dec_norm = _strip_invisibles_and_diacritics(decoded)
-            candidates.append(dec_norm)
-            dec_leet = dec_norm.translate(LEET_MAP)
-            if dec_leet != dec_norm:
-                candidates.append(dec_leet)
+            _add_candidate(decoded)
 
     for match in EMBEDDED_HEX_RE.findall(normalized):
         decoded = _try_decode_hex(match)
         if decoded:
-            candidates.append(_strip_invisibles_and_diacritics(decoded))
+            _add_candidate(decoded)
 
     for match in SPACED_HEX_RE.findall(normalized):
         decoded = _try_decode_hex(match)
         if decoded:
-            candidates.append(_strip_invisibles_and_diacritics(decoded))
+            _add_candidate(decoded)
 
     return " ".join(candidates)
