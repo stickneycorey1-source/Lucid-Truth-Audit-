@@ -1,21 +1,23 @@
-import os
 import csv
 import io
-import math
-import re
 import logging
+import math
+import os
+import re
+import uuid
 from pathlib import Path
-from typing import Any, List, Optional, Literal
+from typing import Any, List, Literal, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.normalizer import normalize_text_for_inspection
 from app.security import TenantContext, authenticate_and_limit
+
 try:
     from app.security import verify_key_and_limit_raw
 except ImportError:
@@ -27,14 +29,32 @@ except ImportError:
             return None, status.HTTP_401_UNAUTHORIZED, "Invalid, expired, or missing API key."
         return tenant, status.HTTP_200_OK, ""
 
-from app.ledger import audit_ledger
-from app.evidence_chain import EvidenceChainStore, DuplicateEvidenceError
-from app.schemas.logistics_guard import router as logistics_router
 from app.api.shadow import router as shadow_router
+from app.evidence_chain import DuplicateEvidenceError, EvidenceChainStore
+from app.ledger import audit_ledger
+from app.schemas.logistics_guard import router as logistics_router
 
 logger = logging.getLogger("lucid_truth_audit")
 
 FRAMEWORK_VERSION = "2.0.3"
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _parse_max_body_bytes() -> int:
+    raw = os.getenv("LUCID_MAX_BODY_BYTES", "1048576").strip()
+    try:
+        val = int(raw)
+        if val >= 1:
+            return val
+    except ValueError:
+        pass
+    return 1_048_576
+
+
+def _sanitize_header_value(value: str, fallback: str) -> str:
+    cleaned = value.replace("\r", "").replace("\n", "").strip()
+    return cleaned[:128] if cleaned else fallback
+
 
 app = FastAPI(
     title="Lucid-Truth-Audit",
@@ -58,7 +78,7 @@ app.include_router(logistics_router)
 app.include_router(shadow_router)
 
 
-# --- Security Headers Middleware ---
+# --- Request Body Limit & Security Headers Middleware ---
 
 class RequestBodyLimitMiddleware:
     """Enforce a bounded HTTP request body before passing it to FastAPI."""
@@ -130,14 +150,15 @@ class RequestBodyLimitMiddleware:
         await self.app(scope, replay_receive, send)
 
     async def _reject(self, scope, receive, send):
-        request_id = next(
+        raw_req_id = next(
             (
                 value.decode("latin-1")
                 for key, value in scope.get("headers", [])
                 if key.lower() == b"x-request-id"
             ),
-            str(uuid.uuid4()),
+            "",
         )
+        request_id = _sanitize_header_value(raw_req_id, str(uuid.uuid4()))
 
         response = JSONResponse(
             status_code=413,
@@ -156,6 +177,10 @@ class RequestBodyLimitMiddleware:
         )
 
         await response(scope, receive, send)
+
+
+app.add_middleware(RequestBodyLimitMiddleware, max_body_bytes=_parse_max_body_bytes())
+
 
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
@@ -232,9 +257,11 @@ SOCIAL_ENGINEERING_PII_SIGNATURES = [
     r"(?i)(system\s+administrator|security\s+auditor|compliance\s+officer).*?(export|list|reveal|bypass).*?(customer|ssn|user|privacy)",
 ]
 
-SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
-SECRET_RE = re.compile(r"\b(?:sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{16})\b")
-PAN_RE = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+SSN_RE = re.compile(r"(?<!\d)\d{3}[-\s]\d{2}[-\s]\d{4}(?!\d)")
+SECRET_RE = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_\-]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z\-_]{20,})\b"
+)
+PAN_RE = re.compile(r"(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)")
 CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 
@@ -319,7 +346,7 @@ class MessageTurn(BaseModel):
 class GuardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     prompt: str = Field(..., min_length=1, max_length=4000)
-    messages: Optional[List[MessageTurn]] = None
+    messages: Optional[List[MessageTurn]] = Field(default=None, max_length=50)
 
     @field_validator("prompt")
     @classmethod
@@ -468,7 +495,7 @@ async def create_evidence_record(
 
 @app.get("/api/v1/evidence")
 async def list_evidence_records(
-    limit: int = 100,
+    limit: int = Query(default=100, ge=1, le=1000),
     tenant: TenantContext = Depends(authenticate_and_limit),
 ):
     store = _get_evidence_store()
@@ -494,7 +521,7 @@ async def verify_evidence_chain(
 
 @app.get("/api/v1/audit/ledger")
 async def get_tenant_ledger(
-    limit: int = 100,
+    limit: int = Query(default=100, ge=1, le=1000),
     tenant: TenantContext = Depends(authenticate_and_limit),
 ):
     return {
@@ -526,8 +553,9 @@ async def export_tenant_ledger_csv(
             sanitize_csv_cell(ev["entry_hash"]),
         ])
     buf.seek(0)
+    safe_tenant = _SAFE_FILENAME_RE.sub("_", tenant.tenant_id) or "tenant"
     return StreamingResponse(
         iter([buf.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="lucid_audit_{tenant.tenant_id}.csv"'},
+        headers={"Content-Disposition": f'attachment; filename="lucid_audit_{safe_tenant}.csv"'},
     )
