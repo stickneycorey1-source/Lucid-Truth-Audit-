@@ -321,19 +321,26 @@ class StreamingBodyLimitMiddleware:
         # 2. Streaming byte counter
         received_bytes = 0
         response_started = False
+        limit_exceeded = False
 
         async def limited_receive() -> Dict[str, Any]:
-            nonlocal received_bytes
+            nonlocal received_bytes, limit_exceeded
             message = await receive()
             if message.get("type") == "http.request":
                 body = message.get("body", b"")
                 received_bytes += len(body)
                 if received_bytes > self.max_body_bytes:
+                    limit_exceeded = True
                     raise _PayloadTooLargeError()
             return message
 
         async def tracked_send(message: Dict[str, Any]) -> None:
             nonlocal response_started
+            if limit_exceeded:
+                if not response_started:
+                    response_started = True
+                    await self._send_413(send, req_id)
+                return
             if message.get("type") == "http.response.start":
                 response_started = True
                 headers = list(message.get("headers") or ())
@@ -353,6 +360,7 @@ class StreamingBodyLimitMiddleware:
             await self.app(scope, limited_receive, tracked_send)
         except _PayloadTooLargeError:
             if not response_started:
+                response_started = True
                 await self._send_413(send, req_id)
 
     async def _send_413(self, send: Any, req_id: str) -> None:
