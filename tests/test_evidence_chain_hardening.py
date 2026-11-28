@@ -14,14 +14,28 @@ import app.evidence_chain as ev_mod
 
 
 def _resolve_append_fn(store: Any) -> Callable[..., Any]:
-    for attr in ("append_evidence", "append", "add_evidence", "create_evidence", "record_evidence", "record"):
+    for attr in (
+        "append_evidence",
+        "append",
+        "add_evidence",
+        "create_evidence",
+        "record_evidence",
+        "record",
+    ):
         fn = getattr(store, attr, None)
         if callable(fn):
             return fn
     raise AttributeError("EvidenceChainStore has no recognized append method")
 
 
-def _call_append(store: Any, *, tenant_id: str, evidence_id: str, evidence_type: str, payload: dict[str, Any]) -> Any:
+def _call_append(
+    store: Any,
+    *,
+    tenant_id: str,
+    evidence_id: str,
+    evidence_type: str,
+    payload: dict[str, Any],
+) -> Any:
     fn = _resolve_append_fn(store)
     params = inspect.signature(fn).parameters
     if "record" in params:
@@ -154,7 +168,12 @@ def test_evidence_detects_tampering_and_supports_concurrent_writes(
 
     conn = sqlite3.connect(str(db_path))
     try:
-        tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+        tables = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        ]
         for tbl in tables:
             cols = [row[1] for row in conn.execute(f"PRAGMA table_info({tbl})").fetchall()]
             if "entry_hash" in cols:
