@@ -29,6 +29,18 @@ BIDI_CONTROL_CHARS: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Invisible non-Cf characters commonly abused for token smuggling
+INVISIBLE_SMUGGLING_CHARS: Final[frozenset[str]] = frozenset(
+    {
+        "\u034f",  # Combining Grapheme Joiner (Mn)
+        "\u115f",  # Hangul Choseong Filler (Lo)
+        "\u1160",  # Hangul Jungseong Filler (Lo)
+        "\u3164",  # Hangul Filler (Lo)
+        "\uffa0",  # Halfwidth Hangul Filler (Lo)
+        *(chr(cp) for cp in range(0xFE00, 0xFE10)),  # Variation Selectors 1-16 (Mn)
+    }
+)
+
 # Safe whitespace control characters to preserve
 SAFE_CONTROL_CHARS: Final[frozenset[str]] = frozenset({"\t", "\n", "\r"})
 
@@ -72,7 +84,16 @@ FALLBACK_CONFUSABLES: Final[dict[str, str]] = {
     "\u03a1": "GREEK",     # Ρ -> P
     "\u03a4": "GREEK",     # Τ -> T
     "\u03a7": "GREEK",     # Χ -> X
+    "\u03b1": "GREEK",     # α -> a
+    "\u03b5": "GREEK",     # ε -> e
+    "\u03b9": "GREEK",     # ι -> i
+    "\u03ba": "GREEK",     # κ -> k
+    "\u03bd": "GREEK",     # ν -> v
     "\u03bf": "GREEK",     # ο -> o
+    "\u03c1": "GREEK",     # ρ -> p
+    "\u03c4": "GREEK",     # τ -> t
+    "\u03c5": "GREEK",     # υ -> u
+    "\u03c7": "GREEK",     # χ -> x
 }
 
 
@@ -139,15 +160,21 @@ class InputSanitizer:
     """
 
     def __init__(self, preferred_aliases: list[str] | None = None) -> None:
-        self.preferred_aliases: list[str] = preferred_aliases or ["LATIN"]
+        normalized = [
+            alias.strip().upper()
+            for alias in (preferred_aliases or [])
+            if isinstance(alias, str) and alias.strip()
+        ]
+        self.preferred_aliases: list[str] = normalized or ["LATIN"]
 
     def sanitize(self, text: str) -> SanitizationResult:
         if not text:
             return SanitizationResult(sanitized_text="", was_modified=False)
 
-        # Stage 1: Strip Unicode Cf (Format/BiDi) and dangerous Cc (Control) chars
+        # Stage 1: Strip Unicode Cf (Format/BiDi), invisible smuggling chars, and dangerous Cc chars
         cleaned_chars: list[str] = []
         stripped_cf = 0
+        non_bidi_cf = 0
         stripped_cc = 0
         bidi_detected = False
 
@@ -157,9 +184,15 @@ class InputSanitizer:
                 stripped_cf += 1
                 continue
 
+            if ch in INVISIBLE_SMUGGLING_CHARS:
+                stripped_cf += 1
+                non_bidi_cf += 1
+                continue
+
             category = unicodedata.category(ch)
             if category == "Cf":
                 stripped_cf += 1
+                non_bidi_cf += 1
                 continue
             if category == "Cc" and ch not in SAFE_CONTROL_CHARS:
                 stripped_cc += 1
@@ -204,7 +237,7 @@ class InputSanitizer:
         risk_flags: list[str] = []
         if bidi_detected:
             risk_flags.append("BIDI_OVERRIDE")
-        if stripped_cf > 0 and not bidi_detected:
+        if non_bidi_cf > 0:
             risk_flags.append("INVISIBLE_FORMAT_OBFUSCATION")
         if stripped_cc > 0:
             risk_flags.append("CONTROL_CHAR_INJECTION")
