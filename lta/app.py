@@ -267,7 +267,6 @@ async def _app_lifespan(fastapi_app: FastAPI):
         logger.info("Lucid-Truth-Audit shutdown complete")
 
 
-
 class _PayloadTooLargeError(Exception):
     """Internal signal raised when a streaming request body exceeds MAX_BODY_BYTES."""
 
@@ -275,6 +274,8 @@ class _PayloadTooLargeError(Exception):
 class StreamingBodyLimitMiddleware:
     """Pure ASGI middleware enforcing MAX_BODY_BYTES on Content-Length and chunked streams.
 
+    - Populates scope["state"]["request_id"] for downstream routes & dependencies.
+    - Injects X-Request-ID and security headers on all HTTP responses.
     - Fast-fails oversized Content-Length headers.
     - Counts raw bytes on the ASGI receive stream for Transfer-Encoding: chunked.
     - Aborts immediately with HTTP 413 the moment the limit is crossed.
@@ -291,7 +292,7 @@ class StreamingBodyLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Extract request ID for consistent security headers
+        # Extract request ID for consistent state & security headers
         req_id = str(uuid.uuid4())
         for raw_name, raw_val in scope.get("headers") or ():
             if raw_name.lower() == b"x-request-id":
@@ -302,6 +303,9 @@ class StreamingBodyLimitMiddleware:
                 except Exception:
                     pass
                 break
+
+        # 0. Populate request.state.request_id for downstream routes & dependencies
+        scope.setdefault("state", {})["request_id"] = req_id
 
         # 1. Fast-path check on Content-Length
         for raw_name, raw_val in scope.get("headers") or ():
@@ -332,6 +336,17 @@ class StreamingBodyLimitMiddleware:
             nonlocal response_started
             if message.get("type") == "http.response.start":
                 response_started = True
+                headers = list(message.get("headers") or ())
+                existing = {k.lower() for k, _ in headers}
+                for key, val in (
+                    (b"x-request-id", req_id.encode("latin-1")),
+                    (b"cache-control", b"no-store"),
+                    (b"x-content-type-options", b"nosniff"),
+                    (b"x-frame-options", b"DENY"),
+                ):
+                    if key not in existing:
+                        headers.append((key, val))
+                message = {**message, "headers": headers}
             await send(message)
 
         try:
@@ -365,6 +380,7 @@ class StreamingBodyLimitMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": payload, "more_body": False})
+
 
 def create_app(settings: Optional[Settings] = None) -> FastAPI:
     cfg = settings or Settings.from_env()
@@ -445,7 +461,6 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         except Exception as exc:
             logger.debug("Policy snapshot record skipped: %s", exc)
         return policy_version, policy_sha256, config_fp
-
 
     # Pure-ASGI streaming body limit (never buffers oversized payloads)
     fastapi_app.add_middleware(StreamingBodyLimitMiddleware, max_body_bytes=MAX_BODY_BYTES)
