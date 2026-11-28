@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -15,6 +16,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 GENESIS_HASH = "0" * 64
 _EPHEMERAL_KEYS = frozenset({"runtime_cache", "_cache", "cache"})
+_PG_CHAIN_LOCK_KEY = 0x4C54415F4C454447  # Stable 64-bit advisory lock key ("LTA_LEDG")
 
 
 @dataclass
@@ -48,6 +50,13 @@ class AuditRecord:
             )
         elif self.redactions is None:
             self.redactions = _normalize_redactions(self.redactions_json)
+
+
+def _safe_latency(latency_ms: float) -> float:
+    val = float(latency_ms)
+    if not math.isfinite(val) or val < 0.0:
+        return 0.0
+    return round(val, 3)
 
 
 def _sanitize_for_digest(obj: Any) -> Any:
@@ -204,7 +213,7 @@ def _compute_entry_hash(
         "vector": None if vector is None else str(vector),
         "redactions": normalized_redactions,
         "payload_sha256": str(payload_sha256),
-        "latency_ms": round(float(latency_ms), 3),
+        "latency_ms": _safe_latency(latency_ms),
     }
 
     # Preserve legacy hash calculations when verifying older records.
@@ -243,11 +252,16 @@ class AuditLedger:
         raw_path = self.db_url
         if raw_path.startswith("sqlite:///"):
             raw_path = raw_path[len("sqlite:///"):]
-        if raw_path != ":memory:":
+        is_memory = raw_path == ":memory:"
+        if not is_memory:
             parent = Path(raw_path).parent
             if str(parent) not in ("", "."):
                 os.makedirs(parent, exist_ok=True)
-        self._sqlite_conn = sqlite3.connect(raw_path, check_same_thread=False)
+        self._sqlite_conn = sqlite3.connect(raw_path, timeout=30.0, check_same_thread=False)
+        self._sqlite_conn.execute("PRAGMA busy_timeout = 5000")
+        if not is_memory:
+            self._sqlite_conn.execute("PRAGMA journal_mode = WAL")
+            self._sqlite_conn.execute("PRAGMA synchronous = NORMAL")
 
     def _init_postgres(self) -> None:
         try:
@@ -468,11 +482,27 @@ class AuditLedger:
         ts = datetime.now(timezone.utc).isoformat()
         payload_sha256 = hashlib.sha256(raw_payload_for_digest.encode("utf-8")).hexdigest()
         redactions_json = json.dumps(sorted(str(r) for r in redactions), separators=(",", ":"))
-        rounded_latency = round(float(latency_ms), 3)
+        rounded_latency = _safe_latency(latency_ms)
 
-        with self._lock:
-            prev_hash = self._get_latest_hash_locked()
-            provenance_hash = compute_provenance_hash(
+        prov_dict: Dict[str, Any] = {}
+        if extra_provenance:
+            sanitized_extra = _sanitize_for_digest(extra_provenance)
+            if isinstance(sanitized_extra, dict):
+                prov_dict.update(sanitized_extra)
+        prov_dict.update(
+            {
+                "policy_pack": str(policy_pack),
+                "policy_version": str(policy_version),
+                "policy_sha256": str(policy_sha256),
+                "config_fingerprint": str(config_fingerprint),
+                "request_id": str(request_id or ""),
+            }
+        )
+        provenance_json = json.dumps(prov_dict, sort_keys=True, separators=(",", ":"))
+        provenance_json_sha256 = hashlib.sha256(provenance_json.encode("utf-8")).hexdigest()
+
+        def _build_hashes(prev_hash: str) -> Tuple[str, str]:
+            prov_hash = compute_provenance_hash(
                 prev_hash=prev_hash,
                 payload_sha256=payload_sha256,
                 policy_name=policy_pack,
@@ -481,19 +511,7 @@ class AuditLedger:
                 config_fingerprint=config_fingerprint,
                 request_id=request_id,
             )
-            prov_dict: Dict[str, Any] = {
-                "policy_pack": str(policy_pack),
-                "policy_version": str(policy_version),
-                "policy_sha256": str(policy_sha256),
-                "config_fingerprint": str(config_fingerprint),
-                "request_id": str(request_id or ""),
-            }
-            if extra_provenance:
-                prov_dict.update(extra_provenance)
-            provenance_json = json.dumps(prov_dict, sort_keys=True, separators=(",", ":"))
-            provenance_json_sha256 = hashlib.sha256(provenance_json.encode("utf-8")).hexdigest()
-
-            entry_hash = _compute_entry_hash(
+            e_hash = _compute_entry_hash(
                 prev_hash=prev_hash,
                 timestamp_utc=ts,
                 tenant_id=tenant_id,
@@ -509,32 +527,12 @@ class AuditLedger:
                 policy_version=policy_version,
                 policy_sha256=policy_sha256,
                 config_fingerprint=config_fingerprint,
-                provenance_hash=provenance_hash,
+                provenance_hash=prov_hash,
                 provenance_json_sha256=provenance_json_sha256,
             )
+            return prov_hash, e_hash
 
-            params = (
-                ts,
-                tenant_id,
-                endpoint,
-                policy_pack,
-                policy_version,
-                policy_sha256,
-                config_fingerprint,
-                provenance_hash,
-                provenance_json,
-                provenance_json_sha256,
-                provider,
-                action,
-                int(http_status),
-                vector,
-                redactions_json,
-                payload_sha256,
-                rounded_latency,
-                prev_hash,
-                entry_hash,
-            )
-
+        with self._lock:
             if self._is_postgres:
                 sql = """
                 INSERT INTO audit_events (
@@ -550,12 +548,61 @@ class AuditLedger:
                 """
                 with self._pg_connection() as conn:
                     cur = conn.cursor()
+                    cur.execute("SELECT pg_advisory_xact_lock(%s)", (_PG_CHAIN_LOCK_KEY,))
+                    cur.execute("SELECT entry_hash FROM audit_events ORDER BY seq_id DESC LIMIT 1")
+                    latest_row = cur.fetchone()
+                    prev_hash = str(latest_row[0]) if latest_row and latest_row[0] else GENESIS_HASH
+                    provenance_hash, entry_hash = _build_hashes(prev_hash)
+                    params = (
+                        ts,
+                        tenant_id,
+                        endpoint,
+                        policy_pack,
+                        policy_version,
+                        policy_sha256,
+                        config_fingerprint,
+                        provenance_hash,
+                        provenance_json,
+                        provenance_json_sha256,
+                        provider,
+                        action,
+                        int(http_status),
+                        vector,
+                        redactions_json,
+                        payload_sha256,
+                        rounded_latency,
+                        prev_hash,
+                        entry_hash,
+                    )
                     cur.execute(sql, params)
                     row = cur.fetchone()
                     seq_id = int(row[0]) if row else 1
                     conn.commit()
             else:
                 assert self._sqlite_conn is not None
+                prev_hash = self._get_latest_hash_locked()
+                provenance_hash, entry_hash = _build_hashes(prev_hash)
+                params = (
+                    ts,
+                    tenant_id,
+                    endpoint,
+                    policy_pack,
+                    policy_version,
+                    policy_sha256,
+                    config_fingerprint,
+                    provenance_hash,
+                    provenance_json,
+                    provenance_json_sha256,
+                    provider,
+                    action,
+                    int(http_status),
+                    vector,
+                    redactions_json,
+                    payload_sha256,
+                    rounded_latency,
+                    prev_hash,
+                    entry_hash,
+                )
                 sql = """
                 INSERT INTO audit_events (
                     timestamp_utc, tenant_id, endpoint, policy_pack,
@@ -637,7 +684,9 @@ class AuditLedger:
         return list(self._sqlite_conn.execute(sql, params).fetchall())
 
     def verify_chain(self) -> Tuple[bool, int, Optional[int]]:
-        """Recompute every SHA-256 link and provenance_json digest from genesis."""
+        """Recompute every SHA-256 link, provenance hash, and provenance_json digest from genesis."""
+        if self._closed:
+            raise RuntimeError("AuditLedger is closed")
         with self._lock:
             rows = self._fetch_all_rows_locked()
 
@@ -671,11 +720,29 @@ class AuditLedger:
                 return False, total, int(seq_id)
 
             stored_prov_sha = str(provenance_json_sha256 or "")
+            raw_prov_json = str(provenance_json or "{}")
             if stored_prov_sha:
-                actual_prov_sha = hashlib.sha256(
-                    str(provenance_json or "{}").encode("utf-8")
-                ).hexdigest()
+                actual_prov_sha = hashlib.sha256(raw_prov_json.encode("utf-8")).hexdigest()
                 if not hmac.compare_digest(actual_prov_sha, stored_prov_sha):
+                    return False, total, int(seq_id)
+
+            stored_prov_hash = str(provenance_hash or "")
+            if stored_prov_hash:
+                try:
+                    parsed_prov = json.loads(raw_prov_json)
+                    req_id = str(parsed_prov.get("request_id") or "") if isinstance(parsed_prov, dict) else ""
+                except (TypeError, ValueError):
+                    return False, total, int(seq_id)
+                expected_prov_hash = compute_provenance_hash(
+                    prev_hash=str(prev_hash),
+                    payload_sha256=str(payload_sha256),
+                    policy_name=str(policy_pack),
+                    policy_version=str(policy_version or ""),
+                    policy_sha256=str(policy_sha256 or ""),
+                    config_fingerprint=str(config_fingerprint or ""),
+                    request_id=req_id,
+                )
+                if not hmac.compare_digest(expected_prov_hash, stored_prov_hash):
                     return False, total, int(seq_id)
 
             recomputed = _compute_entry_hash(
@@ -694,7 +761,7 @@ class AuditLedger:
                 policy_version=str(policy_version or ""),
                 policy_sha256=str(policy_sha256 or ""),
                 config_fingerprint=str(config_fingerprint or ""),
-                provenance_hash=str(provenance_hash or ""),
+                provenance_hash=stored_prov_hash,
                 provenance_json_sha256=stored_prov_sha,
             )
             if not hmac.compare_digest(recomputed, str(entry_hash)):
@@ -710,6 +777,8 @@ class AuditLedger:
         limit: Optional[int] = None,
     ) -> str:
         """Export audit events as NDJSON with full cryptographic provenance fields."""
+        if self._closed:
+            raise RuntimeError("AuditLedger is closed")
         with self._lock:
             rows = self._fetch_all_rows_locked(tenant_id=tenant_id)
         if limit is not None and limit >= 0:
@@ -757,7 +826,7 @@ class AuditLedger:
                 "vector": vector,
                 "redactions": _normalize_redactions(str(redactions_json)),
                 "payload_sha256": str(payload_sha256),
-                "latency_ms": float(latency_ms),
+                "latency_ms": _safe_latency(float(latency_ms)),
                 "prev_hash": str(prev_hash),
                 "entry_hash": str(entry_hash),
             }
