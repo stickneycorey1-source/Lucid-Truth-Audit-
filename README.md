@@ -13,7 +13,7 @@
 [![Status: 9/9 Live Smoke Passed](https://img.shields.io/badge/Live%20Smoke-9%2F9%20Passed%20(100%25)-34D399.svg)](#complete-test--smoke-test-results)
 [![Tests: 303/303 Passing](https://img.shields.io/badge/Unit%20%26%20Hardening-303%2F303%20Passed-16A34A.svg)](#complete-test--smoke-test-results)
 
-Enterprise AI governance and prompt guardrail microservice engineered by **Lucid Tech**. Built on **Python 3.11 / 3.12**, **FastAPI**, and **Pydantic v2**, `Lucid-Truth-Audit` provides deterministic schema validation, Unicode NFKC normalization, PII/secret redaction, prompt-injection & evasion defense, zero-retention privacy guarantees, and tamper-evident SHA-256 hash-chained audit verification.
+Enterprise AI governance and prompt guardrail microservice engineered by **Lucid Tech**. Built on **Python 3.11 / 3.12**, **FastAPI**, and **Pydantic v2**, `Lucid-Truth-Audit` provides deterministic schema validation, Unicode NFKC normalization, PII/secret redaction, prompt-injection and evasion defense, zero-retention privacy guarantees, and tamper-evident SHA-256 hash-chained audit verification.
 
 - **Production Base URL:** `https://lucid-truth-audit.onrender.com`
 - **Repository:** `https://github.com/stickneycorey1-source/Lucid-Truth-Audit-`
@@ -21,30 +21,42 @@ Enterprise AI governance and prompt guardrail microservice engineered by **Lucid
 
 ---
 
-## Milestones & Roadmap
+## Milestones & Engineering Roadmap
 
-- **Milestone 1 — Core Guard Gateway & Shadow Ingest:** Implemented `/api/v1/guard` (`X-API-Key`) and `/v1/shadow/ingest` (`Bearer` auth) for prompt governance, PII/secret redaction, injection/evasion handling, and bidirectional (`BiDi`) / Unicode homoglyph shadow ingestion.
-- **Milestone 2 — Tenant-Isolated Cryptographic Ledger (`EvidenceChainStore`):** Built SQLite ledger (`WAL` mode, `FULL` synchronous mode, `BEGIN IMMEDIATE` write serialization) with canonical JSON and SHA-256 hash-chaining from `"GENESIS"`, per-tenant isolation, concurrent write protection, `DuplicateEvidenceError` handling, and `hmac.compare_digest` verification.
-- **Milestone 3 — Hardening & CI/CD Pipeline (`ci_pytest.yml`):** Expanded test coverage to `303/303` passing tests including dedicated hardening suites (`test_evidence_chain_hardening.py`, `test_main_hardening.py`, `test_normalizer_hardening.py`, `test_ledger_hardening.py`, `test_shadow_hardening.py`, `test_logistics_guard_hardening.py`), safe `[ -f "$f" ]` file discovery across Python `3.11` and `3.12`, and `coverage-3.12.xml` artifact uploads.
-- **Milestone 4 — Live Render Smoke Verification (`smoketest.yml`):** Resolved `/api/v1/guard` `model_input` payload alignment and Render cold-start retry/timeout handling, achieving **9/9 (`100.0%`)** live smoke test pass rate on `https://lucid-truth-audit.onrender.com` (`2026-11-28 11:46:43 UTC`).
-- **Milestone 5 — Stakeholder Readiness & Pilot Rollout:** Verified live deployment readiness ahead of investor discussions with **Muhammad Hassan (VantX)** on **November 28, 2026** and Zoom kickoff + 30-day zero-retention shadow pilot coordination with **Amber Phillips (P2 Transportation Solutions)** on **November 30, 2026**.
+- **Milestone 1 — Core Guard Gateway & Shadow Ingest:**
+  - Implemented `POST /api/v1/guard` (`X-API-Key`) for structured `model_input` validation, PII/secret redaction, and prompt-injection/evasion evaluation.
+  - Implemented `POST /v1/shadow/ingest` (`Authorization: Bearer <shadow_key>`) to ingest shadow payloads—including bidirectional (`BiDi`) text and Unicode homoglyph evasion vectors—and return `202 Accepted` with an `audit_id` and SHA-256 reference hash.
+  - Added liveness (`GET /healthz`), readiness (`GET /readyz`), and audit verification (`GET /v1/audit/verify`) endpoints.
+- **Milestone 2 — Tenant-Isolated Cryptographic Ledger (`EvidenceChainStore`):**
+  - Engineered SQLite persistence configured with `WAL` journal mode, `FULL` synchronous mode, and `BEGIN IMMEDIATE` write serialization to prevent write contention and race conditions.
+  - Implemented canonical JSON hashing and SHA-256 hash-chaining seeded from `"GENESIS"`, computing each `entry_hash` across `schema_version`, `evidence_id`, `tenant_id`, `created_at`, `payload_json`, and `prev_hash`.
+  - Enforced strict per-tenant isolation, `DuplicateEvidenceError` handling, non-finite number (`NaN`, `Infinity`, `-Infinity`) and blank-tenant rejection, and constant-time `hmac.compare_digest` verification returning `chain_valid` and `broken_at_record`.
+- **Milestone 3 — Hardening & CI/CD Pipeline (`ci_pytest.yml`):**
+  - Expanded the test suite to **303/303** passing tests locally, including dedicated hardening suites (`test_main_hardening.py`, `test_normalizer_hardening.py`, `test_ledger_hardening.py`, `test_evidence_chain_hardening.py`, `test_shadow_hardening.py`, and `test_logistics_guard_hardening.py`).
+  - Fixed CI file discovery with `[ -f "$f" ]` existence guards and configured matrix execution across Python `3.11` and `3.12` with `--cov=app --cov-branch` and `coverage-<version>.xml` artifact uploads (`coverage-3.12.xml`, Artifact ID `15257004565`, SHA-256 `87c1b3e52ced401ce8e4ac3a7a34b5131017ea1a299529dad0cc0e18cf0dacba`).
+- **Milestone 4 — Live Render Smoke Verification (`smoketest.yml`):**
+  - Diagnosed and resolved schema mismatches on `POST /api/v1/guard` (`model_input` payload alignment and auto-detection) and added cold-start retry/backoff handling (`502`/`503`/`504` and `RequestException`) in `scripts/run_smoketest.py`.
+  - Achieved **9/9 (`100.0%`)** passing smoke tests on `https://lucid-truth-audit.onrender.com` (`2026-11-28 11:46:43 UTC`) with HTML report artifact generation (`lucid-truth-audit-smoketest-report`).
+- **Milestone 5 — Stakeholder Readiness & Pilot Rollout:**
+  - Verified live service health, authentication boundaries, redaction behavior, and ledger integrity ahead of stakeholder discussions with **Muhammad Hassan (VantX)** on **November 28, 2026**.
+  - Prepared zero-retention telemetry and shadow-ingest readiness ahead of the Zoom meeting and 30-day shadow pilot kickoff with **Amber Phillips (P2 Transportation Solutions)** on **November 30, 2026**.
 
 ---
 
-## Core Capabilities
+## Core Capabilities & Architecture
 
-- **Enterprise Guard Gateway (`/api/v1/guard`):** Authenticates requests via `X-API-Key`, validates structured `model_input` payloads with strict schema enforcement, redacts sensitive identifiers (such as SSNs and API/secret tokens), and detects or blocks prompt injection and evasion attempts.
-- **Shadow Telemetry & Evasion Ingest (`/v1/shadow/ingest`):** Enforces bearer authentication (`Authorization: Bearer <shadow_key>`) and ingests shadow payloads—including bidirectional (`BiDi`) text and Unicode homoglyph evasion vectors—returning `202 Accepted` with an `audit_id` and SHA-256 reference hash.
-- **Cryptographic Evidence Chain (`EvidenceChainStore`):** Stores tenant-isolated records in SQLite (`WAL` journal mode, `FULL` synchronous mode, `BEGIN IMMEDIATE` write serialization) using canonical JSON serialization and SHA-256 hash-chaining linked to `"GENESIS"` and verified with constant-time `hmac.compare_digest` checks.
-- **Deterministic Normalization & Hardening:** Normalizes text inputs deterministically, rejects non-finite numbers (`NaN`, `Infinity`, `-Infinity`) and blank tenant identifiers, and provides branch-covered `pytest` suites across Python 3.11 and 3.12.
+- **Enterprise Guard Gateway (`/api/v1/guard`):** Authenticates callers via `X-API-Key`, validates `model_input` requests against strict Pydantic v2 schemas, redacts sensitive tokens/identifiers (such as SSNs and secret keys), and handles prompt-injection and evasion payloads.
+- **Shadow Telemetry & Evasion Ingest (`/v1/shadow/ingest`):** Enforces bearer token authentication and ingests shadow telemetry—including BiDi overrides and homoglyph characters—returning `202 Accepted` with `audit_id` and SHA-256 hash tracking.
+- **Cryptographic Evidence Chain (`EvidenceChainStore`):** Provides tenant-isolated append-only audit trails in SQLite (`WAL` + `FULL` + `BEGIN IMMEDIATE`), canonical payload hashing, SHA-256 chain linkage (`"GENESIS"` → `prev_hash` → `entry_hash`), and tamper detection via `verify(tenant_id)`.
+- **Deterministic Normalization & Validation:** Normalizes Unicode inputs deterministically and rejects malformed types, non-finite floats, and blank tenant identifiers before persistence.
 
 ---
 
 ## Security & Privacy Architecture
 
-- **Zero-Retention Policy:** Sensitive inputs are evaluated and redacted without retaining raw PII in long-lived application logs or unhashed shadow records.
-- **Canonical Hashing & Tamper Detection:** Each record in `EvidenceChainStore` computes a deterministic `entry_hash` over `schema_version`, `evidence_id`, `tenant_id`, `created_at`, `payload_json`, and `prev_hash`. Modifying any persisted row or breaking link continuity causes `verify(tenant_id)` to flag `chain_valid: False` at `broken_at_record`.
-- **Auth Boundaries:** Unauthenticated requests to `/api/v1/guard` and `/v1/shadow/ingest` are rejected (`403` / `401`).
+- **Zero-Retention Policy:** Prompts and shadow payloads are processed with zero-retention privacy guarantees so sensitive data is not persisted in unhashed logs or retained beyond audit requirements.
+- **Hash-Chain Integrity & Tamper Detection:** Every record links `prev_hash` to the prior tenant record's `entry_hash` (or `"GENESIS"` for the first entry). Any row alteration or chain break is detected by `verify(tenant_id)` (`chain_valid: False`, `broken_at_record`).
+- **Authentication & Access Control:** Missing or invalid credentials on `/api/v1/guard` (`403`) and `/v1/shadow/ingest` (`401`) are rejected prior to payload processing.
 
 ---
 
@@ -52,12 +64,12 @@ Enterprise AI governance and prompt guardrail microservice engineered by **Lucid
 
 | Endpoint / Component | Purpose | Auth / Guard | Verified Live Status |
 | :--- | :--- | :--- | :--- |
-| `GET /healthz` | Service liveness probe | Public | `200 OK` |
-| `GET /readyz` | Service readiness probe | Public | `200 OK` |
-| `POST /api/v1/guard` | Clean prompt evaluation, PII redaction, injection/evasion handling | `X-API-Key` | `403` (no key), `200` / `400` / `403` (keyed) |
-| `POST /v1/shadow/ingest` | Shadow telemetry ingestion (BiDi & homoglyph payloads) | `Bearer` token | `401` (no token), `202 Accepted` (keyed) |
+| `GET /healthz` | Service liveness check | Public | `200 OK` |
+| `GET /readyz` | Service readiness check | Public | `200 OK` |
+| `POST /api/v1/guard` | Clean prompt check, PII/secret redaction, injection/evasion handling | `X-API-Key` | `403` (missing key), `200` / `400` / `403` (keyed) |
+| `POST /v1/shadow/ingest` | Shadow ingest for BiDi & homoglyph payloads | `Bearer` token | `401` (missing token), `202 Accepted` (keyed) |
 | `GET /v1/audit/verify` | Audit ledger integrity verification | `X-API-Key` | `200 OK` |
-| `EvidenceChainStore` | Tenant-isolated SHA-256 hash chain (`add`, `list_records`, `verify`) | Internal / SQLite WAL | Verified in unit & concurrency tests |
+| `EvidenceChainStore` | Tenant-isolated SHA-256 hash chain (`add`, `list_records`, `verify`) | Internal / SQLite WAL | Verified across unit & concurrency tests |
 
 ---
 
@@ -94,13 +106,14 @@ export LTA_REPORT_PATH="lta_smoketest_report.html"
 python scripts/run_smoketest.py
 
 GitHub Actions Workflows & Secrets
- * CI Workflow (.github/workflows/ci_pytest.yml): Runs pytest with branch coverage (--cov=app --cov-branch) across Python 3.11 and 3.12 on pushes and pull requests to main, uploading coverage-<version>.xml artifacts (coverage-3.12.xml, 3,998 bytes).
- * Smoke Test Workflow (.github/workflows/smoketest.yml): Manual workflow_dispatch runner targeting https://lucid-truth-audit.onrender.com (configurable base_url and timeout_seconds), generating lta_smoketest_report.html and uploading the lucid-truth-audit-smoketest-report artifact.
- * Required Repository Secrets: Configure LTA_API_KEY and LTA_SHADOW_KEY under Settings → Secrets and variables → Actions.
+ * CI Workflow (.github/workflows/ci_pytest.yml): Executes pytest --cov=app --cov-branch across Python 3.11 and 3.12 on pushes and pull requests targeting main, safely checking hardening test files with [ -f "$f" ] and uploading coverage-<version>.xml (coverage-3.12.xml, 3,998 bytes).
+ * Smoke Test Workflow (.github/workflows/smoketest.yml): Manual workflow_dispatch workflow against https://lucid-truth-audit.onrender.com (with base_url and timeout_seconds inputs), running python scripts/run_smoketest.py and uploading lta_smoketest_report.html under lucid-truth-audit-smoketest-report.
+ * Required Repository Secrets: Set LTA_API_KEY and LTA_SHADOW_KEY in Settings → Secrets and variables → Actions.
 Complete Test & Smoke Test Results
 1. Unit, Hardening & CI Suite Summary
- * Hardening & Full Test Suite: 303/303 tests passing locally; ci_pytest.yml executes across Python 3.11 and 3.12 with --cov=app --cov-branch and uploads coverage-3.12.xml (Artifact ID 15257004565, SHA-256 87c1b3e52ced401ce8e4ac3a7a34b5131017ea1a299529dad0cc0e18cf0dacba).
- * Hardening Test Modules Covered in CI: tests/test_main_hardening.py, tests/test_normalizer_hardening.py, tests/test_ledger_hardening.py, tests/test_evidence_chain_hardening.py, tests/test_shadow_hardening.py, and tests/test_logistics_guard_hardening.py (with [ -f "$f" ] existence guards).
+ * Hardening & Full Test Suite: 303/303 tests passing locally; CI executes across Python 3.11 and 3.12 with branch coverage enabled (--cov=app --cov-branch).
+ * Coverage Artifact Uploaded: coverage-3.12.xml (3,998 bytes, Artifact ID 15257004565, SHA-256 87c1b3e52ced401ce8e4ac3a7a34b5131017ea1a299529dad0cc0e18cf0dacba).
+ * Hardening Test Modules: tests/test_main_hardening.py, tests/test_normalizer_hardening.py, tests/test_ledger_hardening.py, tests/test_evidence_chain_hardening.py, tests/test_shadow_hardening.py, and tests/test_logistics_guard_hardening.py.
 2. Live Render Smoke Test Results (2026-11-28 11:46:43 UTC — 9/9 Passed · 100.0%)
 Target: https://lucid-truth-audit.onrender.com · Latest SHA-256 Reference: 5c303fae2ce8e0c4e581e09f3d1445a3e6a67f77ad4d473d94df6efc10dc580d
 | # | Check | Endpoint | HTTP | Latency | Status | Detail |
