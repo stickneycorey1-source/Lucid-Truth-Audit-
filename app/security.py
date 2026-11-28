@@ -1,14 +1,45 @@
-import os
 import hmac
-import time
 import logging
+import math
+import os
 import threading
+import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+
 from fastapi import Header, HTTPException, status
 
 logger = logging.getLogger("lucid_truth_audit")
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+        if val >= 1:
+            return val
+    except ValueError:
+        pass
+    logger.warning("security.configuration_warning invalid_%s=%r using_default=%d", name.lower(), raw, default)
+    return default
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+        if math.isfinite(val) and val > 0:
+            return val
+    except ValueError:
+        pass
+    logger.warning("security.configuration_warning invalid_%s=%r using_default=%s", name.lower(), raw, default)
+    return default
 
 
 @dataclass(frozen=True)
@@ -28,6 +59,8 @@ def _parse_tenant_keys() -> Dict[str, TenantContext]:
     multi_raw = os.getenv("LUCID_TENANT_KEYS", "").strip()
     if multi_raw:
         for entry in multi_raw.split(","):
+            if not entry.strip():
+                continue
             parts = [p.strip() for p in entry.split(":")]
             if len(parts) >= 2 and parts[0] and parts[1]:
                 tenant_id, secret = parts[0], parts[1]
@@ -51,15 +84,29 @@ def _parse_tenant_keys() -> Dict[str, TenantContext]:
 
 class SlidingWindowRateLimiter:
     """
-    Thread-safe in-memory sliding-window rate limiter with stale-bucket eviction.
+    Thread-safe, memory-bounded in-memory sliding-window rate limiter with LRU + stale eviction.
     For multi-worker deployments, swap backing store to Redis sorted sets.
     """
 
-    def __init__(self, max_requests: int = 60, window_seconds: float = 60.0, max_tracked_tenants: int = 5000):
-        self.max_requests = max_requests
-        self.window_seconds = window_seconds
-        self.max_tracked_tenants = max_tracked_tenants
-        self._buckets: Dict[str, List[float]] = {}
+    def __init__(
+        self,
+        max_requests: int = 60,
+        window_seconds: float = 60.0,
+        max_tracked_tenants: int = 5000,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        if max_requests < 1:
+            raise ValueError("max_requests must be >= 1")
+        if not math.isfinite(window_seconds) or window_seconds <= 0:
+            raise ValueError("window_seconds must be a finite number > 0")
+        if max_tracked_tenants < 1:
+            raise ValueError("max_tracked_tenants must be >= 1")
+
+        self.max_requests = int(max_requests)
+        self.window_seconds = float(window_seconds)
+        self.max_tracked_tenants = int(max_tracked_tenants)
+        self._clock = clock
+        self._buckets: "OrderedDict[str, List[float]]" = OrderedDict()
         self._lock = threading.Lock()
 
     def _evict_stale_locked(self, now: float) -> None:
@@ -69,18 +116,24 @@ class SlidingWindowRateLimiter:
             del self._buckets[k]
 
     def allow(self, tenant_id: str) -> bool:
-        now = time.time()
-        cutoff = now - self.window_seconds
         with self._lock:
-            if len(self._buckets) > self.max_tracked_tenants:
+            now = self._clock()
+            cutoff = now - self.window_seconds
+
+            if tenant_id not in self._buckets and len(self._buckets) >= self.max_tracked_tenants:
                 self._evict_stale_locked(now)
+                while len(self._buckets) >= self.max_tracked_tenants:
+                    self._buckets.popitem(last=False)
 
             timestamps = [t for t in self._buckets.get(tenant_id, []) if t >= cutoff]
             if len(timestamps) >= self.max_requests:
                 self._buckets[tenant_id] = timestamps
+                self._buckets.move_to_end(tenant_id)
                 return False
+
             timestamps.append(now)
             self._buckets[tenant_id] = timestamps
+            self._buckets.move_to_end(tenant_id)
             return True
 
     def reset(self) -> None:
@@ -89,8 +142,8 @@ class SlidingWindowRateLimiter:
 
 
 rate_limiter = SlidingWindowRateLimiter(
-    max_requests=int(os.getenv("LUCID_RATE_LIMIT_MAX", "60")),
-    window_seconds=float(os.getenv("LUCID_RATE_LIMIT_WINDOW_SEC", "60")),
+    max_requests=_env_positive_int("LUCID_RATE_LIMIT_MAX", 60),
+    window_seconds=_env_positive_float("LUCID_RATE_LIMIT_WINDOW_SEC", 60.0),
 )
 
 
@@ -107,8 +160,9 @@ def verify_key_and_limit_raw(x_api_key: Optional[str]) -> Tuple[Optional[TenantC
 
     matched: Optional[TenantContext] = None
     if x_api_key:
+        candidate_bytes = x_api_key.encode("utf-8")
         for secret, ctx in registry.items():
-            if hmac.compare_digest(x_api_key, secret):
+            if hmac.compare_digest(candidate_bytes, secret.encode("utf-8")):
                 matched = ctx
 
     if matched is None:
