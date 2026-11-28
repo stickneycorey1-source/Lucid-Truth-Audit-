@@ -29,15 +29,36 @@ datasets:[{data:[__PASS__,__FAIL__],backgroundColor:["#34d399","#f43f5e"]}]}});<
 def _env(k: str, d: str = "") -> str:
     return os.getenv(k, d).strip()
 
-def _req(method: str, url: str, timeout: float, headers: dict[str, str] | None = None, payload: dict[str, Any] | None = None):
-    t0 = time.perf_counter()
-    r = requests.request(method, url, headers=headers, json=payload, timeout=timeout)
-    ms = round((time.perf_counter() - t0) * 1000, 1)
-    try:
-        body: Any = r.json()
-    except ValueError:
-        body = r.text[:300]
-    return r.status_code, ms, body
+def _req(
+    method: str,
+    url: str,
+    timeout: float,
+    headers: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+    retries: int = 2,
+) -> tuple[int, float, Any]:
+    last_exc: Exception | None = None
+    for attempt in range(retries + 1):
+        t0 = time.perf_counter()
+        try:
+            r = requests.request(method, url, headers=headers, json=payload, timeout=timeout)
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            if r.status_code in (502, 503, 504) and attempt < retries:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            try:
+                body: Any = r.json()
+            except ValueError:
+                body = r.text[:300]
+            return r.status_code, ms, body
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            ms = round((time.perf_counter() - t0) * 1000, 1)
+            return 0, ms, {"detail": str(last_exc)[:160]}
+    return 0, 0.0, {"detail": str(last_exc)[:160]}
 
 def _err(body: Any, code: int) -> str:
     if isinstance(body, dict):
