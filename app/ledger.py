@@ -1,8 +1,10 @@
-import os
-import json
-import sqlite3
 import hashlib
+import hmac
+import json
+import os
+import sqlite3
 import threading
+from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -18,26 +20,36 @@ class AuditLedger:
     def __init__(self, db_path: str = DEFAULT_DB_PATH):
         self.db_path = db_path
         self._lock = threading.Lock()
-        self._init_db()
+        with self._lock:
+            self._init_db_locked()
 
     def reconfigure(self, db_path: str) -> None:
         """Re-binds ledger storage path safely (useful for isolated pytest runs)."""
-        self.db_path = db_path
-        self._init_db()
+        with self._lock:
+            self.db_path = db_path
+            self._init_db_locked()
 
     def _connect(self) -> sqlite3.Connection:
-        parent = os.path.dirname(os.path.abspath(self.db_path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        conn = sqlite3.connect(self.db_path, timeout=5.0, check_same_thread=False)
+        if self.db_path != ":memory:":
+            parent = os.path.dirname(os.path.abspath(self.db_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=5.0,
+            isolation_level=None,
+            check_same_thread=False,
+        )
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000;")
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
 
-    def _init_db(self) -> None:
-        with self._lock:
-            with self._connect() as conn:
+    def _init_db_locked(self) -> None:
+        with closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS audit_events (
@@ -58,7 +70,10 @@ class AuditLedger:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_audit_tenant_id ON audit_events (tenant_id, id DESC)"
                 )
-                conn.commit()
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
 
     @staticmethod
     def _compute_hash(
@@ -72,23 +87,27 @@ class AuditLedger:
         summary: str,
         prev_hash: str,
     ) -> str:
-        canonical = "|".join([
-            timestamp_utc,
-            tenant_id,
-            endpoint,
-            reference_id,
-            decision,
-            str(http_status),
-            redacted_types_json,
-            summary,
-            prev_hash,
-        ])
+        canonical = json.dumps(
+            [
+                timestamp_utc,
+                tenant_id,
+                endpoint,
+                reference_id,
+                decision,
+                int(http_status),
+                redacted_types_json,
+                summary,
+                prev_hash,
+            ],
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     def get_summary_stats(self) -> Dict[str, Any]:
         """Fast O(1) read for /health probes — avoids full-table SHA-256 scan DoS."""
         with self._lock:
-            with self._connect() as conn:
+            with closing(self._connect()) as conn:
                 row = conn.execute(
                     "SELECT COUNT(*) AS cnt, MAX(id) AS last_id FROM audit_events"
                 ).fetchone()
@@ -111,46 +130,71 @@ class AuditLedger:
         summary: str = "",
     ) -> Dict[str, Any]:
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        red_json = json.dumps(sorted(redacted_types or []))
+        sorted_redacted = sorted(redacted_types or [])
+        red_json = json.dumps(sorted_redacted)
         safe_summary = summary[:300]
 
         with self._lock:
-            with self._connect() as conn:
-                row = conn.execute(
-                    "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
-                ).fetchone()
-                prev_hash = row["entry_hash"] if row else "GENESIS"
-                entry_hash = self._compute_hash(
-                    ts, tenant_id, endpoint, reference_id, decision, http_status, red_json, safe_summary, prev_hash
-                )
-                cur = conn.execute(
-                    """
-                    INSERT INTO audit_events (
-                        timestamp_utc, tenant_id, endpoint, reference_id,
-                        decision, http_status, redacted_types_json, summary,
-                        prev_hash, entry_hash
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (ts, tenant_id, endpoint, reference_id, decision, http_status, red_json, safe_summary, prev_hash, entry_hash),
-                )
-                conn.commit()
-                return {
-                    "id": cur.lastrowid,
-                    "timestamp_utc": ts,
-                    "tenant_id": tenant_id,
-                    "endpoint": endpoint,
-                    "reference_id": reference_id,
-                    "decision": decision,
-                    "http_status": http_status,
-                    "redacted_types": sorted(redacted_types or []),
-                    "summary": safe_summary,
-                    "entry_hash": entry_hash,
-                }
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT entry_hash FROM audit_events ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                    prev_hash = row["entry_hash"] if row else "GENESIS"
+                    entry_hash = self._compute_hash(
+                        ts,
+                        tenant_id,
+                        endpoint,
+                        reference_id,
+                        decision,
+                        http_status,
+                        red_json,
+                        safe_summary,
+                        prev_hash,
+                    )
+                    cur = conn.execute(
+                        """
+                        INSERT INTO audit_events (
+                            timestamp_utc, tenant_id, endpoint, reference_id,
+                            decision, http_status, redacted_types_json, summary,
+                            prev_hash, entry_hash
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            ts,
+                            tenant_id,
+                            endpoint,
+                            reference_id,
+                            decision,
+                            http_status,
+                            red_json,
+                            safe_summary,
+                            prev_hash,
+                            entry_hash,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                    return {
+                        "id": cur.lastrowid,
+                        "timestamp_utc": ts,
+                        "tenant_id": tenant_id,
+                        "endpoint": endpoint,
+                        "reference_id": reference_id,
+                        "decision": decision,
+                        "http_status": http_status,
+                        "redacted_types": sorted_redacted,
+                        "summary": safe_summary,
+                        "entry_hash": entry_hash,
+                    }
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
 
     def list_events(self, tenant_id: str, limit: int = 100) -> List[Dict[str, Any]]:
-        limit = max(1, min(limit, 500))
+        limit = max(1, min(int(limit), 500))
         with self._lock:
-            with self._connect() as conn:
+            with closing(self._connect()) as conn:
                 rows = conn.execute(
                     """
                     SELECT id, timestamp_utc, tenant_id, endpoint, reference_id,
@@ -180,7 +224,7 @@ class AuditLedger:
 
     def verify_chain(self) -> Dict[str, Any]:
         with self._lock:
-            with self._connect() as conn:
+            with closing(self._connect()) as conn:
                 rows = conn.execute(
                     """
                     SELECT id, timestamp_utc, tenant_id, endpoint, reference_id,
@@ -193,7 +237,7 @@ class AuditLedger:
 
         expected_prev = "GENESIS"
         for r in rows:
-            if r["prev_hash"] != expected_prev:
+            if not hmac.compare_digest(r["prev_hash"], expected_prev):
                 return {"chain_valid": False, "checked_records": len(rows), "broken_at_id": r["id"]}
             recomputed = self._compute_hash(
                 r["timestamp_utc"],
@@ -206,7 +250,7 @@ class AuditLedger:
                 r["summary"],
                 r["prev_hash"],
             )
-            if recomputed != r["entry_hash"]:
+            if not hmac.compare_digest(recomputed, r["entry_hash"]):
                 return {"chain_valid": False, "checked_records": len(rows), "broken_at_id": r["id"]}
             expected_prev = r["entry_hash"]
 
