@@ -40,18 +40,21 @@ jobs:
           LTA_TENANT_KEYS: '{"ci_tenant":"ci-ephemeral-shadow-key"}'
           LUCID_LEDGER_DB_PATH: ":memory:"
         run: |
-          pytest \
-            tests/test_main_hardening.py \
-            tests/test_normalizer_hardening.py \
-            tests/test_ledger_hardening.py \
-            tests/test_evidence_chain_hardening.py \
-            tests/test_shadow_hardening.py \
-            tests/test_logistics_guard_hardening.py \
-            --cov=app \
-            --cov-branch \
-            --cov-report=term-missing \
-            --cov-report=xml:coverage-${{ matrix.python-version }}.xml \
-            -vv
+          mkdir -p reports
+          shopt -s nullglob
+          test_files=(
+            tests/test_main_hardening.py
+            tests/test_normalizer_hardening.py
+            tests/test_ledger_hardening.py
+            tests/test_evidence_chain_hardening.py
+            tests/test_shadow_hardening.py
+            tests/test_logistics_guard_hardening.py
+          )
+          if [ ${#test_files[@]} -eq 0 ]; then
+            pytest --cov=app --cov-branch --cov-report=term-missing --cov-report=xml:coverage-${{ matrix.python-version }}.xml -vv
+          else
+            pytest "${test_files[@]}" --cov=app --cov-branch --cov-report=term-missing --cov-report=xml:coverage-${{ matrix.python-version }}.xml -vv
+          fi
 
       - name: Upload coverage XML artifact
         if: always()
